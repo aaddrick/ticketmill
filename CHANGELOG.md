@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.5 (2026-07-18)
+
+- README: new Run options section documenting every workflow arg and its
+  default, plus what `concurrency` does and does not parallelize.
+- README: new Watching a run section on the issue comment trail, the PR
+  review rounds, the logs dir outputs, and live progress via /workflows.
+- README: new Overlapping batches section explaining the claim protocol when
+  maintainers start batches with overlapping issue lists. The Cross-run claims
+  bullet now points there.
+- README: new Resuming an interrupted run section covering both resume paths,
+  finding the batch branch after a dead session, and the usage-limit breaker.
+  The Resumable everywhere bullet now points there.
+
 ## 0.1.4 (2026-07-18)
 
 - README: "How agents work" now describes init-time role staffing. mill-init

@@ -65,6 +65,30 @@ Workflow({
 })
 ```
 
+## Run options
+
+Every run is a `Workflow` call with an `args` object. The `mill` skill assembles
+it from your request; these are the knobs it can turn:
+
+| Arg | Meaning |
+|---|---|
+| `branch` | Required. The base branch the final batch PR targets (e.g. `dev`, `main`) |
+| `issues` | Explicit issue numbers, e.g. `[701, 702]`. Provide this or `labels` |
+| `labels` | Select issues by label instead of by number |
+| `limit` | Cap for label selection (default 50) |
+| `state` | Issue state for label selection (default `open`) |
+| `no_assignee` | With `labels`: select only issues nobody is assigned to |
+| `concurrency` | Issue pipelines running in parallel: 1-5, default 2 |
+| `dry_run` | Read-only preview: probes every issue and reports the routing plan |
+| `run_label` | Tag for claims and report filenames. Pass today's date so reports don't collide |
+| `batch_branch` | Resume a prior run by reusing its `Batch_<timestamp>` branch |
+| `root`, `repo` | Auto-discovered from git and gh; pass explicitly if the bootstrap probe fails |
+
+`concurrency` is parallelism across issues within one run: each pipeline gets
+its own worktree (and its own port when browser verification is on), and browser
+stages serialize through a shared lock at any setting. For coordination across
+runs on different machines, see Overlapping batches below.
+
 ## What makes it trustworthy
 
 The engine is a port of a private orchestrator that earned its guardrails through
@@ -82,21 +106,88 @@ incident retrospectives. The machinery it keeps:
   written, with calibrated severity rules, a settled-decisions ledger to stop
   re-litigation churn, and iteration caps that carry unresolved findings forward
   loudly instead of dropping them.
-- **Cross-run claims.** Issues are claimed via label + comment before work starts,
-  so concurrent runs on other machines skip them; stale claims (12h) expire; claims
-  are advisory and fail open.
+- **Cross-run claims.** Issues are claimed before work starts, so batches started
+  by different maintainers never double-process an issue (see Overlapping batches
+  below).
 - **Circuit breakers.** Three failed issues, or three consecutive agent deaths
   (the usage-limit signature), stop the run with a resume plan instead of burning
   through the batch.
-- **Resumable everywhere.** Same-session journal replay via `resumeFromRunId`, or
-  from any session by re-running with the same args plus `batch_branch`; a
-  preflight probe routes each issue from live GitHub state.
+- **Resumable everywhere.** An interrupted run loses nothing: every path back is
+  covered in Resuming an interrupted run below.
 - **Scope guards.** Every agent prompt pins its GitHub writes to its own issue and
   stamps comments with a machine-checkable marker; contrarian gates delete
   misfiled comments from concurrent pipelines.
 - **Self-improving.** Each run distills durable learnings into
   `logs/ticketmill/process-retrospective.md` and injects them into the next run's
   planning, review, and test prompts.
+
+## Watching a run
+
+The run narrates itself in the places you already look:
+
+- **The issue trail.** Every stage posts a comment as it happens, and every
+  review/fix loop iteration posts its own, so the trail shows each round of a
+  negotiation rather than one "implemented" note at the end. A halt posts the
+  failed stage plus resume instructions. Each comment carries an
+  `<!-- ticketmill owner/repo#N -->` marker naming the issue it belongs to.
+- **The PRs.** The per-issue PR collects the spec and code review rounds. The
+  batch PR carries the Verification Gaps section: every check that did not run,
+  in front of the human who is about to merge.
+- **The logs dir** (`logs_dir`, default `logs/ticketmill`). Each run writes
+  `summary-<run_label>.json` (machine-readable, per-issue outcomes and stage
+  timelines)
+  and `summary-<run_label>.md` (the human version), and appends to the running
+  `process-retrospective.md`.
+- **Live.** While a run is going, `/workflows` in Claude Code shows the progress
+  tree: which issues are in flight and which stage each one is in.
+
+## Overlapping batches
+
+Two maintainers can start batches on different machines with overlapping issue
+lists. Claims keep them from colliding:
+
+- Before any work starts, a run claims every issue it selected: a claim label
+  plus a `## Ticketmill Claimed` comment recording the batch branch, run tag,
+  host, and start time.
+- A run that finds a fresh foreign claim (under 12 hours old) on an issue skips
+  it and processes the rest of its batch. When two runs start at the same
+  moment, both post and then re-read: the earlier claim wins.
+- Claims from your own batch branch count as yours. That is what lets a resumed
+  run pick its issues back up instead of skipping them.
+- Claims release when an issue merges or halts, plus a sweep at report time. A
+  run that dies without releasing is covered by the 12-hour staleness window.
+- Claims are advisory and fail open: if the claim step itself dies, the run
+  proceeds. The worst case is two runs implementing the same issue in their own
+  batch branches, and the humans reviewing those two batch PRs resolve it.
+  Neither run writes to your base branch either way.
+
+## Resuming an interrupted run
+
+Runs die for boring reasons: the laptop loses power, the session hits a usage
+limit, the API has an outage. The engine treats all of them as expected weather.
+
+- **Session still alive.** Resume in place with
+  `Workflow({ scriptPath, resumeFromRunId: "wf_..." })`. The journal replays
+  every completed stage from cache and picks up at the first unfinished one.
+- **Session gone** (power loss, restart, new machine). Re-run with the same args
+  plus `batch_branch: "Batch_<timestamp>"` from the dead run. The preflight
+  probe reads live GitHub and git state and routes each issue: merged or closed
+  skips, an open per-issue PR goes straight to review and merge, and a partial
+  branch keeps implementing. Worktree setup is idempotent, and both the planner
+  and every implement prompt check existing commits before adding work.
+- **Lost the batch branch name with the session?** It survives in three places:
+  on the remote (`git branch -r` lists `Batch_<timestamp>`, pushed at run
+  start), in the run report under the logs dir if the run got that far, and in
+  the `## Ticketmill Claimed` comment on any issue the run claimed.
+- **Usage limits trip a breaker on purpose.** Three consecutive agent deaths is
+  the signature of a limit or an outage, so the run stops launching issues and
+  writes a resume plan instead of failing the batch one issue at a time.
+- **Your own interruption never blocks you.** A resumed run on the same batch
+  branch recognizes the dead run's claims as its own and continues; other
+  maintainers' runs see them as foreign until the 12-hour staleness window
+  clears them.
+- **Every halted issue tells you where it stopped.** The halt comment names the
+  failed stage and repeats the resume instructions.
 
 ## How agents work
 
