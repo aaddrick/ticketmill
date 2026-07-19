@@ -1773,6 +1773,53 @@ async function proposeConsolidation(candidates) {
   return out
 }
 
+// postConsolidationMarkers: post the group-membership marker on a materialized
+// group's PRIMARY (buildConsolidationGroupComment) and the absorbed-member marker
+// on every OTHER live member (buildConsolidatedMemberComment). Deliberately called
+// only AFTER Select-phase materialization (deriveUnits over the reconciled map +
+// live post-claim preflights) — see proposeConsolidation()'s module comment: real
+// membership is only settled post-claim, so posting any earlier could name a
+// member that never actually joins the live unit. Idempotent across resumes: each
+// post is instructed to first check for an existing marker (same pattern as
+// implementIssue()'s setup stage, "SKIP the comment if one with that exact title
+// already exists") so a resumed run's re-heal of an already-marked group never
+// double-posts. `units` is the array runPool() is about to process; singletons
+// (groupId null, or fewer than 2 live members) are silently skipped.
+async function postConsolidationMarkers(units) {
+  const groups = (units || []).filter(function (u) { return u && u.groupId != null && Array.isArray(u.members) && u.members.length >= 2 })
+  for (const u of groups) {
+    const memberIssues = u.members.map(function (m) { return m.issue })
+    const groupBody = buildConsolidationGroupComment(REPO, u.issue, u.groupId, memberIssues, u.subsystem, u.rationale)
+    await consolidationAgent(memberIssues, 'consolidation:mark-primary-g' + u.groupId, [
+      'Post the consolidation GROUP marker comment on issue #' + u.issue + ' of ' + REPO + '.',
+      'FIRST check whether it already exists: gh issue view ' + u.issue + ' --repo ' + REPO + ' --json comments',
+      '— SKIP posting if any comment\'s first line is exactly "' + CONSOLIDATION_GROUP_TITLE + '" and it contains',
+      '"group: ' + u.groupId + '" (resumed run; already posted).',
+      'Otherwise post EXACTLY this body verbatim, unchanged (gh issue comment ' + u.issue + ' --repo ' + REPO + ' --body):',
+      '"""',
+      groupBody,
+      '"""',
+      'Return posted (true if you posted it now, false if it already existed).',
+    ].join('\n'), stageOpts('probe'), NOTE_SCHEMA)
+
+    for (const m of u.members) {
+      if (m.issue === u.issue) continue // the primary carries the group marker, not a member marker
+      const memberBody = buildConsolidatedMemberComment(REPO, m.issue, u.issue, u.groupId, u.rationale)
+      await consolidationAgent([m.issue], 'consolidation:mark-member-' + m.issue, [
+        'Post the consolidation MEMBER marker comment on issue #' + m.issue + ' of ' + REPO + '.',
+        'FIRST check whether it already exists: gh issue view ' + m.issue + ' --repo ' + REPO + ' --json comments',
+        '— SKIP posting if any comment\'s first line is exactly "' + CONSOLIDATION_MEMBER_TITLE + '" (resumed run;',
+        'already posted).',
+        'Otherwise post EXACTLY this body verbatim, unchanged (gh issue comment ' + m.issue + ' --repo ' + REPO + ' --body):',
+        '"""',
+        memberBody,
+        '"""',
+        'Return posted (true if you posted it now, false if it already existed).',
+      ].join('\n'), stageOpts('probe'), NOTE_SCHEMA)
+    }
+  }
+}
+
 // =============================================================================
 // IMPLEMENT (setup -> research -> evaluate<->contrarian -> plan<->contrarian ->
 // tasks with review/quality loops -> test loop -> browser -> docblocks -> PR)
@@ -2647,6 +2694,20 @@ if (learnR && learnR.found) {
   log('no prior-run learnings digest — plan stage falls back to reading the retro file itself')
 }
 
+// ---- Select: consolidation gate (judgment call — see the PROPOSECONSOLIDATION
+// module comment above the harness split for the full design). Candidates are
+// preflights already resolved to resume_point 'implement' only: a 'process_pr' or
+// 'skip' issue heals individually, one at a time, on its own existing path.
+// proposeConsolidation() free-skips internally with NO agent call at all when
+// candidates.length <= 1, and skips the opus proposal (but still heals a group a
+// PRIOR run already committed to, via comment markers) when PROFILE.consolidation
+// is explicitly false — see its module comment on why the heal must survive a
+// mid-run flag flip. It is read-only and side-effect-free under DRY_RUN: the
+// marker-heal and opus proposal both run (gh reads only); the comment-posting
+// contrarian challenge is skipped entirely.
+const consolidationCandidates = preflights.filter(function (p) { return p.resume_point === 'implement' })
+const consolidationMap = await proposeConsolidation(consolidationCandidates)
+
 if (DRY_RUN) {
   return {
     state: 'dry_run', root: ROOT, repo: REPO, base_branch: BASE,
@@ -2654,6 +2715,14 @@ if (DRY_RUN) {
     agent_roster: AGENT_INFO,
     batch_branch_note: 'dry run probes against ' + TARGET + '; a real run creates Batch_<start-timestamp> from ' + BASE + ' (or pass args.batch_branch)',
     plan: preflights.map(function (p) { return { issue: p.issue, title: p.title, resume_point: p.resume_point, pr: p.pr_number, reason: p.reason } }),
+    // Consolidation preview — a PRE-CHALLENGE veto point: dry_run runs only the
+    // read-only marker-heal + opus proposal, never the comment-posting contrarian
+    // challenge, so a human can veto a proposed grouping before it ever takes
+    // effect for real (entries healed from a prior run's markers carry no
+    // dry_run_preview flag; a fresh, unchallenged proposal does).
+    consolidation_groups: Array.from(consolidationMap.values()).map(function (g) {
+      return { group_id: g.groupId, primary: g.primary, members: g.members, subsystem: g.subsystem, rationale: g.rationale, dry_run_preview: !!g.dry_run_preview }
+    }),
     note: 'No changes made. Re-run without dry_run to execute.',
   }
 }
@@ -2709,8 +2778,33 @@ if (toClaim.length) {
   log('claims: ' + HELD_CLAIMS.length + '/' + toClaim.length + ' held by this run')
 }
 
+// ---- Select: materialize final consolidation units now that claims are settled —
+// claims (and any claim-race resume_point flip just above, e.g. p.resume_point =
+// 'skip') make membership authoritative over the pre-claim proposal.
+// reconcileGroups() drops any member whose LIVE preflight resume_point isn't
+// 'implement' (a skip-flipped member falls through deriveUnits() to an ordinary
+// skip singleton, handled by processIssue()'s existing resume_point==='skip'
+// return path); dissolves a group left with fewer than 2 live members; re-anchors
+// the primary onto another live member (by stableGroupId, so the group's
+// worktree/branch/PR identity never moves) when the proposed primary itself was
+// excluded. deriveUnits() then translates the reconciled groups plus every other
+// live preflight into the array runPool() below actually iterates — preflights
+// itself stays untouched (still used by the claim loop above and the Report sweep
+// below), so a no-group run's units are byte-for-byte identical to preflights.
+const reconciledGroups = reconcileGroups(consolidationMap, preflights)
+const units = deriveUnits(reconciledGroups, preflights)
+const groupUnitCount = units.filter(function (u) { return u.groupId != null }).length
+if (groupUnitCount) log('consolidation: ' + groupUnitCount + ' group unit(s) materialized out of ' + units.length + ' total')
+
+// Post absorbed-member / primary group-membership markers ONLY now, post-
+// materialization (see proposeConsolidation()'s module comment on why posting any
+// earlier could name a member that never actually joins the live unit). DRY_RUN
+// already returned above, so this line is only ever reached for a real run — the
+// explicit guard documents that no marker is ever posted for a preview.
+if (!DRY_RUN) await postConsolidationMarkers(units)
+
 // ---- Process: per-issue pipeline with issue-level concurrency + breakers ----
-const results = await runPool(preflights, CONCURRENCY, processIssue)
+const results = await runPool(units, CONCURRENCY, processIssue)
 
 const counts = {}
 for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1
