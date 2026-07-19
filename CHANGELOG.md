@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.1.20 (2026-07-19)
+
+- Test quality fix for the merge auto-resolve harness coverage (#2): closed a
+  green-by-omission gap where `aggregateMergeAutoResolve` (the run-level
+  rollup that feeds the batch-PR body, the final agent report, and
+  `resultsJson.merge_auto_resolve`) had zero test coverage despite having four
+  distinct markdown branches. Added `tests/merge-auto-resolve-aggregate.test.js`
+  covering all four (none / resolved-only / thrash-only / both) plus the
+  missing-metrics and empty/null-input degrade paths, modeled on the sibling
+  `aggregateTokens` coverage in `tests/token-usage.test.js`. Also added a new
+  scenario to `tests/merge-auto-resolve.test.js` driving the full
+  `reviewAndMerge()` for the case the code comment above the metric-bump line
+  explicitly calls out but no test previously verified: `runMergeAutoResolve`
+  resolves cleanly (rebase, forced green tests, force-push all succeed) but
+  the merge stage's own subsequent preflight then blocks for an unrelated
+  reason — asserting `ctx.metrics.merge_auto_resolved` stays at 0 in that
+  case, not just when auto-resolve itself declines or aborts.
+
+## 0.1.19 (2026-07-19)
+
+- Merge stage auto-rebase and resolve for CONFLICTING PRs (#2). Previously any
+  PR the preflight found `CONFLICTING` escalated straight to `needs_human`,
+  even for mechanical conflicts like already-upstream sibling-issue commits or
+  non-overlapping hunks. A new `runMergeAutoResolve(ctx)` runs immediately
+  before the merge stage: it probes mergeability through a shared
+  `mergeSettlePoll` helper (a verbatim bash backoff loop that tolerates
+  GitHub's transient `mergeable: UNKNOWN` after a push rather than
+  misreading it as blocked), and on `CONFLICTING` rebases the issue branch
+  onto the batch branch's live tip in the still-open worktree. Any surviving
+  hunks go to an implementer-persona conflict-resolver stage that prefers
+  keeping both sides' changes and runs `git rebase --abort` rather than guess
+  on a semantic conflict. A forced, skip-bypassing `runTestLoop` run on the
+  exact rebased state is mandatory before anything is pushed — the test suite
+  is the safety property, not the resolver's judgment. A thrash guard checks
+  the batch branch didn't move again while tests ran and escalates (bumping
+  `ctx.metrics.merge_thrash`) rather than replaying an unverified rebase, so
+  only a state `runTestLoop` actually verified is ever force-pushed with
+  `--force-with-lease`. Any rebase, resolver-abort, or test failure falls
+  through to today's immediate `needs_human` escalation with the worktree
+  preserved, unchanged. `ctx.metrics.merge_auto_resolved` increments only
+  after a confirmed squash-merge on the auto-resolved state, and the Task
+  Complete PR comment now notes when the merged diff diverged from the
+  reviewed head. Run-level auto-resolution and thrash counts are rolled up by
+  a new `aggregateMergeAutoResolve()` and surfaced in both the batch PR body
+  and the run report's new "Merge Auto-Resolution" section. Gated on a real
+  `test_command`: profiles with `test_command: null` still escalate
+  immediately, since `runTestLoop` can't provide the mandatory-green
+  safety net there. Covered by `tests/merge-auto-resolve.test.js` (6
+  harness-driven `node:test` cases spanning the acceptance criteria,
+  including the `UNKNOWN`-settle probe and a non-test-glob forced-run case).
+
 ## 0.1.18 (2026-07-19)
 
 - Added a consolidation gate to Select (#14). It's an opus-tier judgment call,

@@ -445,6 +445,41 @@ const MERGE_SCHEMA = {
     error: { type: ['string', 'null'] },
   },
 }
+// ----- merge auto-resolve schemas (see runMergeAutoResolve) -----
+const MERGE_PREFLIGHT_SCHEMA = {
+  type: 'object', required: ['mergeable'],
+  properties: {
+    state: { type: 'string' },
+    mergeable: { enum: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'] },
+    mergeStateStatus: { type: 'string' },
+  },
+}
+const MERGE_REBASE_SCHEMA = {
+  type: 'object', required: ['status'],
+  properties: {
+    status: { enum: ['clean', 'conflicts', 'error'] },
+    conflicted_files: { type: 'array', items: { type: 'string' } },
+    error: { type: ['string', 'null'] },
+  },
+}
+const MERGE_RESOLVE_SCHEMA = {
+  type: 'object', required: ['status', 'summary'],
+  properties: {
+    status: { enum: ['resolved', 'aborted'] },
+    commit: { type: ['string', 'null'] },
+    files_changed: { type: 'array', items: { type: 'string' } },
+    summary: { type: 'string' },
+    notes_for_downstream: { type: 'array', items: { type: 'string' } },
+  },
+}
+const MERGE_GUARD_SCHEMA = {
+  type: 'object', required: ['moved'],
+  properties: { moved: { type: 'boolean' }, detail: { type: 'string' } },
+}
+const MERGE_PUSH_SCHEMA = {
+  type: 'object', required: ['status'],
+  properties: { status: { enum: ['success', 'error'] }, error: { type: ['string', 'null'] } },
+}
 const NOTE_SCHEMA = { type: 'object', required: ['posted'], properties: { posted: { type: 'boolean' } } }
 const REPORT_SCHEMA = {
   type: 'object', required: ['report_path', 'markdown_summary'],
@@ -1095,6 +1130,50 @@ function aggregateTokens(results, spent, concurrency) {
   }
 }
 
+// aggregateMergeAutoResolve: JS-computed run-level rollup of runMergeAutoResolve
+// activity (see that function) — no LLM math, injected verbatim below, same
+// pattern as aggregateTokens above. Reads ctx.metrics.merge_auto_resolved /
+// merge_thrash off EVERY result (fail() carries ctx.metrics through too, so a
+// thrash-escalated needs_human result is counted here even though it never
+// reached 'completed'). resolved_count only ever reflects issues that actually
+// MERGED after auto-resolve (see runMergeAutoResolve's own doc comment on why
+// the metric bumps post-merge, not post-rebase) — thrash_count is a distinct,
+// non-overlapping bucket: an issue that thrashed escalated to needs_human and
+// therefore never also incremented merge_auto_resolved.
+function aggregateMergeAutoResolve(results) {
+  const list = results || []
+  const resolvedIssues = []
+  const thrashIssues = []
+  for (const r of list) {
+    const m = r && r.metrics
+    if (m && m.merge_auto_resolved) resolvedIssues.push(r.issue)
+    if (m && m.merge_thrash) thrashIssues.push(r.issue)
+  }
+  const lines = []
+  lines.push('## Merge Auto-Resolution')
+  lines.push('')
+  if (!resolvedIssues.length && !thrashIssues.length) {
+    lines.push('No CONFLICTING PRs this run — nothing to auto-resolve.')
+  } else {
+    lines.push(resolvedIssues.length
+      ? resolvedIssues.length + ' issue(s) auto-resolved: CONFLICTING after review, rebased onto the batch branch, ' +
+        're-tested green, force-pushed, then merged — ' + fmtIssues(resolvedIssues) + '.'
+      : '0 issue(s) auto-resolved this run.')
+    if (thrashIssues.length) {
+      lines.push('')
+      lines.push(thrashIssues.length + ' issue(s) hit the thrash guard (batch branch moved again while the mandatory ' +
+        're-test ran) and escalated to needs_human instead of a silent re-rebase — ' + fmtIssues(thrashIssues) + '.')
+    }
+  }
+  return {
+    resolved_count: resolvedIssues.length,
+    resolved_issues: resolvedIssues,
+    thrash_count: thrashIssues.length,
+    thrash_issues: thrashIssues,
+    markdown: lines.join('\n'),
+  }
+}
+
 // Best-effort halt note on the issue so humans can triage from GitHub alone. For a
 // consolidation group (ctx.members.length > 1), the SAME halt fires the same note
 // on EVERY member issue — not just the primary — naming the group so a human
@@ -1428,12 +1507,19 @@ async function runBrowserCheck(ctx, where) {
 
 // =============================================================================
 // TEST LOOP (run -> fix -> validate -> fix; errors HALT)
+// forced: when true, always runs the full suite — skips the "no testable code
+// changed" shortcut below entirely. Used by runMergeAutoResolve, where the
+// safety property being verified is "does the EXACT state about to be
+// force-pushed pass tests", not "did this rebase touch test-glob files" (a
+// rebase can pull in upstream commits whose diff against TARGET looks
+// unchanged from this issue's own files while the tree that would be pushed
+// has still moved).
 // Returns { ok: true } | { ok: false, error }
 // A null TEST_CMD is an EXPLICIT profile decision (mill-init records it after
 // human confirmation) — the loop is skipped but the skip is surfaced in the
 // batch PR body via VERIFY_SKIPS, never buried in logs.
 // =============================================================================
-async function runTestLoop(ctx) {
+async function runTestLoop(ctx, forced) {
   if (TEST_CMD === null) {
     log('#' + ctx.issue + ' test loop: profile declares test_command: null (no test gate) — recorded for the batch PR body')
     VERIFY_SKIPS.push('#' + ctx.issue + ': test loop skipped — profile declares "test_command": null (explicit no-test decision)')
@@ -1446,11 +1532,16 @@ async function runTestLoop(ctx) {
     ctx.metrics.test_iters = iter
 
     const t = await stage(ctx, 'test-run-i' + iter, [
-      'First check whether testable code changed: git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --name-only',
-      testGlobs
-        ? 'If NO changed file matches any of these patterns (' + testGlobs.join(', ') + '), do NOT run the suite — return'
-        : 'If the diff is empty, do NOT run the suite — return',
-      'result=passed with summary "no testable code changed — suite skipped" (and post the Test Run comment saying exactly that).',
+      forced
+        ? 'This is a MANDATORY re-run (auto-resolve safety gate after a rebase) — run the full suite below' +
+          ' regardless of which files the diff touches; do NOT skip it for "no testable code changed".'
+        : [
+            'First check whether testable code changed: git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --name-only',
+            testGlobs
+              ? 'If NO changed file matches any of these patterns (' + testGlobs.join(', ') + '), do NOT run the suite — return'
+              : 'If the diff is empty, do NOT run the suite — return',
+            'result=passed with summary "no testable code changed — suite skipped" (and post the Test Run comment saying exactly that).',
+          ].join('\n'),
       'Otherwise run the project test suite in worktree ' + ctx.worktree + ':',
       '  cd ' + ctx.worktree + ' && ' + TEST_CMD + ' 2>&1 | tail -30',
       '(Full output exceeds context — the tail carries the summary. If the suite fails to BOOT — missing env,',
@@ -1534,6 +1625,172 @@ async function runTestLoop(ctx) {
     collectNotes(ctx, 'test-quality-fix', qfix)
   }
   return { ok: false, error: 'test loop exceeded ' + MAX_TEST_ITERATIONS + ' iterations' }
+}
+
+// mergeSettlePoll: verbatim bash a merge-preflight probe runs to query PR
+// mergeability. GitHub recomputes mergeable=UNKNOWN asynchronously — most
+// notably right after a force-push — so a probe that reads state exactly once
+// during that window can misread a perfectly fine PR as unresolvable. Bounded
+// backoff: up to 6 polls, 5s apart (~30s cap); every poll is echoed, so the
+// LAST line printed is always the freshest read, whatever it settled to.
+// Persistent UNKNOWN after the cap is a valid outcome this loop hands back
+// as-is — the caller decides what to do with it. Shared between
+// runMergeAutoResolve's own probe and the merge stage's own preflight.
+function mergeSettlePoll(ctx) {
+  return [
+    'for i in $(seq 1 6); do',
+    '  out=$(gh pr view ' + ctx.pr + ' --repo ' + REPO + ' --json state,mergeable,mergeStateStatus)',
+    '  echo "$out"',
+    '  echo "$out" | grep -q \'"mergeable":"UNKNOWN"\' || break',
+    '  sleep 5',
+    'done',
+  ].join('\n')
+}
+
+// =============================================================================
+// MERGE AUTO-RESOLVE (mechanical CONFLICTING recovery, modeled on
+// runBrowserCheck: an internal probe decides whether to act at all, then a
+// bounded sequence of mechanical git stages plus one judgment stage do the
+// work.) Inserted into reviewAndMerge immediately before the merge stage, so a
+// PR that preflights CONFLICTING gets one mechanical recovery attempt before
+// falling back to today's immediate needs_human escalation.
+//
+// Flow: settle-poll probe -> only on CONFLICTING: fetch+rebase onto TARGET's
+// current tip in the still-live worktree -> on rebase conflicts, a
+// conflict-resolver stage (implementer persona, judgment call) prefers keeping
+// BOTH sides of a hunk, aborts on anything semantic -> mandatory GREEN test
+// loop on the rebased state, FORCED (the safety property here is the test
+// suite re-verifying the EXACT state about to be force-pushed, not the
+// resolver's judgment — it must not skip just because the rebase itself
+// touched no test-glob files) -> a cheap guard that TARGET hasn't moved again
+// while tests were running (if it has, escalate rather than silently
+// re-rebasing and force-pushing content tests never verified — see the guard
+// below) -> force-push with lease.
+//
+// Gated on a real test_command: with test_command:null there is no suite to
+// re-verify against — the stated safety property does not exist — so this
+// whole flow is skipped and a CONFLICTING PR falls straight through to the
+// merge stage's own preflight (today's behavior, unchanged: the fallback, not
+// the default).
+//
+// Returns { ok: true, resolved: boolean } | { ok: false, error }
+//   resolved: true only when this flow actually rebased the branch onto a
+//   newer TARGET tip and force-pushed it — including a CLEAN rebase with no
+//   conflicts (e.g. already-upstream sibling commits), since the merged diff
+//   still differs from the reviewed head either way. The caller bumps
+//   ctx.metrics.merge_auto_resolved itself, and only once the merge stage that
+//   follows actually reports merged=true — a resolved-but-still-blocked PR
+//   (re-conflicted again, or another preflight reason) must not inflate the
+//   metric.
+// =============================================================================
+async function runMergeAutoResolve(ctx) {
+  if (TEST_CMD === null) return { ok: true, resolved: false }
+  if (STOP.tripped) return { ok: false, error: 'stopped: ' + STOP.reason }
+
+  const probe = await stage(ctx, 'merge-preflight-probe', [
+    'READ-ONLY preflight probe for PR #' + ctx.pr + ' (' + REPO + '). Run exactly:',
+    mergeSettlePoll(ctx),
+    'Parse the LAST JSON object printed (the freshest poll). Return its state, mergeable, and mergeStateStatus',
+    'fields verbatim.',
+  ].join('\n'), stageOpts('probe'), MERGE_PREFLIGHT_SCHEMA)
+  if (!probe) return { ok: false, error: 'merge-preflight probe died' }
+  // Only CONFLICTING is this flow's business. MERGEABLE needs no help; a
+  // persistent UNKNOWN is for the merge stage's own settle-tolerant preflight
+  // to decide (it runs the identical poll again right before merging).
+  if (probe.mergeable !== 'CONFLICTING') return { ok: true, resolved: false }
+
+  log('#' + ctx.issue + ' merge-auto-resolve: PR #' + ctx.pr + ' is CONFLICTING — attempting mechanical rebase before escalating')
+
+  // ---- fetch + rebase onto the current TARGET tip ----
+  const rebase = await stage(ctx, 'merge-rebase', [
+    'In worktree ' + ctx.worktree + ' (branch ' + ctx.branch + '), rebase onto the current tip of ' + TARGET + '.',
+    'Idempotency FIRST: git -C ' + ctx.worktree + ' status',
+    'If .git/rebase-merge or .git/rebase-apply already exists in the worktree, a PRIOR attempt left a rebase in',
+    'progress — do NOT run git rebase again; inspect the current conflict state (git -C ' + ctx.worktree +
+    ' diff --name-only --diff-filter=U) and report status=conflicts against what is ALREADY in progress.',
+    'Otherwise:',
+    '  git -C ' + ctx.worktree + ' fetch origin ' + TARGET,
+    '  git -C ' + ctx.worktree + ' rebase origin/' + TARGET,
+    'If it completes with no conflicts (e.g. the conflicting commits are already upstream from a sibling issue,',
+    'or the hunks simply do not overlap), return status=clean.',
+    'If it stops on conflicts, do NOT resolve them yourself — return status=conflicts and conflicted_files',
+    '(git -C ' + ctx.worktree + ' diff --name-only --diff-filter=U); a resolver stage handles them next.',
+    'If it fails for any OTHER reason, run git -C ' + ctx.worktree + ' rebase --abort and return status=error',
+    'with the reason.',
+    'Return status (clean|conflicts|error), conflicted_files, error.',
+  ].join('\n'), stageOpts('probe'), MERGE_REBASE_SCHEMA)
+  if (!rebase) return { ok: false, error: 'merge-rebase stage died — worktree left as-is for human inspection' }
+  if (rebase.status === 'error') return { ok: false, error: 'rebase onto ' + TARGET + ' failed: ' + (rebase.error || 'unknown reason') }
+
+  if (rebase.status === 'conflicts') {
+    const resolve = await stage(ctx, 'merge-conflict-resolve', [
+      implementerBlock(null),
+      '',
+      'Resolve rebase conflicts for issue #' + ctx.issue + ' in worktree ' + ctx.worktree + ' (branch ' + ctx.branch +
+      '), mid-rebase onto ' + TARGET + '.',
+      '',
+      'Idempotency FIRST: git -C ' + ctx.worktree + ' status — a prior attempt may already have resolved some',
+      'hunks, or already aborted; act on the ACTUAL current state, do not assume a fresh conflict.',
+      '',
+      'Conflicted files: ' + ((rebase.conflicted_files || []).join(', ') || '(re-derive from git status)'),
+      ctx.approach ? 'This issue\'s change intent: ' + String(ctx.approach).slice(0, 300) : '',
+      notesBlock(ctx),
+      '',
+      'PREFER KEEPING BOTH SIDES of every hunk (e.g. two non-overlapping additions in the same file/region) over',
+      'discarding either — the other side is almost always an unrelated sibling issue\'s change that already',
+      'landed on ' + TARGET + '. Only collapse to one side when the hunks are genuinely the same edit twice.',
+      '',
+      'If ANY hunk requires judging which side is semantically correct — not just mechanically combinable — do',
+      'NOT guess: git -C ' + ctx.worktree + ' rebase --abort and return status=aborted with the reason in summary.',
+      '',
+      'Otherwise resolve every hunk, git -C ' + ctx.worktree + ' add -A, git -C ' + ctx.worktree +
+      ' rebase --continue, repeating for any further stops, until the rebase completes. Return status=resolved.',
+      HANDOFF_ASK,
+      'Return status (resolved|aborted), commit, files_changed, summary.',
+    ].join('\n'), stageOpts('fix'), MERGE_RESOLVE_SCHEMA)
+    if (!resolve) return { ok: false, error: 'conflict-resolver stage died — worktree left mid-rebase for human inspection' }
+    collectNotes(ctx, 'merge-conflict-resolve', resolve)
+    if (resolve.status === 'aborted') return { ok: false, error: 'conflict resolver declined a semantic conflict (rebase aborted): ' + (resolve.summary || 'no reason given') }
+  }
+
+  // ---- mandatory green tests on the EXACT rebased state (forced: must not skip) ----
+  const t = await runTestLoop(ctx, true)
+  if (!t.ok) return { ok: false, error: 'mandatory post-rebase test loop failed: ' + t.error }
+
+  // ---- thrash guard: TARGET must not have moved again while tests were running.
+  // A second move means the state that just went green is already stale.
+  // Escalating here (rather than silently re-rebasing and force-pushing
+  // UNTESTED content) is a deliberate contrarian-adjudicated choice: an earlier
+  // draft of this flow re-rebased and pushed at this point instead, which would
+  // have force-pushed a diff runTestLoop never actually verified. ----
+  const guard = await stage(ctx, 'merge-preflight-guard', [
+    'In worktree ' + ctx.worktree + ', verify ' + TARGET + ' has not moved since the rebase above:',
+    '  git -C ' + ctx.worktree + ' fetch origin ' + TARGET,
+    '  git -C ' + ctx.worktree + ' merge-base --is-ancestor origin/' + TARGET + ' HEAD',
+    'That command exits 0 if origin/' + TARGET + ' IS an ancestor of HEAD (TARGET has not moved past what tests',
+    'just verified — safe to push) and non-zero if it moved further (the just-tested state is now stale).',
+    'Return moved (boolean: true if the command exited non-zero / TARGET moved further, false otherwise).',
+  ].join('\n'), stageOpts('probe'), MERGE_GUARD_SCHEMA, 1)
+  if (!guard) return { ok: false, error: 'pre-force-push guard stage died' }
+  if (guard.moved) {
+    ctx.metrics.merge_thrash = (ctx.metrics.merge_thrash || 0) + 1
+    return { ok: false, error: TARGET + ' moved again while the mandatory test loop was running — escalating rather than force-pushing a state tests never verified (thrash guard tripped)' }
+  }
+
+  // ---- force-push the tested, rebased branch ----
+  const push = await stage(ctx, 'merge-force-push', [
+    'In worktree ' + ctx.worktree + ' (branch ' + ctx.branch + '), push the rebased branch:',
+    'Idempotency FIRST: git -C ' + ctx.worktree + ' status — if it already shows nothing to push against origin/' +
+    ctx.branch + ', a prior attempt may have already pushed; that is fine, treat as success.',
+    'Otherwise: git -C ' + ctx.worktree + ' push --force-with-lease origin ' + ctx.branch,
+    'If the push is rejected (stale lease — someone else pushed to this branch concurrently), return status=error',
+    'with the reason — do NOT retry with a plain --force.',
+    'Return status (success|error), error.',
+  ].join('\n'), stageOpts('probe'), MERGE_PUSH_SCHEMA)
+  if (!push || push.status === 'error') return { ok: false, error: 'force-push of the rebased, tested branch failed: ' + (push && push.error || 'push stage died') }
+
+  log('#' + ctx.issue + ' merge-auto-resolve: PR #' + ctx.pr + ' rebased onto ' + TARGET + ', tests green, force-pushed')
+  return { ok: true, resolved: true }
 }
 
 // sanitizeTasks: normalize a plan agent's raw task list and drop stub tasks.
@@ -2535,7 +2792,12 @@ async function reviewAndMerge(ctx) {
     if (!td || td.status === 'error') log('#' + ctx.issue + ' tech-docs degraded (non-fatal) — continuing to merge')
   }
 
-  // ---- MERGE (complete comment, squash merge, follow-ups, cleanup) ----
+  // ---- MERGE AUTO-RESOLVE (mechanical CONFLICTING recovery before the merge
+  // stage's own preflight would otherwise escalate straight to needs_human) ----
+  const mar = await runMergeAutoResolve(ctx)
+  if (!mar.ok) return fail(ctx, STOP.tripped ? 'halted' : 'needs_human', 'merge-auto-resolve', mar.error + ' — PR #' + ctx.pr + ' left open for human review')
+
+  // ---- MERGE (preflight, squash merge, complete comment, follow-ups, cleanup) ----
   const deferredBlock = ctx.deferred.length ? ctx.deferred.map(function (d) { return '- ' + d }).join('\n') : ''
   // Group unit: release the claim on EVERY member, not just the primary — every
   // member's claim label was taken at Select and must be freed the same way.
@@ -2543,14 +2805,27 @@ async function reviewAndMerge(ctx) {
     ? '6. Release the claim on EVERY member issue:\n   ' +
       ctx.members.map(function (m) { return 'gh issue edit ' + m.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true' }).join('\n   ')
     : '6. Release the claim: gh issue edit ' + ctx.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true'
+  // If auto-resolve force-pushed a rebased branch, the Implementation Complete
+  // comment (posted only AFTER a confirmed merge below — see reordering) must say
+  // so: the merged diff has diverged from what spec/code review actually looked at.
+  const autoResolveNote = mar.resolved
+    ? '   Also note explicitly: this PR was CONFLICTING after review; it was auto-rebased onto ' + TARGET +
+      ' and force-pushed with tests re-verified green before this merge, so the merged diff differs from the' +
+      ' head that spec/code review actually reviewed.'
+    : ''
   const merge = await stage(ctx, 'merge', [
     'Finalize and merge PR #' + ctx.pr + ' for issue #' + ctx.issue + ' in ' + REPO + '. It passed spec and code review in this run.',
     '',
-    '1. Post a PR comment "## Implementation Complete" summarizing branch ' + ctx.branch + ', reviews passed,',
+    '1. Preflight (settle-tolerant — GitHub can still report mergeable:UNKNOWN for a few seconds after the',
+    '   auto-resolve force-push above; poll rather than reading once). Run exactly:',
+    mergeSettlePoll(ctx),
+    '   Parse the LAST JSON object printed (the freshest poll). If NOT open+mergeable (state!=OPEN, or',
+    '   mergeable=CONFLICTING, or mergeable is still UNKNOWN after the poll): DO NOT merge and do NOT post the',
+    '   Implementation Complete comment below; return status=blocked with the reason.',
+    '2. Squash-merge: gh pr merge ' + ctx.pr + ' --repo ' + REPO + ' --squash --delete-branch',
+    '3. Post a PR comment "## Implementation Complete" summarizing branch ' + ctx.branch + ', reviews passed,',
     '   and — if the deferred-suggestions block below is non-empty — a collapsible "Deferred Suggestions for Follow-up" section.',
-    '2. Preflight: gh pr view ' + ctx.pr + ' --repo ' + REPO + ' --json state,mergeable,mergeStateStatus',
-    '   If NOT open+mergeable (conflict etc.): DO NOT merge; return status=blocked with the reason.',
-    '3. Squash-merge: gh pr merge ' + ctx.pr + ' --repo ' + REPO + ' --squash --delete-branch',
+    autoResolveNote,
     '4. Do NOT close issue #' + ctx.issue + ' manually. This PR merges into the batch branch ' + TARGET + ', not the',
     '   default branch, so "Closes #" will not fire — closure happens when a human merges the final batch PR',
     '   (' + TARGET + ' -> ' + BASE + '), whose body carries the Closes reference. Post a comment on issue #' + ctx.issue,
@@ -2571,6 +2846,11 @@ async function reviewAndMerge(ctx) {
   ].join('\n'), stageOpts('merge'), MERGE_SCHEMA)
   if (!merge) return fail(ctx, 'needs_human', 'merge', 'merge agent died — PR #' + ctx.pr + ' is approved but unmerged')
   if (merge.status !== 'merged') return fail(ctx, 'needs_human', 'merge', merge.error || 'merge blocked (' + merge.status + ') — PR #' + ctx.pr + ' left open')
+
+  // Bump the metric only now — after a CONFIRMED merge — so a PR that auto-resolve
+  // fixed but that then failed this stage's own preflight for an unrelated reason
+  // (still fails fail()/needs_human above) never inflates the count.
+  if (mar.resolved) ctx.metrics.merge_auto_resolved = (ctx.metrics.merge_auto_resolved || 0) + 1
 
   log('#' + ctx.issue + ' merged PR #' + ctx.pr + (merge.follow_up_issues && merge.follow_up_issues.length ? ' (follow-ups: ' + merge.follow_up_issues.join(', ') + ')' : ''))
   return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx) }
@@ -2594,7 +2874,7 @@ async function processIssue(pre) {
     // unit-of-work abstraction must preserve.
     members: Array.isArray(pre.members) && pre.members.length ? pre.members : [pre],
     groupId: ('groupId' in pre && pre.groupId != null) ? pre.groupId : null, // stable consolidation-group id; null outside a group
-    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0 },
+    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0 },
     tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
   }
   if (pre.resume_point === 'skip') {
@@ -3016,6 +3296,9 @@ if (HELD_CLAIMS.length) {
 // ---- Token usage: JS-computed aggregation (no LLM math), injected verbatim below ----
 const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY)
 
+// ---- Merge auto-resolution: JS-computed run-level rollup, injected verbatim below ----
+const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
+
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
 const completedIssues = results.filter(function (r) { return r && r.status === 'completed' })
@@ -3052,6 +3335,8 @@ if (completedIssues.length) {
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
     '   - a note that per-issue PRs were squash-merged into ' + TARGET + ' with full review trails on each issue.',
+    '   - this "## Merge Auto-Resolution" section, injected VERBATIM (already computed in JS — do not recompute,',
+    '     re-sum, or add commentary beyond copying it in):\n' + MERGE_RESOLVE_AGG.markdown,
     '   - this "## Token Usage" section, injected VERBATIM (already computed in JS — do not recompute, re-sum,',
     '     or add commentary beyond copying it in):\n' + TOKEN_AGG.markdown,
     '3. If one exists: update its body to the current results (gh pr edit) and comment that the run refreshed it.',
@@ -3069,6 +3354,7 @@ const resultsJson = JSON.stringify({
   state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts,
   verification_gaps: VERIFY_SKIPS, tokens_spent: budget.spent(),
   tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
+  merge_auto_resolve: { resolved_count: MERGE_RESOLVE_AGG.resolved_count, resolved_issues: MERGE_RESOLVE_AGG.resolved_issues, thrash_count: MERGE_RESOLVE_AGG.thrash_count, thrash_issues: MERGE_RESOLVE_AGG.thrash_issues },
   consolidation_groups: finalGroups,
   results: results,
 }, null, 2)
@@ -3085,7 +3371,10 @@ const report = await agent([
   '   so list them explicitly here rather than only showing the primary\'s row in the results table), a',
   '   "Verification Gaps" section if verification_gaps is non-empty, a failures section with halt stages, and —',
   '   if state is not "completed" — a "Resume" section: re-run ticketmill with the same args (preflight skips',
-  '   finished work) or resume via resumeFromRunId. Include this "## Token Usage" section VERBATIM (already',
+  '   finished work) or resume via resumeFromRunId. Include this "## Merge Auto-Resolution" section VERBATIM',
+  '   (already computed in JS — do not recompute, re-sum, or add commentary beyond copying it in):',
+  MERGE_RESOLVE_AGG.markdown,
+  '   Include this "## Token Usage" section VERBATIM (already',
   '   computed in JS — do not recompute, re-sum, or add commentary beyond copying it in):',
   TOKEN_AGG.markdown,
   '4. Include the current timestamp from: date -Iseconds',
@@ -3127,6 +3416,8 @@ return {
   batch_pr: batchPr,
   counts: counts,
   verification_gaps: VERIFY_SKIPS,
+  merge_auto_resolved_count: MERGE_RESOLVE_AGG.resolved_count,
+  merge_thrash_count: MERGE_RESOLVE_AGG.thrash_count,
   results: results,
   report: report ? report.report_path : null,
   summary_table: report ? report.markdown_summary : null,
