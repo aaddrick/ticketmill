@@ -1504,19 +1504,44 @@ function consolidationScopeGuard(issueNumbers) {
   ].join('\n')
 }
 
+// consolidationAgent: the same safety net stage() gives single-issue calls
+// (STOP.tripped short-circuit, budget/ceiling errors converted to tripStop()
+// instead of propagating, BATCH.consecutiveDeaths accounted on every death),
+// but for the multi-issue consolidation gate — which has no single ctx to hang
+// off of, so it guards on the candidate issueNumbers list via
+// consolidationScopeGuard() instead of scopeGuard(ctx). No retries (matches
+// this gate's pre-hardening call shape: a death here dissolves/falls through
+// to the ordinary per-issue path rather than being worth a retry budget).
+async function consolidationAgent(issueNumbers, label, promptText, opts, schema) {
+  if (STOP.tripped) return null
+  const guarded = consolidationScopeGuard(issueNumbers) + '\n\n' + promptText
+  let r = null
+  try {
+    r = await agent(guarded, Object.assign({ label: label, phase: 'Select', schema: schema }, opts))
+  } catch (e) {
+    const msg = String((e && e.message) || e)
+    if (/budget|token target|ceiling/i.test(msg)) { tripStop('token budget exhausted (' + msg + ')'); return null }
+    log('consolidation ' + label + ' threw: ' + msg)
+  }
+  if (r) { BATCH.consecutiveDeaths = 0; return r }
+  BATCH.consecutiveDeaths++
+  if (BATCH.consecutiveDeaths >= MAX_CONSECUTIVE_AGENT_DEATHS) {
+    tripStop(MAX_CONSECUTIVE_AGENT_DEATHS + ' consecutive agent deaths — likely usage limit or API outage. Resume later with the same args (preflight will skip finished work) or resumeFromRunId.')
+  }
+  return null
+}
+
 // fetchConsolidationMarkers: READ-ONLY (safe under DRY_RUN) — collects each
 // candidate's most recent consolidation-marker comment, if any, for healGroups().
 async function fetchConsolidationMarkers(issueNumbers) {
   if (!issueNumbers.length) return []
-  const r = await agent([
-    consolidationScopeGuard(issueNumbers),
-    '',
+  const r = await consolidationAgent(issueNumbers, 'consolidation:marker-probe', [
     'READ-ONLY: for each issue above, check whether it carries a prior ticketmill consolidation-marker comment —',
     'one whose FIRST line is EXACTLY "' + CONSOLIDATION_MEMBER_TITLE + '" or "' + CONSOLIDATION_GROUP_TITLE + '".',
     'gh issue view <n> --repo ' + REPO + ' --json comments',
     'Return markers: [{issue, body}] — ONLY for issues carrying such a comment (its exact full body; if more than',
     'one exists on an issue, the MOST RECENT). Omit issues with none entirely.',
-  ].join('\n'), Object.assign({ label: 'consolidation:marker-probe', phase: 'Select', schema: CONSOLIDATION_MARKER_PROBE_SCHEMA }, stageOpts('probe')))
+  ].join('\n'), stageOpts('probe'), CONSOLIDATION_MARKER_PROBE_SCHEMA)
   return (r && r.markers) || []
 }
 
@@ -1528,9 +1553,7 @@ async function challengeConsolidationGroup(group, settledCarrier) {
   let current = group
   for (let iter = 1; iter <= MAX_CONTRARIAN_ITERATIONS; iter++) {
     const groupId = stableGroupId(current.members)
-    const ch = await agent([
-      consolidationScopeGuard(current.members),
-      '',
+    const ch = await consolidationAgent(current.members, 'consolidation:challenge-g' + groupId + '-i' + iter, [
       roleBlock('contrarian'),
       '',
       'Stress-test a PROPOSED ISSUE CONSOLIDATION for ' + REPO + ' (challenge iteration ' + iter + ').',
@@ -1552,7 +1575,7 @@ async function challengeConsolidationGroup(group, settledCarrier) {
       'Post an issue comment on #' + current.primary + ' titled "## Contrarian: Consolidation Challenge (Group ' + groupId + ', Iteration ' + iter + ')" with your verdict and findings.',
       'STRUCTURED OUTPUT CONTRACT: verdict must be EXACTLY one of sound_with_caveats | needs_rework | investigate_first.',
       'Every concern goes in the findings ARRAY (severity, summary, recommendation), never only in prose.',
-    ].filter(Boolean).join('\n'), Object.assign({ label: 'consolidation:challenge-g' + groupId + '-i' + iter, phase: 'Select', schema: CHALLENGE_SCHEMA }, stageOpts('contrarian')))
+    ].filter(Boolean).join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
 
     if (!ch) {
       log('consolidation group ' + groupId + ' DISSOLVED — challenge agent died (fails conservatively, not open)')
@@ -1567,16 +1590,14 @@ async function challengeConsolidationGroup(group, settledCarrier) {
     log('consolidation group ' + groupId + ' challenge i' + iter + ': ' + ch.verdict + ', ' + criticalMajor + ' critical/major')
     if (iter === MAX_CONTRARIAN_ITERATIONS) {
       log('consolidation group ' + groupId + ' DISSOLVED — contrarian cap (' + MAX_CONTRARIAN_ITERATIONS + ') reached without acceptance: ' + (ch.summary || ''))
-      await agent([
-        consolidationScopeGuard(current.members),
+      await consolidationAgent(current.members, 'consolidation:dissolve-note-g' + groupId, [
         'Post a GitHub comment on issue #' + current.primary + ' in ' + REPO + ' (gh issue comment).',
         'Title line: "## Consolidation Dissolved After Contrarian Cap"',
         'Body: a proposed consolidation of ' + fmtIssues(current.members) +
           ' did not survive ' + MAX_CONTRARIAN_ITERATIONS + ' contrarian challenge iterations; each issue will be',
         'processed independently instead. Last challenge summary: ' + String(ch.summary || '').slice(0, 900),
         'Return posted=true/false.',
-      ].join('\n'), Object.assign({ label: 'consolidation:dissolve-note-g' + groupId, phase: 'Select', schema: NOTE_SCHEMA }, stageOpts('probe')))
-        .catch(function () { return null })
+      ].join('\n'), stageOpts('probe'), NOTE_SCHEMA)
       return null
     }
     // Revise: give the opus gate one more look at just THIS group, with the
@@ -1584,9 +1605,7 @@ async function challengeConsolidationGroup(group, settledCarrier) {
     // response is just groups: [one] — or groups: [] if it now concludes the
     // members should not be grouped at all, which dissolves immediately rather
     // than spending remaining iterations defending an unsupported grouping).
-    const re = await agent([
-      consolidationScopeGuard(current.members),
-      '',
+    const re = await consolidationAgent(current.members, 'consolidation:revise-g' + groupId + '-i' + iter, [
       'Revise a proposed issue consolidation for ' + REPO + ' based on contrarian feedback (verdict: ' + ch.verdict + ').',
       'Current group: primary #' + current.primary + ', members ' + fmtIssues(current.members) + '.',
       'Findings to address:',
@@ -1595,15 +1614,15 @@ async function challengeConsolidationGroup(group, settledCarrier) {
       'verifying, these issues genuinely should NOT be grouped, return groups: [] and list every member issue in',
       'ungrouped instead (this ends the review — do not keep defending a grouping the evidence does not support).',
       'Otherwise return EXACTLY ONE revised group (same schema as the original gate) addressing the CONFIRMED concerns.',
-      'Only consider these candidates — never introduce an issue number outside this exact set: ' + fmtIssues(group.members) + '.',
-    ].join('\n'), Object.assign({ label: 'consolidation:revise-g' + groupId + '-i' + iter, phase: 'Select', schema: CONSOLIDATION_SCHEMA }, stageOpts('consolidation')))
+      'Only consider these candidates — never introduce an issue number outside this exact set: ' + fmtIssues(current.members) + '.',
+    ].join('\n'), stageOpts('consolidation'), CONSOLIDATION_SCHEMA)
 
     if (!re || !Array.isArray(re.groups) || !re.groups.length) {
       log('consolidation group ' + groupId + ' DISSOLVED — revision concluded no grouping (or agent died)')
       return null
     }
     const rg = re.groups[0]
-    const revisedMembers = (rg.members || []).filter(function (n) { return group.members.indexOf(n) !== -1 })
+    const revisedMembers = (rg.members || []).filter(function (n) { return current.members.indexOf(n) !== -1 })
     if (revisedMembers.length < 2) {
       log('consolidation group ' + groupId + ' DISSOLVED — revision shrank below a group')
       return null
@@ -1636,9 +1655,7 @@ async function proposeConsolidation(candidates) {
 
   // ---- PROPOSE (opus gate, READ-ONLY, conservative bar) ----
   const menu = residual.map(function (c) { return '- #' + c.issue + ': ' + (c.title || '(no title)') }).join('\n')
-  const proposal = await agent([
-    consolidationScopeGuard(residual.map(function (c) { return c.issue })),
-    '',
+  const proposal = await consolidationAgent(residual.map(function (c) { return c.issue }), 'consolidation:propose', [
     'READ-ONLY consolidation gate for a ticketmill batch run on ' + REPO + '. Decide whether any of these candidate',
     'issues are cheaper to resolve as ONE worktree/branch/research/plan/PR unit instead of independently:',
     menu,
@@ -1655,7 +1672,7 @@ async function proposeConsolidation(candidates) {
     'rationale (1-3 concrete sentences).',
     'Every candidate issue number listed above MUST appear in EXACTLY ONE of: some group\'s members, or ungrouped.',
     'Return groups (possibly empty — that is the expected common case) and ungrouped.',
-  ].join('\n'), Object.assign({ label: 'consolidation:propose', phase: 'Select', schema: CONSOLIDATION_SCHEMA }, stageOpts('consolidation')))
+  ].join('\n'), stageOpts('consolidation'), CONSOLIDATION_SCHEMA)
 
   if (!proposal || !Array.isArray(proposal.groups) || !proposal.groups.length) return out // agent died, or found nothing to propose
 
