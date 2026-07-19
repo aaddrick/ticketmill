@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace-schema.json",
+  "name": "ticketmill",
+  "owner": {
+    "name": "aaddrick"
+  },
+  "description": "Marketplace for the ticketmill plugin — autonomous GitHub issue batch processing.",
+  "plugins": [
+    {
+      "name": "ticketmill",
+      "source": "./",
+      "description": "Batch-process GitHub issues end-to-end with contrarian-gated planning, quality/test loops, and human-reviewed batch PRs. Uses the target project's own agents.",
+      "category": "productivity",
+      "license": "MIT"
+    }
+  ]
+}

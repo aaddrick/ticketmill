@@ -1,0 +1,4 @@
+.worktrees/
+logs/
+node_modules/
+*.log
