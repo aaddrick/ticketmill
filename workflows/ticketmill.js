@@ -1769,6 +1769,9 @@ async function runEngineOwnedGate(ctx) {
 
   log('#' + ctx.issue + ' engine-owned gate: regime (c) incidental change — hard-reverting ' + revertFiles.join(', ') + ' to origin/' + TARGET)
   const revert = await stage(ctx, 'engine-owned-revert', [
+    'The scope guard\'s OUT-OF-SCOPE clause above (engine-owned paths — do not stage, commit, or restore them) does NOT',
+    'apply to this stage: this stage IS the deterministic guardrail acting on your behalf. Carry out the steps below.',
+    '',
     'Regime (c) engine-owned guardrail for issue #' + ctx.issue + ' in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ':',
     'This issue\'s implementation incidentally changed engine-owned path(s) that this issue does NOT target (its title/body',
     'never names them) — these are read-only tooling artifacts of the run itself (the ticketmill profile, agent roster, or',

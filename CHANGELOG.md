@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.24 (2026-07-19)
+
+- Fix (#3, task 3 quality fix): resolved a prompt self-contradiction flagged
+  in quality review. `scopeGuard()`'s engine-owned advisory clause is
+  prepended to EVERY stage prompt, including `runEngineOwnedGate`'s own
+  `engine-owned-revert` stage — so the agent carrying out a regime (c)
+  revert was told, one paragraph earlier in the same prompt, never to stage,
+  commit, or restore those exact paths. The revert stage's prompt now opens
+  with an explicit override line stating the guard clause does not apply to
+  it ("this stage IS the deterministic guardrail acting on your behalf"),
+  ahead of the checkout/commit/push instructions it excuses. Added a
+  dedicated `tests/engine-owned.test.js` case asserting both the guard
+  clause and the override are present, and that the override precedes the
+  checkout instruction.
+
 ## 0.1.23 (2026-07-19)
 
 - Engine-owned path guardrail, task-time backstop (#3, task 3 of 4): two

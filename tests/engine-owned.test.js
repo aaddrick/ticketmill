@@ -426,6 +426,40 @@ test('runEngineOwnedGate: regime (c) — not intentional, reverts ONLY the engin
   assert.ok(ctx.deferred[0].indexOf('dedicated issue') !== -1)
 })
 
+test('runEngineOwnedGate: the revert stage prompt explicitly overrides scopeGuard\'s OUT-OF-SCOPE clause, resolving the self-contradiction (quality review, task 3 iteration 1)', async function () {
+  // scopeGuard() unconditionally prepends an advisory clause telling the agent
+  // never to stage/commit/restore engine-owned paths (see scope-guard.test.js).
+  // stage() prepends that SAME clause to the revert stage's own prompt, which
+  // then instructs the agent to git checkout/commit/push those exact paths —
+  // a contradiction unless the revert prompt itself carries an explicit
+  // exception. Assert that exception is present, not just that the revert
+  // instructions are (already covered by the regime (c) test above).
+  const context = harness.boot()
+  seedGate(context)
+  let revertPrompt = null
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label === '8:engine-owned-probe') return { changed_files: ['.claude/ticketmill.json'] }
+    if (label === '8:engine-owned-revert') { revertPrompt = prompt; return { status: 'success', commit: 'f00dcafe', files_changed: ['.claude/ticketmill.json'], summary: 'reverted' } }
+    throw new Error('unexpected call: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 8, engineOwnedIntentional: false })
+  const result = await context.runEngineOwnedGate(ctx)
+
+  assert.strictEqual(result.ok, true)
+  // the scope guard's clause is still present (it precedes every stage prompt)...
+  assert.ok(revertPrompt.indexOf('are OUT OF SCOPE unless this issue explicitly targets') !== -1)
+  // ...but the revert prompt now explicitly says that clause does not bind this stage,
+  // and the override line appears BEFORE the checkout/commit/push instructions it excuses.
+  const overrideIdx = revertPrompt.indexOf('does NOT')
+  const checkoutIdx = revertPrompt.indexOf('checkout origin/')
+  assert.ok(overrideIdx !== -1, 'revert prompt must explicitly override the scope guard clause')
+  assert.ok(checkoutIdx !== -1, 'revert prompt must contain the checkout instruction')
+  assert.ok(revertPrompt.indexOf('deterministic guardrail acting on your behalf') !== -1)
+  assert.ok(overrideIdx < checkoutIdx, 'the override must precede the git checkout/commit/push instructions it excuses')
+})
+
 test('runEngineOwnedGate: revert stage fails -> records a deferred follow-up instead of halting the run', async function () {
   const context = harness.boot()
   seedGate(context)
