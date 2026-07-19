@@ -639,7 +639,7 @@ function reconcileGroups(map, livePreflights) {
     const live = g.members.filter(function (n) { return resumeByIssue[n] === 'implement' })
     if (live.length < 2) return // dissolved
     let primary = g.primary
-    if (live.indexOf(primary) === -1) primary = live.slice().sort(function (a, b) { return a - b })[0]
+    if (live.indexOf(primary) === -1) primary = stableGroupId(live)
     out.set(groupId, { groupId: groupId, primary: primary, members: live, subsystem: g.subsystem, rationale: g.rationale })
   })
   return out
