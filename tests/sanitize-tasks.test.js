@@ -2,11 +2,14 @@
 
 // Unit tests for sanitizeTasks(ctx, raw) — the lifted, top-level stub-task
 // guard (workflows/ticketmill.js, above `async function implementIssue`).
-// Covers the three documented behaviors: the stub-task guard (description
-// length < 12 dropped), agent normalization to DEFAULT_IMPLEMENTER when the
-// planner names an agent outside IMPLEMENTERS, and id defaulting to the
-// task's 1-based position in the ORIGINAL (pre-filter) array when t.id isn't
-// a number.
+// Covers the documented behaviors: the stub-task guard (description length
+// < 12 dropped), agent normalization to DEFAULT_IMPLEMENTER when the planner
+// names an agent outside IMPLEMENTERS, id defaulting to the task's 1-based
+// position in the ORIGINAL (pre-filter) array when t.id isn't a number, and
+// the origin_issue hallucination guard (a task's origin_issue is kept only
+// when it names a live member of ctx.members — memberIssues(ctx) — for both
+// a singleton ctx and a group ctx with members.length > 1; anything else
+// (hallucinated, stale, missing, or wrong-typed) falls back to ctx.issue).
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
@@ -73,6 +76,45 @@ test('sanitizeTasks: explicit numeric id is preserved as-is', function () {
   const tasks = context.sanitizeTasks(ctx, [{ id: 42, description: 'A perfectly valid task description' }])
 
   assert.strictEqual(tasks[0].id, 42)
+})
+
+test('sanitizeTasks: origin_issue guard (singleton) keeps ctx.issue as-is and rejects hallucinated/stale/missing values', function () {
+  const context = bootWithImplementers()
+  // Singleton: members defaults to [{issue: 20}] (harness.makeCtx), so the
+  // only valid origin is 20 itself.
+  const ctx = harness.makeCtx({ issue: 20 })
+
+  const tasks = context.sanitizeTasks(ctx, [
+    { id: 1, description: 'A task naming its own issue as origin', origin_issue: 20 }, // valid -> kept as-is
+    { id: 2, description: 'A task naming a hallucinated origin', origin_issue: 999 }, // not a member -> falls back
+    { id: 3, description: 'A task naming a stale origin issue', origin_issue: 5 }, // not a member -> falls back
+    { id: 4, description: 'A task with no origin_issue field at all' }, // missing -> falls back
+    { id: 5, description: 'A task with a non-numeric origin_issue', origin_issue: '20' }, // wrong type -> falls back
+  ])
+
+  assert.strictEqual(tasks[0].origin_issue, 20)
+  assert.strictEqual(tasks[1].origin_issue, 20)
+  assert.strictEqual(tasks[2].origin_issue, 20)
+  assert.strictEqual(tasks[3].origin_issue, 20)
+  assert.strictEqual(tasks[4].origin_issue, 20)
+})
+
+test('sanitizeTasks: origin_issue guard (group) keeps any live member, rejects a plausible-looking non-member', function () {
+  const context = bootWithImplementers()
+  // Group unit: primary is 7, live members are 7 and 9 (deriveUnits() shape).
+  const ctx = harness.makeCtx({ issue: 7, members: [{ issue: 7 }, { issue: 9 }] })
+
+  const tasks = context.sanitizeTasks(ctx, [
+    { id: 1, description: 'A task naming the primary as origin', origin_issue: 7 }, // valid member -> kept
+    { id: 2, description: 'A task naming the other live member', origin_issue: 9 }, // valid member -> kept as-is, NOT coerced to primary
+    { id: 3, description: 'A task naming a plausible but non-member issue', origin_issue: 8 }, // between the two members but not one of them -> falls back to primary
+    { id: 4, description: 'A task with no origin_issue field at all' }, // missing -> falls back to primary
+  ])
+
+  assert.strictEqual(tasks[0].origin_issue, 7)
+  assert.strictEqual(tasks[1].origin_issue, 9)
+  assert.strictEqual(tasks[2].origin_issue, 7)
+  assert.strictEqual(tasks[3].origin_issue, 7)
 })
 
 test('sanitizeTasks: empty/absent raw list returns an empty array', function () {

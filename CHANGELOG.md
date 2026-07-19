@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.18 (2026-07-19)
+
+- Added a consolidation gate to Select (#14). It's an opus-tier judgment call,
+  deliberately conservative: shared files alone are never sufficient reason. It
+  proposes folding selected issues sharing a subsystem and acceptance surface
+  (or an explicit dependency) into one worktree/branch/research/plan/PR. The
+  proposal runs the same capped contrarian challenge pattern as the
+  approach/plan gates, with one asymmetry: hitting the iteration cap dissolves
+  the contested group back to independent issues rather than proceeding with
+  caveats, since independent per-issue processing is always a safe fallback. A
+  group's physical identity (worktree, branch, PR head) binds to a stable
+  group id rather than the mutable "primary" issue, so a primary can re-anchor
+  onto another live member after claims settle without moving anyone's
+  worktree. Every unit of work above the harness split is layered on top of the
+  existing per-issue path (`ctx.members = [ctx.issue]` for a singleton), so a
+  no-overlap run with zero proposed groups is byte-for-byte unchanged. A failed
+  group counts as one circuit-breaker increment; every member's claim releases
+  and gets its own resume comment naming the group and failing stage; resuming
+  re-proposes the same group from that comment's marker instead of reprocessing
+  members individually. Disable via the new `profile.consolidation: false` flag.
+  See docs/ARCHITECTURE.md's "Consolidation gate" and "Failure semantics"
+  entries for the full design rationale.
+
 ## 0.1.17 (2026-07-19)
 
 - Test quality fix (#11): the previous test pass only exercised the pure
