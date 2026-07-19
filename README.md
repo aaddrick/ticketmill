@@ -261,6 +261,7 @@ load-bearing fields:
 | `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes) |
 | `models` | Per-stage model/effort overrides |
 | `consolidation` | Default `true`. Set `false` to disable the Select-phase consolidation gate entirely (a resumed run still heals any group a prior run already committed to) |
+| `serialize_globs` | Optional, default `[]`. Patterns worth trusting as a lane-scheduling hint beyond predicted-file overlap alone: a shared schema, a magnet config, anything two issues could conflict on without their own predicted paths overlapping |
 
 ## Repo layout
 
