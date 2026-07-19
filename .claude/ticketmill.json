@@ -20,6 +20,7 @@
   ],
   "browser": null,
   "lockstep_installed_paths": [".claude/workflows/ticketmill.js"],
+  "serialize_globs": ["workflows/ticketmill.js", ".claude/workflows/ticketmill.js"],
   "models": {},
   "roles": {
     "implementers": ["ticketmill-implementer"],

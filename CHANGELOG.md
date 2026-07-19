@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.27 (2026-07-19)
+
+- Set `serialize_globs` in this repo's own profile to the two engine copies
+  (`workflows/ticketmill.js`, `.claude/workflows/ticketmill.js`). Lane
+  scheduling (#1) predicts file overlap heuristically; this pins the known
+  magnet so engine-touching issues are never raced even when prediction
+  misses. Batch 2026-07-19-d demonstrated the failure mode: issues #1 and #2
+  each landed ~1,000 lines in the engine ahead of #3, whose PR then needed
+  manual conflict resolution.
+
 ## 0.1.26 (2026-07-19)
 
 - Docs (#3, tech-docs stage): added an "Engine-owned path guardrail: three
