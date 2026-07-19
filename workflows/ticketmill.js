@@ -305,6 +305,12 @@ const PREFLIGHT_SCHEMA = {
     commits_ahead: { type: ['integer', 'null'] },
     resume_point: { enum: ['skip', 'process_pr', 'implement'] },
     reason: { type: 'string' },
+    // OPTIONAL lane-scheduling prediction (issue #1): real repo-relative paths
+    // resolved against origin/TARGET (never guessed), and in-batch issue refs
+    // parsed from body text. Both fail open to [] — see the probe prompt below
+    // and deriveUnits() for how they're threaded onto the unit shape.
+    predicted_files: { type: 'array', items: { type: 'string' } },
+    depends_on: { type: 'array', items: { type: 'integer' } },
   },
 }
 const SETUP_SCHEMA = {
@@ -728,6 +734,23 @@ function reconcileGroups(map, livePreflights) {
   return out
 }
 
+// unionField: dedupe the union of an array-valued field across a group's live
+// member refs, in first-seen order. Shared by deriveUnits() below for both
+// predicted_files and depends_on so a group unit sees everything its members
+// individually predicted, not just the primary's own slice.
+function unionField(memberRefs, field) {
+  const seen = {}
+  const out = []
+  for (const m of memberRefs) {
+    const arr = m && Array.isArray(m[field]) ? m[field] : []
+    for (const v of arr) {
+      const key = String(v)
+      if (!seen[key]) { seen[key] = true; out.push(v) }
+    }
+  }
+  return out
+}
+
 // deriveUnits: the final translation from "reconciled groups" + "live preflights" to
 // the array runPool() actually iterates. Every reconciled group becomes ONE unit
 // (a live-preflight-shaped object for the primary, with members: the live preflight
@@ -735,6 +758,16 @@ function reconcileGroups(map, livePreflights) {
 // live preflight becomes an ordinary singleton unit (members: [self], groupId: null)
 // — the exact shape processIssue()'s ctx init below defaults to, so a no-group run
 // produces units identical to today's preflights array.
+//
+// predicted_files/depends_on (issue #1, lane scheduling): every preflight carries
+// these two OPTIONAL arrays (normalized to [] by the probe's .then() above). A
+// singleton unit carries its own straight through the Object.assign spread below
+// (p.predicted_files/p.depends_on are already on p) — no extra work needed. A
+// group unit's predicted_files is the union over every live member (unionField
+// above); its depends_on is that same union MINUS any ref onto a fellow member of
+// THIS group — that dependency is already satisfied by the merge (both issues land
+// in the same unit), so keeping it would dangle a lane edge onto an issue number
+// that no longer exists as its own unit once grouped.
 function deriveUnits(reconciledMap, livePreflights) {
   const byIssue = {}
   for (const p of livePreflights || []) byIssue[p.issue] = p
@@ -745,7 +778,11 @@ function deriveUnits(reconciledMap, livePreflights) {
     if (memberRefs.length < 2) return // a member vanished from livePreflights entirely; treat as dissolved
     const primaryRef = byIssue[g.primary] || memberRefs[0]
     memberRefs.forEach(function (m) { consumed[m.issue] = true })
-    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale }))
+    const memberIssueSet = {}
+    memberRefs.forEach(function (m) { memberIssueSet[m.issue] = true })
+    const predictedFiles = unionField(memberRefs, 'predicted_files')
+    const dependsOn = unionField(memberRefs, 'depends_on').filter(function (n) { return !memberIssueSet[n] })
+    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale, predicted_files: predictedFiles, depends_on: dependsOn }))
   })
   for (const p of (livePreflights || [])) {
     if (consumed[p.issue]) continue
@@ -2817,27 +2854,63 @@ const learnPromise = agent([
   .catch(function (e) { log('learnings digest failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
 
 // ---- Select: preflight probe (the GitHub-state healing layer) ----
+// batchIssueNumbers: this run's whole candidate set, used below to scope
+// depends_on parsing — a body reference to an issue outside the batch is
+// dropped (there's no unit for computeLanes to point it at).
+const batchIssueNumbers = issueList.map(function (it) { return it.number })
 const preflights = (await Promise.all(issueList.map(function (it) {
   return agent([
     'Probe the current state of GitHub issue #' + it.number + ' in ' + REPO + ' (READ-ONLY: gh + git inspection, no changes).',
     '',
-    '1. gh issue view ' + it.number + ' --repo ' + REPO + ' --json state,title',
+    '1. gh issue view ' + it.number + ' --repo ' + REPO + ' --json state,title,body',
     '2. Related PRs: gh pr list --repo ' + REPO + ' --state all --search "' + it.number + '" --json number,state,headRefName,mergedAt',
     '   A PR is related if its head branch starts with "issue-' + it.number + '-" or its body references #' + it.number + '.',
     '   Prefer: merged > open > closed-unmerged. Report its number and state.',
     '3. Local: does ' + WORKTREES + '/issue-' + it.number + ' exist, and on what branch? Commits ahead:',
     '   git -C ' + ROOT + ' rev-list --count origin/' + TARGET + '..<branch> 2>/dev/null (0/none if no branch).',
     '',
+    '4. predicted_files (best-effort lane-scheduling hint — fail open to [] on ANY doubt, never guess a path):',
+    '   a. From the issue title + body, extract ONLY high-signal identifiers: backticked spans (`like this`),',
+    '      quoted spans ("like this"), path-like strings (contain a / or a file extension such as .js/.md/.json/.sh),',
+    '      and code-symbol tokens (PascalCase, camelCase, snake_case, or ALL_CAPS words of 3+ chars).',
+    '      REJECT bare dictionary/English nouns used in ordinary prose (e.g. "engine", "button", "config" alone,',
+    '      with no code formatting, path shape, or distinctive casing) — those are not identifiers.',
+    '      If nothing clears this bar, predicted_files = [] and skip the rest of this step.',
+    '   b. git -C ' + ROOT + ' fetch origin ' + TARGET + ' (read-only — updates the ref only, never checks anything out).',
+    '   c. Resolve each surviving identifier against the REAL tree at origin/' + TARGET + ' (never the working directory,',
+    '      which may be on a different branch): git -C ' + ROOT + ' grep -l -I -F -i -- "<identifier>" origin/' + TARGET + '',
+    '      for a content match, and git -C ' + ROOT + ' ls-tree -r --name-only origin/' + TARGET + ' filtered for a',
+    '      case-insensitive substring match for a path/filename match. Keep ONLY the exact repo-relative paths those',
+    '      commands actually return — never fabricate or normalize a path yourself.',
+    '   d. Dedupe and cap at 20 paths. If every resolution comes back empty, or any command errors, predicted_files = [].',
+    '5. depends_on (best-effort lane-scheduling hint — fail open to [] on ANY doubt):',
+    '   a. Scan the issue body for "depends on #N", "depends-on #N", or "follow-up to #N" (case-insensitive). Collect each N.',
+    '   b. Drop any N that is not one of this batch\'s issue numbers (' + batchIssueNumbers.join(', ') + '), and drop N == ' + it.number + '.',
+    '   c. For each remaining N, check whether #N itself ALSO references "depends on #' + it.number + '" or',
+    '      "follow-up to #' + it.number + '" in ITS OWN body (gh issue view N --repo ' + REPO + ' --json body, read-only).',
+    '      If so this is a two-issue cycle: keep the edge ONLY on the lower-numbered issue of the pair and drop it from',
+    '      the higher-numbered one (deterministic by issue number, so both probes agree without coordinating).',
+    '   d. Return the surviving numbers as depends_on. Empty array if none, or on any doubt/error.',
+    '',
     'Decide resume_point:',
     '- "skip": issue is closed OR a related PR is already merged',
     '- "process_pr": a related PR is OPEN (implementation exists; it needs review + merge)',
     '- "implement": otherwise (fresh, or partial branch/worktree — implementation will continue from existing commits)',
-    'Return issue, title, issue_state, pr_number, pr_state, branch, worktree_exists, commits_ahead, resume_point, reason (one line).',
+    'Return issue, title, issue_state, pr_number, pr_state, branch, worktree_exists, commits_ahead, resume_point, reason (one line),',
+    'predicted_files (array of real repo-relative paths, [] if none/uncertain), depends_on (array of in-batch issue numbers, [] if none/uncertain).',
   ].join('\n'), { label: it.number + ':preflight', phase: 'Select', schema: PREFLIGHT_SCHEMA, model: M.probe.model, effort: M.probe.effort })
     .then(function (r) {
-      if (r) { if (!r.title && it.title) r.title = it.title; return r }
+      if (r) {
+        if (!r.title && it.title) r.title = it.title
+        // Normalize the two optional prediction fields to real arrays regardless
+        // of what the agent omitted/returned — every downstream reader (deriveUnits,
+        // eventually computeLanes) can then assume Array.isArray() without re-checking.
+        r.predicted_files = Array.isArray(r.predicted_files) ? r.predicted_files : []
+        r.depends_on = Array.isArray(r.depends_on) ? r.depends_on : []
+        return r
+      }
       // probe died -> assume full implement; the pipeline stages are individually idempotent
-      return { issue: it.number, title: it.title || '', issue_state: 'unknown', pr_number: null, pr_state: 'none', branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)' }
+      return { issue: it.number, title: it.title || '', issue_state: 'unknown', pr_number: null, pr_state: 'none', branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)', predicted_files: [], depends_on: [] }
     })
 }))).filter(Boolean)
 
