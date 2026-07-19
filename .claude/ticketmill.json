@@ -1,0 +1,34 @@
+{
+  "repo": "aaddrick/ticketmill",
+  "test_command": "node --check workflows/ticketmill.js && bash -n scripts/setup-worktree.sh && node -e \"['.claude-plugin/plugin.json','.claude-plugin/marketplace.json'].forEach(f=>JSON.parse(require('fs').readFileSync(f,'utf8')))\"",
+  "test_globs": ["workflows/**", "scripts/**", ".claude-plugin/**", "tests/**"],
+  "install_commands": [],
+  "env_files": [],
+  "simplify_globs": ["workflows/**/*.js", "scripts/**/*.sh"],
+  "docblock_globs": null,
+  "docs_dir": "docs",
+  "logs_dir": "logs/ticketmill",
+  "claim_label": "ticketmill",
+  "verify_notes": [
+    "This repo IS the ticketmill plugin: the engine (workflows/ticketmill.js), skills (skills/*/SKILL.md), and setup script are the product. There is no runtime app to boot.",
+    "The engine cannot be imported by Node — it uses Workflow-tool globals (agent, parallel, pipeline, phase, log, args, budget) and top-level await. Test logic via extracted pure helpers or a harness that stubs those globals.",
+    "Engine sandbox rules: no Date.now(), Math.random(), or argless new Date(); no fs/Node APIs; plain JS only. node --check does NOT catch these.",
+    "Release discipline: every change updates CHANGELOG.md and bumps .claude-plugin/plugin.json version (conventional commits). marketplace.json has no version field — never add one.",
+    "The current test_command is a syntax/manifest smoke check only — a real test harness is being built up via issues; update test_command when it lands.",
+    "Node >= 22 required."
+  ],
+  "browser": null,
+  "models": {},
+  "roles": {
+    "implementers": ["ticketmill-implementer"],
+    "default_implementer": "ticketmill-implementer",
+    "task_reviewer": null,
+    "spec_reviewer": null,
+    "code_reviewer": "ticketmill-code-reviewer",
+    "contrarian": "contrarian",
+    "test_validator": "ticketmill-test-validator",
+    "simplifier": null,
+    "docblock_writer": null,
+    "doc_writer": null
+  }
+}

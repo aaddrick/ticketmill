@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.9 (2026-07-19)
+
+- Onboarded this repo for its own mill runs (dogfooding): `.claude/ticketmill.json`
+  profile, forged implementer / code-reviewer / test-validator agents, contrarian
+  copied into the project roster, engine + setup script copied to `.claude/`.
+- The profile's test_command is a syntax/manifest smoke check for now; issues
+  #4-#7 build the real test engine via ticketmill itself.
+
 ## 0.1.8 (2026-07-18)
 
 - README: the Quickstart dry-run example is a plain request now, no longer a
