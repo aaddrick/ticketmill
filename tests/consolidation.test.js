@@ -309,6 +309,140 @@ test('reconcileGroups: a lost primary re-anchors onto the lowest-numbered live m
   assert.deepStrictEqual(g.members.slice(), [2, 3])
 })
 
+// ---- worktreeAnchor: stable groupId anchor vs. mutable primary ----
+
+test('worktreeAnchor: for a group unit, anchors on the stable groupId even when it differs from the (re-anchored) primary issue', function () {
+  const context = bootConsolidation()
+  // A re-anchor scenario: the group's stable id is 5 (its original lowest member),
+  // but ctx.issue (the current logical primary) has moved on to 7 — worktreeAnchor
+  // must still return the stable id, never ctx.issue, or a resumed run would spawn
+  // a second, orphaned worktree (see the function's own comment).
+  const ctx = harness.makeCtx({ issue: 7, groupId: 5, members: [{ issue: 5 }, { issue: 7 }] })
+  assert.strictEqual(context.worktreeAnchor(ctx), 5)
+  assert.notStrictEqual(context.worktreeAnchor(ctx), ctx.issue)
+})
+
+test('worktreeAnchor: a singleton (groupId null) anchors on ctx.issue itself', function () {
+  const context = bootConsolidation()
+  const ctx = harness.makeCtx({ issue: 9, groupId: null })
+  assert.strictEqual(context.worktreeAnchor(ctx), 9)
+})
+
+// ---- proposeConsolidation DEDUPE: overlapping proposed groups ----
+
+test('proposeConsolidation: DEDUPE drops a later proposed group that overlaps an already-claimed member, first-seen wins', async function () {
+  const context = bootConsolidation()
+  const candidates = [
+    { issue: 1, title: 'A', resume_point: 'implement' },
+    { issue: 2, title: 'B (claimed by both proposed groups)', resume_point: 'implement' },
+    { issue: 3, title: 'C', resume_point: 'implement' },
+    { issue: 4, title: 'D', resume_point: 'implement' },
+  ]
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label === 'consolidation:marker-probe') return { markers: [] }
+    if (label === 'consolidation:propose') {
+      return {
+        groups: [
+          { primary: 1, members: [1, 2], subsystem: 's1', shared_surface: 'surf1', rationale: 'r1' },
+          // Shares issue #2 with the first group above -> must be dropped whole,
+          // not trimmed (trimming could orphan its primary or shrink it further).
+          { primary: 2, members: [2, 3], subsystem: 's2', shared_surface: 'surf2', rationale: 'r2' },
+        ],
+        ungrouped: [4],
+      }
+    }
+    if (label === 'consolidation:challenge-g1-i1') {
+      return { verdict: 'sound_with_caveats', summary: 'confirmed', findings: [] }
+    }
+    if (/^consolidation:(challenge|revise)-g2-/.test(label)) {
+      throw new Error('the overlapping second group must never reach the contrarian challenge: ' + label)
+    }
+    throw new Error('unexpected consolidation call: ' + label)
+  })
+
+  const map = await context.proposeConsolidation(candidates)
+
+  // Only the first-claimed group (#1, members [1,2]) survives.
+  assert.strictEqual(map.size, 1)
+  const entry = map.get(1)
+  assert.deepStrictEqual(entry.members.slice(), [1, 2])
+
+  // The dropped group's non-overlapping member (#3) falls through as an ordinary
+  // singleton once reconciled/derived, same as #4 (which was never grouped at all).
+  const reconciled = context.reconcileGroups(map, candidates)
+  const units = context.deriveUnits(reconciled, candidates)
+  assert.strictEqual(units.length, 3) // group-unit {1,2} + singleton 3 + singleton 4
+  const singleton3 = units.find(function (u) { return u.issue === 3 })
+  assert.ok(singleton3)
+  assert.strictEqual(singleton3.groupId, null)
+  const singleton4 = units.find(function (u) { return u.issue === 4 })
+  assert.ok(singleton4)
+  assert.strictEqual(singleton4.groupId, null)
+
+  // No challenge call ever fired for the dropped group.
+  const g2Calls = context.agent.calls.filter(function (c) { return c.opts.label.indexOf('-g2-') !== -1 })
+  assert.strictEqual(g2Calls.length, 0)
+})
+
+// ---- postConsolidationMarkers: posts the group marker on the primary and the ----
+// ---- member marker on every other live member; skips singleton units ----
+
+test('postConsolidationMarkers: posts one group marker on the primary and one member marker per other member; skips singletons', async function () {
+  const context = bootConsolidation({ REPO: 'aaddrick/ticketmill-fixture' })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label === 'consolidation:mark-primary-g1') return { posted: true }
+    if (label === 'consolidation:mark-member-2') return { posted: true }
+    if (label === 'consolidation:mark-member-3') return { posted: true }
+    throw new Error('unexpected consolidation-marker call for a run with one group + one singleton: ' + label)
+  })
+
+  const units = [
+    {
+      issue: 1, groupId: 1, subsystem: 'shared subsystem', rationale: 'shared rationale',
+      members: [{ issue: 1 }, { issue: 2 }, { issue: 3 }],
+    },
+    { issue: 9, groupId: null, members: [{ issue: 9 }] }, // singleton — must be skipped entirely
+  ]
+
+  await context.postConsolidationMarkers(units)
+
+  assert.strictEqual(context.agent.calls.length, 3) // 1 primary marker + 2 member markers; nothing for the singleton
+  const labels = context.agent.calls.map(function (c) { return c.opts.label })
+  assert.deepStrictEqual(labels.sort(), ['consolidation:mark-member-2', 'consolidation:mark-member-3', 'consolidation:mark-primary-g1'])
+
+  const primaryCall = context.agent.calls.find(function (c) { return c.opts.label === 'consolidation:mark-primary-g1' })
+  assert.ok(primaryCall.prompt.includes('Post the consolidation GROUP marker comment on issue #1'))
+  assert.ok(primaryCall.prompt.includes(context.buildConsolidationGroupComment('aaddrick/ticketmill-fixture', 1, 1, [1, 2, 3], 'shared subsystem', 'shared rationale')))
+  // idempotency check present verbatim
+  assert.ok(primaryCall.prompt.includes('SKIP posting if any comment\'s first line is exactly "## Consolidation Group" and it contains'))
+
+  const member2Call = context.agent.calls.find(function (c) { return c.opts.label === 'consolidation:mark-member-2' })
+  assert.ok(member2Call.prompt.includes('Post the consolidation MEMBER marker comment on issue #2'))
+  assert.ok(member2Call.prompt.includes(context.buildConsolidatedMemberComment('aaddrick/ticketmill-fixture', 2, 1, 1, 'shared rationale')))
+  assert.ok(member2Call.prompt.includes('SKIP posting if any comment\'s first line is exactly "## Consolidated"'))
+
+  const member3Call = context.agent.calls.find(function (c) { return c.opts.label === 'consolidation:mark-member-3' })
+  assert.ok(member3Call.prompt.includes('Post the consolidation MEMBER marker comment on issue #3'))
+})
+
+test('postConsolidationMarkers: never posts a member marker for the primary itself, and no-ops entirely when every unit is a singleton', async function () {
+  const context = bootConsolidation()
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    throw new Error('no marker calls expected for an all-singleton run: ' + ((opts && opts.label) || ''))
+  })
+
+  await context.postConsolidationMarkers([
+    { issue: 1, groupId: null, members: [{ issue: 1 }] },
+    { issue: 2, groupId: null, members: [{ issue: 2 }] },
+  ])
+
+  assert.strictEqual(context.agent.calls.length, 0)
+})
+
 test('reconcileGroups: fewer than 2 live members dissolves the group entirely', function () {
   const context = bootConsolidation()
   const map = new Map()
