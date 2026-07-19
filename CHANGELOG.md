@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.3 (2026-07-18)
+
+- README: expanded the one-line requirements note into a full Requirements
+  section (Workflow tool, authenticated `gh` with repo write access, git
+  worktrees, GitHub remote, verified profile, locally runnable toolchain,
+  optional browser MCP).
+- README: documented all ten `roles` profile keys in a table, with each role's
+  pipeline responsibility drawn from the engine's built-in charters, and
+  clarified when a fallback charter is a Verification Gap (missing agent file)
+  versus not (role explicitly `null`).
+
 ## 0.1.2 (2026-07-18)
 
 - The bundled contrarian template is now the verbatim canonical agent from

@@ -20,8 +20,28 @@ claude plugin marketplace add aaddrick/ticketmill
 /plugin install ticketmill@ticketmill
 ```
 
-Requirements: Claude Code with the Workflow tool available, `gh` authenticated with
-write access to the target repo, and `git`.
+## Requirements
+
+- **Claude Code with the `Workflow` tool available.** The engine is a workflow
+  script; the `mill` skill hard-stops if the tool is missing rather than simulate
+  the pipeline inline (an imitation run has no journal, claims, breakers, or
+  resumability).
+- **`gh` (GitHub CLI), authenticated, with write access to the target repo.**
+  `gh auth status` must succeed and the token must be able to write to the repo:
+  the engine reads issues and creates labels, issue/PR comments, branches, and
+  pull requests. `mill-init` probes this during onboarding.
+- **`git`** with worktree support (any modern version). Each issue is implemented
+  in its own worktree branched from the batch branch.
+- **A target repo that is a git clone with a GitHub remote** (`gh repo view` must
+  resolve an `owner/name` slug).
+- **A per-repo profile at `.claude/ticketmill.json`**, written by
+  `/ticketmill:mill-init`. No profile, no run. The engine never guesses a
+  toolchain.
+- **A locally runnable toolchain.** The profile's `install_commands` and
+  `test_command` must work on the machine running the batch. `mill-init`'s doctor
+  pass proves this once in a scratch worktree before the profile is written.
+- Optional: **browser verification** (`profile.browser`) additionally needs a
+  servable UI and the Claude browser MCP tools available in the session.
 
 ## Quickstart
 
@@ -80,15 +100,29 @@ incident retrospectives. The machinery it keeps:
 
 ## How agents work
 
-Ticketmill thinks in roles: implementers (per domain), task reviewer, spec
-reviewer, code reviewer, contrarian, test validator, simplifier, docblock writer,
-doc writer. Your profile maps roles to agents in your repo's `.claude/agents/`.
+Ticketmill thinks in roles. Your profile's `roles` map assigns each role to an
+agent in your repo's `.claude/agents/`. Every role also has a built-in fallback
+charter, so a role left `null` still runs on the generic charter. If the profile
+names an agent whose file is missing, the engine uses the fallback and lists the
+gap in the batch PR's Verification Gaps section.
+
+| Role (profile key) | What it does in the pipeline |
+|---|---|
+| `implementers` | The agents that write code: an array, ideally one per domain (e.g. backend, frontend). The planner assigns each task to the best fit |
+| `default_implementer` | The implementer used when no domain-specific one fits a task |
+| `task_reviewer` | After each task: verifies the implementation achieves the task goal against the actual diff |
+| `spec_reviewer` | At the PR gate: verifies the PR fulfills the *issue's* requirements and flags scope creep for removal |
+| `code_reviewer` | At the PR gate (parallel with spec review): correctness, security, error handling, codebase conventions |
+| `contrarian` | Devil's-advocate gate that stress-tests the approach and the task plan before any code is written |
+| `test_validator` | Audits tests for cheating: hollow assertions, mock abuse, missing edge cases, tests that pass without exercising the change |
+| `simplifier` | Quality loop: refines changed code for clarity and consistency without changing behavior (gated by `simplify_globs`) |
+| `docblock_writer` | Writes doc comments for changed code in the project's style (gated by `docblock_globs`) |
+| `doc_writer` | Writes technical design docs into `docs_dir` after review passes (skipped when `docs_dir` is `null`) |
 
 One mechanism, deliberately: a stage's subagent is instructed to read the mapped
 agent file and adopt its persona. The engine never depends on the session's agent
 registry, so a freshly generated agent works in the very next run, and behavior is
-identical before and after a session restart. Unfilled roles fall back to built-in
-charters and are reported as such.
+identical before and after a session restart.
 
 Missing an agent for a role? The contrarian role ships with a bundled template
 that mill-init copies into your repo (preferring a `~/.claude/agents/contrarian.md`
