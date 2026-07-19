@@ -457,6 +457,219 @@ const LEARNINGS_SCHEMA = {
     performance: { type: 'string' }, error_patterns: { type: 'string' }, workflow: { type: 'string' },
   },
 }
+// CONSOLIDATION_SCHEMA: the opus-tier Select-phase gate that proposes grouping
+// selected issues into ONE worktree/branch/research/plan/PR unit. Conservative bar —
+// grouping is the exception, so groups[] is expected to be empty on most runs. Each
+// group names an explicit reason (subsystem + shared acceptance surface, OR an
+// explicit dependency) so shared files alone never qualify; the prompt that drives
+// this schema (added when the gate itself is wired in) enforces that at least one of
+// shared_surface/dependency is populated. ungrouped[] carries every candidate issue
+// the gate declined to group, so the caller can assert groups+ungrouped covers every
+// candidate.
+const CONSOLIDATION_SCHEMA = {
+  type: 'object', required: ['groups', 'ungrouped'],
+  properties: {
+    groups: { type: 'array', items: { type: 'object', required: ['primary', 'members', 'subsystem', 'rationale'], properties: {
+      primary: { type: 'integer' },              // issue number carrying the comment trail
+      members: { type: 'array', items: { type: 'integer' } }, // every issue in the group, primary included
+      subsystem: { type: 'string' },
+      shared_surface: { type: 'string' },        // the shared acceptance surface, if that's the reason
+      dependency: { type: 'string' },            // the explicit dependency, if that's the reason instead
+      rationale: { type: 'string' },
+    } } },
+    ungrouped: { type: 'array', items: { type: 'integer' } },
+  },
+}
+
+// =============================================================================
+// CONSOLIDATION (unit-of-work) FOUNDATIONS
+//
+// A "unit" is either a singleton (today's per-issue path, verbatim) or a group
+// (a primary issue + members[] processed as one worktree/branch/research/plan/PR).
+// With zero groups every unit is a singleton, so a no-overlap run behaves
+// byte-for-byte like today — that's the acceptance bar this whole abstraction is
+// built to preserve.
+//
+// Judgment (the opus gate + capped contrarian challenge that PROPOSES groups) is not
+// implemented here — this section only holds the pure, harness-testable plumbing it
+// will be built on: the schema above, the comment markers that let a resumed run
+// recognize a prior consolidation, and the reducers that turn "what the markers say"
+// plus "what's live right now" into the units runPool() actually processes.
+//
+// STABLE GROUP ID: a group's PHYSICAL identity (worktree issue-N, branch issue-N-*,
+// PR head — see scripts/setup-worktree.sh and the process_pr path) is bound to a
+// group id that is chosen once and never changes. The group's LOGICAL primary (the
+// issue carrying the comment trail) can move on re-anchor (e.g. the original primary
+// got skip-flipped by a resume), but the group id does not — mixing the two up is
+// exactly the contradiction the approach-gate contrarian caught. By convention the
+// group id is the lowest issue number that has EVER been a member (see
+// stableGroupId()); it is also the key healGroups()/reconcileGroups() index by.
+// =============================================================================
+
+// Comment titles (first line) that gate consolidation markers apart from ordinary
+// trail comments. Every marker comment still ends with the canonical scope-guard
+// line "<!-- ticketmill <repo>#<issue> -->" (see scopeGuard()) — these titles add a
+// second, group-specific line of machine-parseable content ABOVE that line; they
+// never replace or reshape the canonical marker itself.
+const CONSOLIDATION_MEMBER_TITLE = '## Consolidated'       // posted on an absorbed member's own issue
+const CONSOLIDATION_GROUP_TITLE = '## Consolidation Group' // posted on the group's primary issue
+
+// buildConsolidatedMemberComment: the comment left on an absorbed member's issue.
+// Names the CURRENT primary for humans reading the trail, and the STABLE groupId
+// (never the primary, which can move — see reconcileGroups) for the machine heal
+// pass to key off of.
+function buildConsolidatedMemberComment(repo, memberIssue, primaryIssue, groupId, rationale) {
+  return [
+    CONSOLIDATION_MEMBER_TITLE,
+    'Consolidated into #' + primaryIssue + ' (group ' + groupId + ') — implemented as one unit.',
+    rationale ? 'Rationale: ' + rationale : '',
+    '<!-- ticketmill ' + repo + '#' + memberIssue + ' -->',
+  ].filter(Boolean).join('\n')
+}
+
+// buildConsolidationGroupComment: the comment left on the group's primary issue,
+// enumerating every live member so a resumed run's heal pass can reconstruct the
+// whole group even if it never fetches each member's own marker comment.
+function buildConsolidationGroupComment(repo, primaryIssue, groupId, members, subsystem, rationale) {
+  return [
+    CONSOLIDATION_GROUP_TITLE,
+    'group: ' + groupId,
+    'members: ' + members.map(function (m) { return '#' + m }).join(', '),
+    'subsystem: ' + subsystem,
+    rationale ? 'rationale: ' + rationale : '',
+    '<!-- ticketmill ' + repo + '#' + primaryIssue + ' -->',
+  ].filter(Boolean).join('\n')
+}
+
+// parseConsolidatedMemberComment: null unless body is a member marker (title-gated,
+// so an unrelated comment that merely mentions "consolidated" is never misread).
+// Returns { primary, groupId }.
+function parseConsolidatedMemberComment(body) {
+  if (!body || String(body).split('\n')[0].trim() !== CONSOLIDATION_MEMBER_TITLE) return null
+  const m = /Consolidated into #(\d+) \(group (\S+)\)/.exec(body)
+  if (!m) return null
+  return { primary: Number(m[1]), groupId: Number(m[2]) }
+}
+
+// parseConsolidationGroupComment: null unless body is a group marker (title-gated).
+// Returns { groupId, members: [issueNumbers], subsystem, rationale }.
+function parseConsolidationGroupComment(body) {
+  if (!body || String(body).split('\n')[0].trim() !== CONSOLIDATION_GROUP_TITLE) return null
+  const g = /^group:\s*(\S+)\s*$/m.exec(body)
+  const mem = /^members:\s*(.+)$/m.exec(body)
+  if (!g || !mem) return null
+  const members = mem[1].split(',')
+    .map(function (s) { return Number(s.trim().replace(/^#/, '')) })
+    .filter(function (n) { return n > 0 })
+  if (!members.length) return null
+  const sub = /^subsystem:\s*(.*)$/m.exec(body)
+  const rat = /^rationale:\s*(.*)$/m.exec(body)
+  return { groupId: Number(g[1]), members: members, subsystem: sub ? sub[1].trim() : '', rationale: rat ? rat[1].trim() : '' }
+}
+
+// stableGroupId: a group's immutable physical-identity anchor (see comment block
+// above) — the lowest issue number ever proposed as a member. Chosen once, at first
+// proposal; re-anchoring the logical primary (reconcileGroups) never changes it.
+function stableGroupId(memberIssueNumbers) {
+  return Math.min.apply(null, memberIssueNumbers)
+}
+
+// consolidationEnabled: profile.consolidation defaults to true (the gate runs for any
+// run with >1 'implement' candidate); an explicit false disables the gate entirely —
+// free, with no gate agent call at all. A single-issue run skips it for free too,
+// since the gate only ever has one candidate to look at.
+function consolidationEnabled(profile) {
+  return !!profile && profile.consolidation !== false
+}
+
+// healGroups: reconstruct prior consolidation decisions from GitHub comment markers
+// so a resumed run recognizes an existing group instead of reprocessing its members
+// individually. Keyed by the STABLE groupId (never the mutable primary) so a
+// re-anchor from a prior run is picked up as the same group, not treated as new.
+//   preflights: this run's live preflight probes — used only to know which issue
+//               numbers are in play right now; healGroups never mutates them.
+//   markers: [{ issue, body }] — the single most relevant consolidation-marker
+//            comment found on each candidate issue, if any (produced by the
+//            Select-phase marker-fetch pass this reducer is pure of). Both a group's
+//            own marker and its members' markers may appear; either alone is enough
+//            to reconstruct the group (the member markers act as a fallback in case
+//            the primary's own comment was never fetched or was deleted).
+// Returns Map<groupId, { groupId, primary, members: [issueNumbers], subsystem, rationale }>.
+function healGroups(preflights, markers) {
+  const known = {}
+  for (const p of preflights || []) known[p.issue] = true
+  const groups = new Map()
+  const memberOnly = []
+  for (const rec of markers || []) {
+    if (!rec || !known[rec.issue]) continue
+    const g = parseConsolidationGroupComment(rec.body)
+    if (g) {
+      groups.set(g.groupId, { groupId: g.groupId, primary: rec.issue, members: g.members.slice(), subsystem: g.subsystem, rationale: g.rationale })
+      continue
+    }
+    const m = parseConsolidatedMemberComment(rec.body)
+    if (m) memberOnly.push({ issue: rec.issue, primary: m.primary, groupId: m.groupId })
+  }
+  // Fallback: reconstruct (or extend) a group from member-side markers alone, for
+  // when the primary's own group-marker comment wasn't fetched or never landed.
+  for (const m of memberOnly) {
+    let g = groups.get(m.groupId)
+    if (!g) { g = { groupId: m.groupId, primary: m.primary, members: [], subsystem: '', rationale: '' }; groups.set(m.groupId, g) }
+    if (g.members.indexOf(m.issue) === -1) g.members.push(m.issue)
+    if (g.members.indexOf(g.primary) === -1) g.members.push(g.primary)
+  }
+  return groups
+}
+
+// reconcileGroups: make LIVE claimed preflights authoritative over group membership.
+// A member whose live preflight resume_point isn't 'implement' (already merged,
+// closed, claimed by another concurrent run, ...) is excluded — it takes its own
+// ordinary path (skip singleton, or process_pr singleton) instead of blocking or
+// corrupting the group. If the excluded member was the group's primary, the group
+// re-anchors onto another live member (lowest issue number, for determinism) —
+// groupId, and therefore the group's worktree/branch/PR identity, never moves. A
+// group left with fewer than 2 live members dissolves entirely (returns no entry):
+// its one remaining member, if any, falls through to deriveUnits as an ordinary
+// singleton, same as if it had never been grouped.
+function reconcileGroups(map, livePreflights) {
+  const resumeByIssue = {}
+  for (const p of livePreflights || []) resumeByIssue[p.issue] = p.resume_point
+  const out = new Map()
+  map.forEach(function (g, groupId) {
+    const live = g.members.filter(function (n) { return resumeByIssue[n] === 'implement' })
+    if (live.length < 2) return // dissolved
+    let primary = g.primary
+    if (live.indexOf(primary) === -1) primary = live.slice().sort(function (a, b) { return a - b })[0]
+    out.set(groupId, { groupId: groupId, primary: primary, members: live, subsystem: g.subsystem, rationale: g.rationale })
+  })
+  return out
+}
+
+// deriveUnits: the final translation from "reconciled groups" + "live preflights" to
+// the array runPool() actually iterates. Every reconciled group becomes ONE unit
+// (a live-preflight-shaped object for the primary, with members: the live preflight
+// refs of every group member, groupId, subsystem, rationale attached); every other
+// live preflight becomes an ordinary singleton unit (members: [self], groupId: null)
+// — the exact shape processIssue()'s ctx init below defaults to, so a no-group run
+// produces units identical to today's preflights array.
+function deriveUnits(reconciledMap, livePreflights) {
+  const byIssue = {}
+  for (const p of livePreflights || []) byIssue[p.issue] = p
+  const consumed = {}
+  const units = []
+  reconciledMap.forEach(function (g) {
+    const memberRefs = g.members.map(function (n) { return byIssue[n] }).filter(Boolean)
+    if (memberRefs.length < 2) return // a member vanished from livePreflights entirely; treat as dissolved
+    const primaryRef = byIssue[g.primary] || memberRefs[0]
+    memberRefs.forEach(function (m) { consumed[m.issue] = true })
+    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale }))
+  })
+  for (const p of (livePreflights || [])) {
+    if (consumed[p.issue]) continue
+    units.push(Object.assign({}, p, { members: [p], groupId: null }))
+  }
+  return units
+}
 
 // ----- batch state -----
 const STOP = { tripped: false, reason: '' }
@@ -1819,6 +2032,13 @@ async function processIssue(pre) {
     notes: [],      // handoff notes: env quirks/gotchas agents pass to later stages
     unresolved: [], // critical/major findings carried past a contrarian iteration cap
     approach: '',   // evaluate's approach one-liner, threaded into fix/test prompts
+    // Consolidation (unit-of-work): live preflight refs for every issue this unit
+    // covers. deriveUnits() sets these on a group unit; anything else (today, always
+    // — Select doesn't build units yet) defaults to a self-reference singleton, so
+    // ctx.members === [pre] and ctx.groupId === null for every issue, matching the
+    // byte-for-byte no-group behavior the unit-of-work abstraction must preserve.
+    members: Array.isArray(pre.members) && pre.members.length ? pre.members : [pre],
+    groupId: ('groupId' in pre && pre.groupId != null) ? pre.groupId : null, // stable consolidation-group id; null outside a group
     metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0 },
     tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
   }
