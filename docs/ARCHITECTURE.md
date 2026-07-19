@@ -45,7 +45,7 @@ flowchart TD
         direction LR
         DB["Docblocks<br/>gated"] --> PR["PR into<br/>batch branch"] --> RV["Spec + code review<br/>in parallel"]
         RV -->|"fix findings, capped"| RV
-        RV -->|approved| BW2["Browser<br/>re-check"] --> TDOC["Tech docs<br/>gated"] --> MG["Squash-merge<br/>+ follow-up issues"]
+        RV -->|approved| BW2["Browser<br/>re-check"] --> TDOC["Tech docs<br/>gated"] --> MAR["Merge auto-resolve<br/>CONFLICTING only, rebase + forced tests"] --> MG["Squash-merge<br/>+ follow-up issues"]
     end
 
     SHIP --> REP
@@ -137,6 +137,72 @@ Per-issue PRs squash-merge into `Batch_<timestamp>`; issue closure fires from th
 batch PR's `Closes #N` lines when the human merges it. This keeps N issues'
 worth of autonomous merges off the base branch while preserving per-issue review
 trails.
+
+### Merge auto-resolve: one mechanical recovery attempt before needs_human
+
+A PR whose preflight reads `CONFLICTING` used to escalate straight to
+`needs_human`, even when the conflict was mechanical: a sibling issue's
+commits already landed on the batch branch, or two hunks that just don't
+overlap. `runMergeAutoResolve(ctx)` runs immediately before the merge stage
+and gives that case one recovery attempt first. It follows the same shape as
+`runBrowserCheck`: a probe decides whether to act at all, then a bounded chain
+of mechanical git stages plus one judgment stage does the work.
+
+The probe reads mergeability through `mergeSettlePoll`, a shared bash loop
+(up to 6 polls, 5 seconds apart) rather than one read. GitHub recomputes
+`mergeable: UNKNOWN` asynchronously for a few seconds after a push, so a
+single read can misjudge a perfectly fine PR as unresolvable. The merge
+stage's own preflight polls the same way right before it merges, for the same
+reason.
+
+Only `CONFLICTING` triggers the rest of the flow. On that state, the still-open
+worktree fetches and rebases onto the batch branch's current tip. A clean
+rebase counts as resolved too, even with zero conflicts, because the merged
+diff still differs from the head that spec and code review actually looked
+at. Surviving conflicts go to an implementer-persona resolver stage that
+prefers keeping both sides of a hunk over discarding either, since the other
+side is almost always a sibling issue's change already on the batch branch.
+A hunk that needs a semantic judgment call aborts the rebase instead of
+guessing.
+
+Every rebase, resolved or clean, is followed by a mandatory, forced run of
+`runTestLoop(ctx, true)`. The `forced` flag skips the loop's usual "no
+testable code changed" shortcut. It exists to answer one narrow question:
+does the exact tree about to be force-pushed pass. A rebase can pull in
+commits whose diff looks unchanged against the target while the tree that
+would actually get pushed has moved.
+
+A thrash guard runs right after: it checks the batch branch hasn't moved
+again while those tests were running. If it has, the state that just went
+green is already stale. The flow escalates instead of silently re-rebasing
+and pushing content the tests never verified, bumping
+`ctx.metrics.merge_thrash`. An earlier draft of this flow re-rebased and
+pushed at that point instead; the guard is a deliberate, contrarian-adjudicated
+reversal of that choice. The final push uses `--force-with-lease`, never a
+plain `--force`, so a stale lease from concurrent access fails loud instead of
+clobbering someone else's push.
+
+Gated on a real `test_command`: with `test_command: null` there's no suite to
+re-verify against, so the safety property this flow exists to provide doesn't
+apply. A `CONFLICTING` PR under a no-test profile falls straight through to
+the merge stage's own preflight, unchanged, exactly as before this mechanism
+existed.
+
+`ctx.metrics.merge_auto_resolved` increments only after the merge stage's own
+subsequent preflight confirms a real merge. The force-push alone never bumps
+it, so a PR that auto-resolve fixed but that then blocks at the merge stage
+for an unrelated reason can't inflate the count. When the merge does go through,
+the Implementation Complete comment says explicitly that the merged diff
+diverged from the head spec and code review reviewed.
+
+`aggregateMergeAutoResolve(results)` rolls the per-issue metrics up into a
+"## Merge Auto-Resolution" section for the batch PR body and the run report,
+following the same JS-computed, verbatim-injected pattern as
+`aggregateTokens` below: no subagent ever sums or double-checks this
+arithmetic. It reads `merge_auto_resolved` and `merge_thrash` off every
+result, including a `needs_human` result the thrash guard escalated, since
+`fail()` carries `ctx.metrics` through. The two counts never overlap: a
+thrashed issue escalates before it can also count as resolved.
 
 ### Incident-derived machinery (preserved from the source engine)
 
