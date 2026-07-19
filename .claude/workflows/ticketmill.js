@@ -1035,6 +1035,26 @@ async function runTestLoop(ctx) {
   return { ok: false, error: 'test loop exceeded ' + MAX_TEST_ITERATIONS + ' iterations' }
 }
 
+// sanitizeTasks: normalize a plan agent's raw task list and drop stub tasks.
+// Top-level (not closed over ctx) so tests can exercise the stub guard directly;
+// still closes over IMPLEMENTERS, DEFAULT_IMPLEMENTER, and log from module scope.
+function sanitizeTasks(ctx, raw) {
+  return (raw || []).map(function (t, i) {
+    return {
+      id: typeof t.id === 'number' ? t.id : i + 1,
+      description: String(t.description || '').trim(),
+      agent: IMPLEMENTERS.indexOf(t.agent) !== -1 ? t.agent : DEFAULT_IMPLEMENTER,
+    }
+  }).filter(function (t) {
+    // Stub guard: a real task description is a sentence, not a token. Dropping
+    // stubs makes a stubbed plan fail the !tasks.length check and retry instead
+    // of dispatching an empty task.
+    if (t.description.length >= 12) return true
+    if (t.description.length > 0) log('#' + ctx.issue + ' plan: DROPPED stub task ' + t.id + ' ("' + t.description + '")')
+    return false
+  })
+}
+
 // =============================================================================
 // IMPLEMENT (setup -> research -> evaluate<->contrarian -> plan<->contrarian ->
 // tasks with review/quality loops -> test loop -> browser -> docblocks -> PR)
@@ -1256,23 +1276,7 @@ async function implementIssue(ctx) {
   if (!planR) return fail(ctx, 'halted', 'plan', 'plan agent died')
   if (planR.status !== 'success') return fail(ctx, 'failed', 'plan', planR.error || 'planning failed')
 
-  const sanitizeTasks = function (raw) {
-    return (raw || []).map(function (t, i) {
-      return {
-        id: typeof t.id === 'number' ? t.id : i + 1,
-        description: String(t.description || '').trim(),
-        agent: IMPLEMENTERS.indexOf(t.agent) !== -1 ? t.agent : DEFAULT_IMPLEMENTER,
-      }
-    }).filter(function (t) {
-      // Stub guard: a real task description is a sentence, not a token. Dropping
-      // stubs makes a stubbed plan fail the !tasks.length check and retry instead
-      // of dispatching an empty task.
-      if (t.description.length >= 12) return true
-      if (t.description.length > 0) log('#' + ctx.issue + ' plan: DROPPED stub task ' + t.id + ' ("' + t.description + '")')
-      return false
-    })
-  }
-  let tasks = sanitizeTasks(planR.tasks)
+  let tasks = sanitizeTasks(ctx, planR.tasks)
   if (!tasks.length) return fail(ctx, 'failed', 'plan', 'plan produced no tasks')
   pushDecision(ctx, 'Plan', (planR.summary || '') + '\n**Tasks:**\n' + tasks.map(function (t) { return '- ' + t.id + ' [' + (t.agent || 'implementer') + '] ' + t.description }).join('\n'))
 
@@ -1350,7 +1354,7 @@ async function implementIssue(ctx) {
     ), stageOpts('plan'), PLAN_SCHEMA)
     if (!rp || rp.status !== 'success') { log('#' + ctx.issue + ' re-plan failed — proceeding with current plan'); break }
     planR = rp
-    const revised = sanitizeTasks(rp.tasks)
+    const revised = sanitizeTasks(ctx, rp.tasks)
     if (revised.length) tasks = revised
     pushDecision(ctx, 'Revised Plan (i' + iter + ')', (rp.summary || '') + '\n**Tasks:**\n' + tasks.map(function (t) { return '- ' + t.id + ' [' + (t.agent || 'implementer') + '] ' + t.description }).join('\n'))
   }
@@ -1719,6 +1723,29 @@ async function runPool(items, limit, fn) {
 // =============================================================================
 // MAIN
 // =============================================================================
+
+// __seed: test-only hook (never called in production). tests/harness.js truncates
+// this source at the marker below and evaluates everything above it in a fresh
+// vm context; __seed lets that harness repopulate the Select-populated let
+// bindings without re-running the bootstrap/profile-detection agent calls. Uses
+// 'k' in o membership (not o[k] truthiness) so TEST_CMD: null is distinguishable
+// from "key not provided" — a profile with no test command is a valid state.
+function __seed(o) {
+  o = o || {}
+  if ('PROFILE' in o) PROFILE = o.PROFILE
+  if ('TEST_CMD' in o) TEST_CMD = o.TEST_CMD
+  if ('IMPLEMENTERS' in o) IMPLEMENTERS = o.IMPLEMENTERS
+  if ('DEFAULT_IMPLEMENTER' in o) DEFAULT_IMPLEMENTER = o.DEFAULT_IMPLEMENTER
+  if ('ROLES' in o) ROLES = o.ROLES
+  if ('TARGET' in o) TARGET = o.TARGET
+  if ('REPO' in o) REPO = o.REPO
+  if ('ROOT' in o) ROOT = o.ROOT
+}
+
+// ---- TICKETMILL-TEST-HARNESS-SPLIT: tests/harness.js truncates the source at this
+// marker and evaluates only what precedes it; nothing from here down (including the
+// top-level await below) runs under the test harness's vm context. Do not remove or
+// reword this comment without updating tests/harness.js's split point in lockstep. ----
 
 // ---- Select: bootstrap repo context (portable across users/machines) ----
 phase('Select')

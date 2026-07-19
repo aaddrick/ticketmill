@@ -108,6 +108,28 @@ unavailable and explicitly forbids simulating the pipeline inline: an imitation
 run has no journal, no claims, no breakers, and no resumability, which is worse
 than not running.
 
+Because the engine now exists as two files that must stay byte-identical
+(`workflows/ticketmill.js`, the source, and `.claude/workflows/ticketmill.js`,
+the copy mill-init drops into target repos), `scripts/lint-engine.js` byte-compares
+them on every test run and fails loud on drift. Edit only the source and copy it
+over the `.claude` copy in the same commit; the two are never meant to diverge.
+
+### Sandbox lint: catching rules `node --check` can't see
+
+The Workflow tool sandbox forbids `Date.now()`, `Math.random()`, argless
+`new Date()`, and any filesystem/Node API (`require`/`import`) inside the engine
+script — all legal JavaScript, so `node --check` passes on every one of them,
+but they throw at runtime and silently break resume (wall-clock time and
+randomness aren't available in that sandbox; see the comments near the top of
+`workflows/ticketmill.js`). That gap used to live only as tribal knowledge in
+`verify_notes`. `scripts/lint-engine.js` makes it a mechanical, line-by-line text
+scan wired into `test_command` right after `node --check`, so a violation fails
+CI instead of a live run. Pure-comment lines are skipped (the engine's own docs
+legitimately name these APIs), and a line carrying the literal `// sandbox-ok`
+marker is the only escape hatch — deliberately narrower than a pattern-based
+exception, so it has to be spelled out per line rather than silently suppressing
+a whole rule.
+
 ### Batch branch model
 
 `args.branch` (BASE) receives exactly one PR per run, created for a human.

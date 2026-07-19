@@ -67,7 +67,7 @@ git -C "$REPO_ROOT" fetch origin "$BASE_BRANCH" --quiet \
 
 # --- Create branch if it doesn't exist ---
 if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
-    git -C "$REPO_ROOT" branch "$branch" "origin/$BASE_BRANCH" \
+    git -C "$REPO_ROOT" branch "$branch" "origin/$BASE_BRANCH" >/dev/null 2>&1 \
         || die "Could not create branch $branch"
 fi
 

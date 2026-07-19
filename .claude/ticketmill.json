@@ -1,6 +1,6 @@
 {
   "repo": "aaddrick/ticketmill",
-  "test_command": "node --check workflows/ticketmill.js && bash -n scripts/setup-worktree.sh && node -e \"['.claude-plugin/plugin.json','.claude-plugin/marketplace.json'].forEach(f=>JSON.parse(require('fs').readFileSync(f,'utf8')))\"",
+  "test_command": "node --check workflows/ticketmill.js && node scripts/lint-engine.js && bash -n scripts/setup-worktree.sh && node -e \"['.claude-plugin/plugin.json','.claude-plugin/marketplace.json'].forEach(f=>JSON.parse(require('fs').readFileSync(f,'utf8')))\" && node --test && bash tests/setup-worktree.test.sh",
   "test_globs": ["workflows/**", "scripts/**", ".claude-plugin/**", "tests/**"],
   "install_commands": [],
   "env_files": [],
@@ -12,9 +12,10 @@
   "verify_notes": [
     "This repo IS the ticketmill plugin: the engine (workflows/ticketmill.js), skills (skills/*/SKILL.md), and setup script are the product. There is no runtime app to boot.",
     "The engine cannot be imported by Node — it uses Workflow-tool globals (agent, parallel, pipeline, phase, log, args, budget) and top-level await. Test logic via extracted pure helpers or a harness that stubs those globals.",
-    "Engine sandbox rules: no Date.now(), Math.random(), or argless new Date(); no fs/Node APIs; plain JS only. node --check does NOT catch these.",
+    "Engine sandbox rules: no Date.now(), Math.random(), or argless new Date(); no fs/Node APIs; plain JS only. node --check does NOT catch these — scripts/lint-engine.js does, wired into test_command right after node --check. It skips pure-comment lines and any line with the literal `// sandbox-ok` marker; use that marker (not a weaker exception) for a genuine false positive.",
+    "LOCKSTEP-EDIT RULE: workflows/ticketmill.js and .claude/workflows/ticketmill.js are the SAME engine and must stay byte-identical — scripts/lint-engine.js enforces this with a byte-compare and fails the whole test_command if they drift. Whenever you edit workflows/ticketmill.js, immediately `cp workflows/ticketmill.js .claude/workflows/ticketmill.js` in the same commit. Never edit only one copy.",
     "Release discipline: every change updates CHANGELOG.md and bumps .claude-plugin/plugin.json version (conventional commits). marketplace.json has no version field — never add one.",
-    "The current test_command is a syntax/manifest smoke check only — a real test harness is being built up via issues; update test_command when it lands.",
+    "test_command runs syntax/manifest smoke checks then `node --test`, which auto-discovers tests/*.test.js (bare `node --test`, not `node --test tests/` — the directory-arg form throws MODULE_NOT_FOUND on Node 22.22.0).",
     "Node >= 22 required."
   ],
   "browser": null,
