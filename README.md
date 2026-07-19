@@ -55,15 +55,9 @@ worktree, runs your install commands and test suite there once, and only then
 records the profile. That converts "the test env is broken" from N expensive
 mid-batch failures into one onboarding failure.
 
-First run in a repo? Use a dry run. It probes every issue and reports the routing
-plan (skip / review-only / implement) without changing anything:
-
-```js
-Workflow({
-  scriptPath: "<repo>/.claude/workflows/ticketmill.js",
-  args: { branch: "dev", issues: [701], dry_run: true }
-})
-```
+First run in a repo? Ask for a dry run ("mill issue 701 against dev, dry run").
+It probes every issue and reports the routing plan (skip / review-only /
+implement) without changing anything.
 
 ## Run options
 
@@ -88,6 +82,11 @@ it from your request; these are the knobs it can turn:
 its own worktree (and its own port when browser verification is on), and browser
 stages serialize through a shared lock at any setting. For coordination across
 runs on different machines, see Overlapping batches below.
+
+If you state the same options every time, put them in a skill: a small project
+skill that invokes `/ticketmill:mill` with your standing preferences (say,
+always `no_assignee`, concurrency 3, and your team's label conventions) turns a
+paragraph of instructions into one command.
 
 ## What makes it trustworthy
 

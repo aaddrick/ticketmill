@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.8 (2026-07-18)
+
+- README: the Quickstart dry-run example is a plain request now, no longer a
+  Workflow call. The mill skill takes "dry run" in natural language.
+- README: Run options now suggests a small skill invoking /ticketmill:mill for
+  standing preferences, instead of restating options every run.
+
 ## 0.1.7 (2026-07-18)
 
 - README: new Follow-up issues section on the one place the engine files new
