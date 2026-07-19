@@ -321,6 +321,10 @@ const BATCH_BRANCH_SCHEMA = {
   type: 'object', required: ['status'],
   properties: { status: { enum: ['success', 'error'] }, branch: { type: 'string' }, error: { type: ['string', 'null'] } },
 }
+const TARGET_FETCH_SCHEMA = {
+  type: 'object', required: ['status'],
+  properties: { status: { enum: ['success', 'error'] }, error: { type: ['string', 'null'] } },
+}
 const UI_PROBE_SCHEMA = {
   type: 'object', required: ['ui_files'],
   properties: { ui_files: { type: 'array', items: { type: 'string' } } },
@@ -2854,6 +2858,19 @@ const learnPromise = agent([
   .catch(function (e) { log('learnings digest failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
 
 // ---- Select: preflight probe (the GitHub-state healing layer) ----
+// One shared fetch of origin/TARGET before the per-issue Promise.all below —
+// each probe's predicted_files step reads this ref read-only. Fetching it once
+// here (rather than once per issue inside the unbounded Promise.all) avoids N
+// concurrent `git fetch` calls racing on the same ref's lock file in ROOT.
+// Best-effort: on failure, probes still run and fall open to predicted_files=[]
+// against whatever origin/TARGET already pointed at (batch-branch creation
+// above already fetched it once too).
+const targetFetch = await agent(
+  ['Run: git -C ' + ROOT + ' fetch origin ' + TARGET + ' (read-only — updates the ref only, never checks anything out).',
+    'Return status=success, or status=error with error if the fetch failed.'].join('\n'),
+  { label: 'preflight-fetch', phase: 'Select', schema: TARGET_FETCH_SCHEMA, model: M.setup.model, effort: M.setup.effort })
+if (!targetFetch || targetFetch.status !== 'success') log('preflight: git fetch origin ' + TARGET + ' failed (non-fatal) — predicted_files will fall open to [] wherever it depended on a fresher ref: ' + String((targetFetch && targetFetch.error) || 'agent died'))
+
 // batchIssueNumbers: this run's whole candidate set, used below to scope
 // depends_on parsing — a body reference to an issue outside the batch is
 // dropped (there's no unit for computeLanes to point it at).
@@ -2876,13 +2893,13 @@ const preflights = (await Promise.all(issueList.map(function (it) {
     '      REJECT bare dictionary/English nouns used in ordinary prose (e.g. "engine", "button", "config" alone,',
     '      with no code formatting, path shape, or distinctive casing) — those are not identifiers.',
     '      If nothing clears this bar, predicted_files = [] and skip the rest of this step.',
-    '   b. git -C ' + ROOT + ' fetch origin ' + TARGET + ' (read-only — updates the ref only, never checks anything out).',
-    '   c. Resolve each surviving identifier against the REAL tree at origin/' + TARGET + ' (never the working directory,',
-    '      which may be on a different branch): git -C ' + ROOT + ' grep -l -I -F -i -- "<identifier>" origin/' + TARGET + '',
-    '      for a content match, and git -C ' + ROOT + ' ls-tree -r --name-only origin/' + TARGET + ' filtered for a',
+    '   b. Resolve each surviving identifier against the REAL tree at origin/' + TARGET + ' (already fetched read-only',
+    '      before this step; never the working directory, which may be on a different branch):',
+    '      git -C ' + ROOT + ' grep -l -I -F -i -- "<identifier>" origin/' + TARGET + ' for a content match, and',
+    '      git -C ' + ROOT + ' ls-tree -r --name-only origin/' + TARGET + ' filtered for a',
     '      case-insensitive substring match for a path/filename match. Keep ONLY the exact repo-relative paths those',
     '      commands actually return — never fabricate or normalize a path yourself.',
-    '   d. Dedupe and cap at 20 paths. If every resolution comes back empty, or any command errors, predicted_files = [].',
+    '   c. Dedupe and cap at 20 paths. If every resolution comes back empty, or any command errors, predicted_files = [].',
     '5. depends_on (best-effort lane-scheduling hint — fail open to [] on ANY doubt):',
     '   a. Scan the issue body for "depends on #N", "depends-on #N", or "follow-up to #N" (case-insensitive). Collect each N.',
     '   b. Drop any N that is not one of this batch\'s issue numbers (' + batchIssueNumbers.join(', ') + '), and drop N == ' + it.number + '.',
