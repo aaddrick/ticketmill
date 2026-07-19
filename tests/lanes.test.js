@@ -229,3 +229,107 @@ test('computeLanes: lanes are sorted by lowest unit index, and every lane carrie
   assert.deepStrictEqual(Array.from(lanes[1].unitIndices), [1])
   assert.ok(Array.isArray(lanes[0].predicted_files))
 })
+
+// ---- computeLanes({ trustedOnly: true }) (issue #1, used by the real-run
+// collapse guard below) ----
+
+test('computeLanes: trustedOnly unions serialize_globs and depends_on but skips heuristic edges, the DF log, and the dissolve log entirely', function () {
+  const context = bootLanes()
+  const units = [unit(1, ['SecurityHeaders.php'], { depends_on: [2] }), unit(2, ['SecurityHeaders.php']), unit(3, ['SecurityHeaders.php'])]
+  const lanes = context.computeLanes(units, [], { trustedOnly: true })
+  // 0-1 unite via depends_on; 2 has no trusted edge to either -> stays singleton,
+  // even though all three would heuristically merge under the default mode.
+  assert.strictEqual(lanes.length, 2)
+  const sizes = Array.from(lanes).map(function (l) { return l.unitIndices.length }).sort()
+  assert.deepStrictEqual(sizes, [1, 2])
+  assert.ok(!context.logs.length, 'trustedOnly must skip the DF/dissolve log paths entirely')
+})
+
+// ---- applyRealRunCollapseGuard (issue #1) ----
+
+function laneUnit(issue, predictedFiles, extra) {
+  return Object.assign({ issue: issue, members: [{ issue: issue }], predicted_files: predictedFiles || [], depends_on: [] }, extra)
+}
+
+test('applyRealRunCollapseGuard: no-op (same array reference) when unitCount < concurrency, even with a severe collapse ratio', function () {
+  const context = bootLanes()
+  const units = [laneUnit(1, ['a.js']), laneUnit(2, ['b.js']), laneUnit(3, ['c.js'])]
+  const lanes = [{ unitIndices: [0, 1, 2], predicted_files: ['a.js'] }] // one giant lane, ratio would be severe
+  const guard = context.applyRealRunCollapseGuard(units, lanes, 5, [])
+  assert.strictEqual(guard.dissolvedCount, 0)
+  assert.strictEqual(guard.lanes, lanes, 'must return the SAME array reference on the no-op path')
+})
+
+test('applyRealRunCollapseGuard: no-op when collapse_ratio >= 0.5', function () {
+  const context = bootLanes()
+  const units = [laneUnit(1, ['a.js']), laneUnit(2, ['a.js']), laneUnit(3, ['c.js']), laneUnit(4, ['d.js'])]
+  // 2 lanes for 4 units at concurrency 4 -> ratio 2/4 = 0.5, not < 0.5.
+  const lanes = [{ unitIndices: [0, 1], predicted_files: ['a.js'] }, { unitIndices: [2] }, { unitIndices: [3] }]
+  const guard = context.applyRealRunCollapseGuard(units, lanes, 4, [])
+  assert.strictEqual(guard.dissolvedCount, 0)
+  assert.strictEqual(guard.lanes, lanes)
+})
+
+// Every fixture below pads unitCount up to (>=) concurrency with a SECOND lane
+// built on serialize_globs (a trusted edge) so that padding lane is provably kept
+// regardless of the guard's cohesion check — isolating each assertion to what
+// happens to the ONE lane under test.
+function paddingUnits(startIssue, count) {
+  const out = []
+  for (let i = 0; i < count; i++) out.push(laneUnit(startIssue + i, ['pad/file-' + i + '.js']))
+  return out
+}
+
+test('applyRealRunCollapseGuard: dissolves a single-path magnet lane back to singletons when triggered', function () {
+  const context = bootLanes()
+  // 8 units: {0,1,2} merged on nothing but a single shared magnet path (the exact
+  // shape this guard exists to catch as a final safety net, independent of
+  // whatever produced `lanes`); {3..7} trusted via serialize_globs (padding, kept
+  // unconditionally). laneCount 2 for 8 units at concurrency 8 gives ratio =
+  // min(8,2)/min(8,8) = 2/8 = 0.25 < 0.5, well inside the trigger band.
+  const units = [
+    laneUnit(1, ['magnet.php']), laneUnit(2, ['magnet.php']), laneUnit(3, ['magnet.php']),
+  ].concat(paddingUnits(4, 5))
+  const lanes = [
+    { unitIndices: [0, 1, 2], predicted_files: ['magnet.php'] }, // synthetic magnet lane
+    { unitIndices: [3, 4, 5, 6, 7] }, // trusted (serialize_globs) padding lane
+  ]
+  const guard = context.applyRealRunCollapseGuard(units, lanes, 8, ['pad/**'])
+  assert.ok(guard.collapseRatio < 0.5, 'expected the fixture to actually trigger the guard: got ' + guard.collapseRatio)
+  assert.strictEqual(guard.dissolvedCount, 1)
+  assert.strictEqual(guard.lanes.length, 4) // {3,4,5,6,7} kept whole + 3 dissolved singletons
+  const singles = Array.from(guard.lanes).filter(function (l) { return l.unitIndices.length === 1 }).map(function (l) { return l.unitIndices[0] }).sort()
+  assert.deepStrictEqual(singles, [0, 1, 2])
+  const kept = Array.from(guard.lanes).find(function (l) { return l.unitIndices.length === 5 })
+  assert.deepStrictEqual(Array.from(kept.unitIndices), [3, 4, 5, 6, 7])
+})
+
+test('applyRealRunCollapseGuard: a lane sharing >= 2 paths across its whole membership is exempt even when triggered', function () {
+  const context = bootLanes()
+  const units = [
+    laneUnit(1, ['impl.js', 'impl.test.js']), laneUnit(2, ['impl.js', 'impl.test.js']), laneUnit(3, ['impl.js', 'impl.test.js']),
+  ].concat(paddingUnits(4, 5))
+  const lanes = [
+    { unitIndices: [0, 1, 2], predicted_files: ['impl.js', 'impl.test.js'] }, // genuine cluster
+    { unitIndices: [3, 4, 5, 6, 7] }, // trusted (serialize_globs) padding lane
+  ]
+  const guard = context.applyRealRunCollapseGuard(units, lanes, 8, ['pad/**'])
+  assert.ok(guard.collapseRatio < 0.5)
+  assert.strictEqual(guard.dissolvedCount, 0)
+  assert.strictEqual(guard.lanes, lanes)
+})
+
+test('applyRealRunCollapseGuard: a trusted lane (depends_on) is kept even when triggered and even with < 2 shared paths', function () {
+  const context = bootLanes()
+  const units = [
+    laneUnit(1, ['a.js'], { depends_on: [2] }), laneUnit(2, ['b.js']),
+  ].concat(paddingUnits(3, 6))
+  const lanes = [
+    { unitIndices: [0, 1], predicted_files: ['a.js', 'b.js'] }, // trusted via depends_on, zero shared paths
+    { unitIndices: [2, 3, 4, 5, 6, 7] }, // trusted (serialize_globs) padding lane
+  ]
+  const guard = context.applyRealRunCollapseGuard(units, lanes, 8, ['pad/**'])
+  assert.ok(guard.collapseRatio < 0.5)
+  assert.strictEqual(guard.dissolvedCount, 0, 'a trusted lane must never be dissolved by this guard, no matter its path cohesion')
+  assert.strictEqual(guard.lanes, lanes)
+})
