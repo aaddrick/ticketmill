@@ -358,6 +358,14 @@ const UI_PROBE_SCHEMA = {
   type: 'object', required: ['ui_files'],
   properties: { ui_files: { type: 'array', items: { type: 'string' } } },
 }
+// DIFF_PROBE_SCHEMA: the post-implement engine-owned gate's own read-only
+// diff probe (runEngineOwnedGate) — same shape as UI_PROBE_SCHEMA's ui_files
+// idea, generalized to "every changed file" since the JS side (not the
+// agent) does the ENGINE_OWNED filtering.
+const DIFF_PROBE_SCHEMA = {
+  type: 'object', required: ['changed_files'],
+  properties: { changed_files: { type: 'array', items: { type: 'string' } } },
+}
 const CLAIM_SCHEMA = {
   type: 'object', required: ['issue', 'claimed'],
   properties: { issue: { type: 'integer' }, claimed: { type: 'boolean' }, reason: { type: 'string' } },
@@ -924,6 +932,19 @@ function scopeGuard(ctx) {
   if (BROWSER) {
     lines.push('The shared verification browser is lock-guarded (' + BW_LOCK + '): only use it if your prompt includes the')
     lines.push('"live browser feedback" protocol block — without that block, do NOT open the browser.')
+  }
+  // Engine-owned advisory clause (issue #3): a deterministic post-implement
+  // gate (runEngineOwnedGate, before the test loop) is the real backstop —
+  // this is only defense-in-depth, so it is unconditional (prepended to
+  // EVERY stage prompt, not gated on isGroup/BROWSER) and stays generic
+  // rather than naming ctx.engineOwnedIntentional: an agent mid-stage has no
+  // reliable way to know which regime it is in, so the instruction must hold
+  // for both — never touch these paths without being told to.
+  if (ENGINE_OWNED.length) {
+    lines.push('Engine-owned paths (' + ENGINE_OWNED.join(', ') + ') are OUT OF SCOPE unless this issue explicitly targets one of')
+    lines.push('them: do not stage, commit, or restore them from git history for any other reason (including "reconciling" a')
+    lines.push('diff or an apparently stale file) — leave them exactly as you found them and surface the discrepancy as a')
+    lines.push('deferred note instead.')
   }
   return lines.join('\n')
 }
@@ -1683,6 +1704,96 @@ async function runBrowserCheck(ctx, where) {
     collectNotes(ctx, 'browser-fix', fix)
   }
   return { ok: false, error: 'browser verification still failing after ' + MAX_BROWSER_ITERATIONS + ' iterations (' + where + ')' }
+}
+
+// =============================================================================
+// ENGINE-OWNED GATE (issue #3, regimes b/c) — the deterministic post-implement
+// backstop. scopeGuard()'s engine-owned clause (above) is advisory layer 1; this
+// is layer 2. Modeled on runBrowserCheck immediately above: a READ-ONLY probe
+// runs `git diff --name-only` against the batch baseline and returns every
+// changed file; JS (never the agent) filters that list via matchesGlobs against
+// ENGINE_OWNED, then routes on ctx.engineOwnedIntentional — computed once at
+// Select from THIS issue's own prose (engineOwnedHit) and OR-folded across a
+// consolidation group's live members (deriveUnits) — per the three-regime model
+// documented above ENGINE_OWNED_GLOBS:
+//   (b) intentional: this issue's own prose plainly targets the engine-owned
+//       set, so an engine-owned diff is expected, deliberate work (e.g. issue
+//       #3 itself). Leave the implementation exactly as committed — no revert.
+//   (c) NOT intentional, but engine-owned paths showed up in the diff anyway:
+//       the incidental/paraphrased silent-restore vector nonconvexlabs-com #77
+//       actually was. A single-purpose stage hard-reverts ONLY the paths where
+//       isHardRevertPath(f, ENGINE_OWNED, LOCKSTEP_INSTALLED_PATHS) is true —
+//       lockstep-installed paths (e.g. this repo's own
+//       .claude/workflows/ticketmill.js) are deliberately exempted so a
+//       source-of-truth edit's installed lockstep copy is never clobbered by
+//       this gate; any resulting divergence is left for the test loop's own
+//       lint-engine byte-compare to catch in-band — see isHardRevertPath's doc
+//       comment — to the batch baseline (origin/TARGET), commits, and pushes.
+// Placed BEFORE runTestLoop() in implementIssue() (not near runBrowserCheck,
+// which runs AFTER the test loop) so a revert this gate makes is re-validated
+// by the SAME run's test suite / lint-engine byte-compare, in-band, rather
+// than landing unverified.
+// Never halts the run on its own: a dead probe or a failed/dead revert stage
+// degrades to a recorded deferred follow-up (mirrors the anti-pattern rule —
+// a skipped verification must be recorded, never silently swallowed) so a
+// plumbing hiccup in this gate never blocks an otherwise-green issue.
+// Returns { ok: true } always.
+// =============================================================================
+async function runEngineOwnedGate(ctx) {
+  if (!ENGINE_OWNED.length) return { ok: true }
+  const probe = await stage(ctx, 'engine-owned-probe', [
+    'READ-ONLY probe for issue #' + ctx.issue + ': list every file this issue\'s implementation changed. Run exactly:',
+    'git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --name-only',
+    'Return changed_files (the output lines as an array; empty array if none).',
+  ].join('\n'), stageOpts('probe'), DIFF_PROBE_SCHEMA)
+  if (!probe) {
+    log('#' + ctx.issue + ' engine-owned gate: diff probe died — degrading (recorded), not blocking the issue')
+    ctx.deferred.push('Engine-owned guardrail: the post-implement diff probe died, so this pass could not check for incidental changes to ' + ENGINE_OWNED.join(', ') + ' — verify manually before merge.')
+    return { ok: true }
+  }
+  const engineFiles = (probe.changed_files || []).filter(function (f) { return matchesGlobs(f, ENGINE_OWNED) })
+  if (!engineFiles.length) return { ok: true }
+
+  if (ctx.engineOwnedIntentional) {
+    log('#' + ctx.issue + ' engine-owned gate: regime (b) deliberate engine work — leaving ' + engineFiles.length + ' engine-owned file(s) in place: ' + engineFiles.join(', '))
+    return { ok: true }
+  }
+
+  const revertFiles = engineFiles.filter(function (f) { return isHardRevertPath(f, ENGINE_OWNED, LOCKSTEP_INSTALLED_PATHS) })
+  const exemptFiles = engineFiles.filter(function (f) { return !isHardRevertPath(f, ENGINE_OWNED, LOCKSTEP_INSTALLED_PATHS) })
+  if (exemptFiles.length) {
+    log('#' + ctx.issue + ' engine-owned gate: ' + exemptFiles.length + ' lockstep-installed path(s) left in place (regime (c) exemption): ' + exemptFiles.join(', '))
+    ctx.deferred.push('Engine-owned guardrail: incidental change(s) to lockstep-installed path(s) — ' + exemptFiles.join(', ') + ' — were NOT reverted (lockstep exemption); verify the lockstep pair stayed in sync (lint-engine) before merge.')
+  }
+  if (!revertFiles.length) return { ok: true }
+
+  log('#' + ctx.issue + ' engine-owned gate: regime (c) incidental change — hard-reverting ' + revertFiles.join(', ') + ' to origin/' + TARGET)
+  const revert = await stage(ctx, 'engine-owned-revert', [
+    'Regime (c) engine-owned guardrail for issue #' + ctx.issue + ' in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ':',
+    'This issue\'s implementation incidentally changed engine-owned path(s) that this issue does NOT target (its title/body',
+    'never names them) — these are read-only tooling artifacts of the run itself (the ticketmill profile, agent roster, or',
+    'engine copy), not this issue\'s application code.',
+    '',
+    'Hard-revert EXACTLY these paths to the batch baseline, and touch NOTHING else:',
+    revertFiles.map(function (f) { return '- ' + f }).join('\n'),
+    '',
+    '1. git -C ' + ctx.worktree + ' checkout origin/' + TARGET + ' -- ' + revertFiles.map(function (f) { return '"' + f + '"' }).join(' '),
+    '2. Confirm the revert is exact: git -C ' + ctx.worktree + ' diff origin/' + TARGET + ' -- ' + revertFiles.map(function (f) { return '"' + f + '"' }).join(' ') + ' (must be empty)',
+    '3. git -C ' + ctx.worktree + ' commit -m "revert(engine): drop incidental engine-owned change(s) (#' + ctx.issue + ')"',
+    '4. git -C ' + ctx.worktree + ' push origin ' + ctx.branch,
+    '',
+    'Restore ONLY via that checkout from origin/' + TARGET + ' — never from git log/reflog/history on this branch, and never by',
+    're-authoring the file yourself. Stage and commit nothing outside the listed paths.',
+    'Return status, commit, files_changed, summary.',
+  ].join('\n'), stageOpts('fix'), FIX_SCHEMA, 1)
+  if (!revert || revert.status === 'error') {
+    log('#' + ctx.issue + ' engine-owned gate: revert stage failed/died — degrading (recorded), not blocking the issue')
+    ctx.deferred.push('Engine-owned guardrail: automatic revert of incidental engine-owned change(s) to ' + revertFiles.join(', ') + ' FAILED — a human must verify/revert these paths manually before merge.')
+    return { ok: true }
+  }
+  pushDecision(ctx, 'Engine-Owned Guardrail', 'Reverted incidental engine-owned change(s) to the batch baseline (origin/' + TARGET + '): ' + revertFiles.join(', ') + '. Commit: ' + (revert.commit || 'n/a') + '.')
+  ctx.deferred.push('Engine-owned guardrail: incidental change(s) to ' + revertFiles.join(', ') + ' were reverted to the batch baseline — if this was actually intentional engine work, redo it as its own dedicated issue that names the path(s) so it is recognized as deliberate.')
+  return { ok: true }
 }
 
 // =============================================================================
@@ -2806,6 +2917,10 @@ async function implementIssue(ctx) {
   if (tasksCompleted === 0) return fail(ctx, 'failed', 'implement', 'no tasks completed (' + failedTasks.length + ' failed)')
   if (failedTasks.length) ctx.deferred.push('Tasks that failed review and were NOT completed: ' + failedTasks.join(', '))
 
+  // ---- ENGINE-OWNED GATE (issue #3) — BEFORE the test loop so a hard-revert
+  // is re-validated by the same run's test suite / lint-engine in-band. ----
+  await runEngineOwnedGate(ctx)
+
   // ---- TEST LOOP ----
   const tl = await runTestLoop(ctx)
   if (!tl.ok) return fail(ctx, STOP.tripped ? 'halted' : 'failed', 'test-loop', tl.error)
@@ -3054,6 +3169,12 @@ async function processIssue(pre) {
     // unit-of-work abstraction must preserve.
     members: Array.isArray(pre.members) && pre.members.length ? pre.members : [pre],
     groupId: ('groupId' in pre && pre.groupId != null) ? pre.groupId : null, // stable consolidation-group id; null outside a group
+    // engineOwnedIntentional (issue #3): deriveUnits() OR-folds this across a
+    // group's live memberRefs (or spreads a singleton's own value through) —
+    // see the comment above deriveUnits(). runEngineOwnedGate() reads it off
+    // ctx (not pre) so every stage downstream of this init sees the same
+    // threaded value.
+    engineOwnedIntentional: !!pre.engineOwnedIntentional,
     metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0 },
     tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
   }

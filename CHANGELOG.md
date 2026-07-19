@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.23 (2026-07-19)
+
+- Engine-owned path guardrail, task-time backstop (#3, task 3 of 4): two
+  layers now enforce regimes (b)/(c) of the three-regime model during
+  implementation, on top of task 2's select-phase regime (a) skip.
+  Layer 1 (advisory): `scopeGuard()` — prepended to EVERY stage prompt,
+  unconditionally, not just at concurrency > 1 — appends a clause naming
+  `ENGINE_OWNED` and instructing agents never to stage, commit, or restore
+  those paths from git history for any reason, surfacing a discrepancy as a
+  deferred note instead. Layer 2 (deterministic backstop): a new
+  `runEngineOwnedGate(ctx)`, modeled on `runBrowserCheck`, runs right after
+  the task/quality loop and BEFORE `runTestLoop` (so a revert this gate makes
+  is re-validated by the SAME run's test suite / `lint-engine` byte-compare,
+  in-band). A read-only probe lists this issue's changed files against the
+  batch baseline; JS (never the agent) filters via `matchesGlobs` against
+  `ENGINE_OWNED`, then routes on `ctx.engineOwnedIntentional` (now threaded
+  onto `ctx` at `processIssue()` init from the `deriveUnits()`-shaped unit):
+  regime (b) — this issue's own prose targets the set — leaves the
+  implementation exactly as committed, no revert; regime (c) — it doesn't,
+  but engine-owned paths showed up anyway — a single-purpose stage hard
+  reverts ONLY the paths where `isHardRevertPath(f, ENGINE_OWNED,
+  LOCKSTEP_INSTALLED_PATHS)` is true to the batch baseline, commits, and
+  pushes, while lockstep-installed paths (e.g. this repo's own
+  `.claude/workflows/ticketmill.js`) are left in place for the test loop's
+  own lint-engine byte-compare to catch any divergence in-band. The gate
+  never halts the run on its own — a dead probe or a failed/dead revert
+  degrades to a recorded `ctx.deferred` follow-up instead of blocking an
+  otherwise-green issue. Added `tests/engine-owned.test.js` coverage for
+  `runEngineOwnedGate` across every regime and edge case, including a
+  group-threaded non-primary deliberate member correctly NOT being reverted,
+  and a lockstep path nested under an engine-owned directory glob being left
+  in place alongside an exact-file lockstep path while sibling engine-owned
+  paths still revert; extended `tests/scope-guard.test.js` for the new
+  advisory clause. Task 4 (doc notes in `skills/mill/SKILL.md` and
+  `skills/mill-init/SKILL.md`) remains.
+
 ## 0.1.22 (2026-07-19)
 
 - Engine-owned path guardrail, select-phase skip (#3, task 2 of 4): the
