@@ -258,6 +258,10 @@ why `mill-init` copies the engine into your repo's `.claude/workflows/` and the
 `mill` skill invokes it by `scriptPath`. A plain git clone of this repo works too;
 the plugin install just adds the namespaced skills.
 
+## Author
+
+[aaddrick](https://github.com/aaddrick) · [LinkedIn](https://www.linkedin.com/in/aaddrick/)
+
 ## License
 
 MIT

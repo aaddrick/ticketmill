@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6 (2026-07-18)
+
+- README: added an Author section above the license, with GitHub and LinkedIn
+  links.
+
 ## 0.1.5 (2026-07-18)
 
 - README: new Run options section documenting every workflow arg and its
