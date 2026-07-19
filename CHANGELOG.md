@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.15 (2026-07-19)
+
+- Added per-run token tracking (#11). `stage()` samples the runtime's guarded
+  `budget.spent()` before and after each retry loop, attributing the delta to
+  `ctx.tokens.total` and `ctx.tokens.byModel[opts.model]` with no wall-clock
+  dependency and no effect on retry/STOP control flow. A new pure
+  `aggregateTokens(results, spent, concurrency)` helper turns those per-issue
+  deltas into a "## Token Usage" section: at concurrency 1 an
+  "orchestration/unattributed" remainder row makes the table reconcile
+  exactly to the run's `budget.spent()` total; at concurrency above 1 the
+  whole breakdown is labelled approximate, since a single shared monotonic
+  counter can't be split across overlapping concurrent stages. Surfaced in
+  the batch PR body, the run report JSON/markdown, and per-issue PR bodies
+  (subtotal only). Tokens only — no currency or per-token price anywhere, and
+  a missing/unavailable counter renders "not tracked" rather than a false
+  zero. Added `tests/token-usage.test.js` covering both reconciliation modes
+  and the "not tracked" degrade path via the harness.
+
 ## 0.1.14 (2026-07-19)
 
 - Forged `.claude/agents/ticketmill-doc-writer.md` and staffed the profile's
