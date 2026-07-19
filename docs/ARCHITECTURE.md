@@ -13,7 +13,7 @@ flowchart TD
         P["Load profile<br/>.claude/ticketmill.json"] --> D["Resolve roles vs<br/>.claude/agents roster"] --> B["Create batch branch<br/>Batch_ts from BASE"] --> I["Resolve issue list<br/>numbers or labels"] --> F["Preflight probe<br/>skip / review / implement"] --> C["Claim issues<br/>label + comment, advisory"]
     end
 
-    SEL --> POOL["Worker pool<br/>concurrency 1-5<br/>circuit breakers"]
+    SEL --> POOL["Worker pool<br/>concurrency 1-5<br/>lane-serial groups<br/>circuit breakers"]
     POOL --> PLAN
 
     subgraph PLAN["Per issue: plan"]
@@ -45,7 +45,7 @@ flowchart TD
         direction LR
         DB["Docblocks<br/>gated"] --> PR["PR into<br/>batch branch"] --> RV["Spec + code review<br/>in parallel"]
         RV -->|"fix findings, capped"| RV
-        RV -->|approved| BW2["Browser<br/>re-check"] --> TDOC["Tech docs<br/>gated"] --> MG["Squash-merge<br/>+ follow-up issues"]
+        RV -->|approved| BW2["Browser<br/>re-check"] --> TDOC["Tech docs<br/>gated"] --> MAR["Merge auto-resolve<br/>CONFLICTING only, rebase + forced tests"] --> MG["Squash-merge<br/>+ follow-up issues"]
     end
 
     SHIP --> REP
@@ -137,6 +137,138 @@ Per-issue PRs squash-merge into `Batch_<timestamp>`; issue closure fires from th
 batch PR's `Closes #N` lines when the human merges it. This keeps N issues'
 worth of autonomous merges off the base branch while preserving per-issue review
 trails.
+
+### Merge auto-resolve: one mechanical recovery attempt before needs_human
+
+A PR whose preflight reads `CONFLICTING` used to escalate straight to
+`needs_human`, even when the conflict was mechanical: a sibling issue's
+commits already landed on the batch branch, or two hunks that just don't
+overlap. `runMergeAutoResolve(ctx)` runs immediately before the merge stage
+and gives that case one recovery attempt first. It follows the same shape as
+`runBrowserCheck`: a probe decides whether to act at all, then a bounded chain
+of mechanical git stages plus one judgment stage does the work.
+
+The probe reads mergeability through `mergeSettlePoll`, a shared bash loop
+(up to 6 polls, 5 seconds apart) rather than one read. GitHub recomputes
+`mergeable: UNKNOWN` asynchronously for a few seconds after a push, so a
+single read can misjudge a perfectly fine PR as unresolvable. The merge
+stage's own preflight polls the same way right before it merges, for the same
+reason.
+
+Only `CONFLICTING` triggers the rest of the flow. On that state, the still-open
+worktree fetches and rebases onto the batch branch's current tip. A clean
+rebase counts as resolved too, even with zero conflicts, because the merged
+diff still differs from the head that spec and code review actually looked
+at. Surviving conflicts go to an implementer-persona resolver stage that
+prefers keeping both sides of a hunk over discarding either, since the other
+side is almost always a sibling issue's change already on the batch branch.
+A hunk that needs a semantic judgment call aborts the rebase instead of
+guessing.
+
+Every rebase, resolved or clean, is followed by a mandatory, forced run of
+`runTestLoop(ctx, true)`. The `forced` flag skips the loop's usual "no
+testable code changed" shortcut. It exists to answer one narrow question:
+does the exact tree about to be force-pushed pass. A rebase can pull in
+commits whose diff looks unchanged against the target while the tree that
+would actually get pushed has moved.
+
+A thrash guard runs right after: it checks the batch branch hasn't moved
+again while those tests were running. If it has, the state that just went
+green is already stale. The flow escalates instead of silently re-rebasing
+and pushing content the tests never verified, bumping
+`ctx.metrics.merge_thrash`. An earlier draft of this flow re-rebased and
+pushed at that point instead; the guard is a deliberate, contrarian-adjudicated
+reversal of that choice. The final push uses `--force-with-lease`, never a
+plain `--force`, so a stale lease from concurrent access fails loud instead of
+clobbering someone else's push.
+
+Gated on a real `test_command`: with `test_command: null` there's no suite to
+re-verify against, so the safety property this flow exists to provide doesn't
+apply. A `CONFLICTING` PR under a no-test profile falls straight through to
+the merge stage's own preflight, unchanged, exactly as before this mechanism
+existed.
+
+`ctx.metrics.merge_auto_resolved` increments only after the merge stage's own
+subsequent preflight confirms a real merge. The force-push alone never bumps
+it, so a PR that auto-resolve fixed but that then blocks at the merge stage
+for an unrelated reason can't inflate the count. When the merge does go through,
+the Implementation Complete comment says explicitly that the merged diff
+diverged from the head spec and code review reviewed.
+
+`aggregateMergeAutoResolve(results)` rolls the per-issue metrics up into a
+"## Merge Auto-Resolution" section for the batch PR body and the run report,
+following the same JS-computed, verbatim-injected pattern as
+`aggregateTokens` below: no subagent ever sums or double-checks this
+arithmetic. It reads `merge_auto_resolved` and `merge_thrash` off every
+result, including a `needs_human` result the thrash guard escalated, since
+`fail()` carries `ctx.metrics` through. The two counts never overlap: a
+thrashed issue escalates before it can also count as resolved.
+
+### Engine-owned path guardrail: three regimes
+
+A worktree only sees committed state. A freshly forged agent file, or a
+profile field just added at the repo root, stays invisible there until it's
+committed. An implementer that "reconciles" what looks like a stale diff in
+the worktree can restore the old committed version straight from git
+history. A later batch merge then overwrites the uncommitted root-tree work
+without ever raising a conflict: that's nonconvexlabs-com#77, the incident
+this guardrail exists to close.
+
+Engine-owned paths are the run's own tooling: the ticketmill profile
+(`.claude/ticketmill.json`), the agent roster (`.claude/agents/**`), and the
+engine's own installed copy (`.claude/workflows/ticketmill.js`,
+`.claude/scripts/ticketmill/**`). A profile can extend that default set via
+`profile.engine_owned_globs`. These paths stay read-only for a run unless an
+issue's own title or body plainly names one of them.
+
+Three regimes cover what happens next.
+
+**(a) Select-phase skip.** When an issue's prose names an engine-owned path
+(`engineOwnedHit`, a case-sensitive substring match) and the preflight probe
+finds the root tree already dirty under that same path
+(`root_dirty_engine_paths`), the issue is routed straight to `resume_point:
+skip` before a worktree is ever built. This is the only regime the engine
+can catch ahead of time, and only because git tracks the dirt: an
+uncommitted rename or a change outside git's view still slips through.
+
+**(b) Deliberate engine work, clean root.** An issue whose prose names an
+engine-owned path, with a clean root tree, is intentional engine work: this
+repo's own ticketmill issues look exactly like this. `ctx.engineOwnedIntentional`
+is computed once at Select from title and body, then OR-folded across a
+consolidation group's live members in `deriveUnits()` so a non-primary
+group member's intent survives `pickPrimary`'s unrelated choice of primary.
+The post-implement gate reads that flag and leaves the diff exactly as
+committed.
+
+**(c) Incidental change.** Engine-owned paths turn up in the diff, but
+nothing in the issue's prose named them. `runEngineOwnedGate(ctx)` runs
+right before the test loop, not after like `runBrowserCheck`, so a revert it
+triggers gets re-validated by that same run's test suite in-band rather than
+landing unverified. A deterministic JS pass filters the diff against the
+engine-owned set, then splits it again with `isHardRevertPath`: a
+single-purpose stage hard-reverts every path that isn't also listed in
+`profile.lockstep_installed_paths`, committing and pushing the revert. A
+lockstep path is exempt because it's a deliberate installed copy of a
+source-of-truth file elsewhere in the repo, kept in sync by the repo's own
+tooling: this repo sets `[".claude/workflows/ticketmill.js"]`, since
+`scripts/lint-engine.js` already keeps it byte-identical to
+`workflows/ticketmill.js`. Reverting a lockstep path here would fight that
+sync instead of undoing an incidental restore, so any drift on that path is
+left for `lint-engine`'s byte-compare to catch on its own.
+
+`scopeGuard()` carries a fourth, advisory layer on top of the two gates
+above: a clause appended to every stage prompt, unconditionally, telling the
+agent never to stage, commit, or restore an engine-owned path outside these
+mechanisms. It has to stay generic rather than naming a regime, since an
+agent mid-stage has no reliable way to know which one it's in. The one
+stage that's deliberately excused from that clause is the regime (c) revert
+stage itself: its prompt opens with an explicit override, because it is the
+guardrail acting on the agent's behalf, ahead of the checkout instruction
+the general clause would otherwise contradict.
+
+The gate never halts a run on its own. A dead diff probe or a failed revert
+stage degrades to a recorded `ctx.deferred` follow-up instead of blocking an
+otherwise-green issue.
 
 ### Incident-derived machinery (preserved from the source engine)
 
@@ -278,6 +410,93 @@ effectively orphaned rather than merged. This is a known caveat, not yet a
 mechanical exclusion; treat an `implement`-bound issue with nonzero
 `commits_ahead` as a poor consolidation candidate until `reconcileGroups` is
 extended to drop it.
+
+### Lane scheduling: serializing issues with predicted file conflicts
+
+Concurrent issues that touch the same file race by default: two implementers
+land conflicting edits, and review has to reconcile a diff nobody expected.
+Lane scheduling groups issues likely to overlap into one lane, and a single
+worker drains that lane serially instead of racing every unit against the
+whole pool.
+
+**Predictions come from preflight, not a title heuristic.** Each preflight
+probe resolves real repo-relative paths against `origin/TARGET` (fetched once
+up front, shared read-only across every issue's probe rather than refetched
+per issue) and reads `depends_on #N` / `follow-up to #N` references out of
+the issue body. Both fields fail open to `[]` on any doubt. A wrong guess
+would wrongly serialize two unrelated issues; an empty prediction only costs
+the batch today's ordinary racing behavior.
+
+**`computeLanes()` is a union-find over predicted-file overlap, with two edge
+tiers.** Trusted edges, a `serialize_globs` pattern hit or a `depends_on`
+reference, always unite their units and are never dissolved. Heuristic
+edges, a shared predicted path or (only when no path matches) a shared
+basename, unite units too, but only survive a cohesion-aware collapse guard.
+A pair sharing two or more distinct paths is a genuine cluster, an
+implementation file plus its test, say, and always stands. A pair sharing
+exactly one path only survives as part of a weak-edge-only chain that
+reaches two distinct shared keys entirely on its own, never inherited from a
+neighboring strong cluster. A single popular path touched by many otherwise
+unrelated units, a magnet config or a central router, can't drag them into
+one lane by itself. That's the failure mode the guard exists to catch: one
+file everyone happens to touch is not evidence that any two of them conflict.
+
+**Document frequency is advisory, never a filter.** A path matched by more
+than half the batch (minimum 3 units) gets logged as a magnet signal, for
+visibility in run logs and the DRY_RUN preview. It never drops an
+intersection key or suppresses an edge; only the collapse guard does that.
+
+**A second, coarser guard runs immediately before the real drain.**
+`computeLanes()` guards each weak-edge chain locally, but a long run of
+pairwise-weak edges, each sharing a different path with its neighbor, can
+clear that local two-distinct-keys bar in aggregate without the lane, taken
+as a whole, actually cohering around anything. `applyRealRunCollapseGuard()`
+only recomputes when the batch is large enough to want the concurrency
+(`unitCount >= concurrency`) and the lanes produced are running noticeably
+narrower than a flat pool would (`collapse_ratio < 0.5`). A lane whose exact
+membership also comes out of `computeLanes({ trustedOnly: true })` is
+trusted and always kept. Everything else is re-checked whole-lane, fresh,
+for at least two paths shared across its own units, and dissolved back to
+one singleton lane per unit if it doesn't clear that bar.
+
+**`runPool()` steals whole lanes, not items.** A worker grabs the next
+unclaimed lane and drains every unit in it one at a time, in `depends_on`
+topological order, before stealing another lane. No `lanes` argument, or
+every lane a singleton (what `computeLanes()` returns when nothing
+overlaps), degenerates byte-for-byte to the pre-lane pool: one lane per item,
+drained in original order, `min(limit, items.length)` workers. STOP is still
+checked per unit, and a thrown error is still isolated to the one unit that
+threw, so lane draining changes nothing about failure isolation or
+resumability.
+
+**DRY_RUN previews the same lane graph, read-only.** The claim loop never
+runs during a preview, so a preview's lanes can still diverge from a real
+run's if a claim race flips a `resume_point` between the two. The preview
+reports each lane's issues, predicted files, and provenance (`trusted`,
+`heuristic`, or `none` for an unconnected singleton), plus `collapse_ratio`,
+`prediction_coverage`, any DF-flagged magnet paths, and whether the shared
+`origin/TARGET` fetch failed, which would mean every prediction in the
+preview is grounded against a stale ref.
+
+**The retrospective measures its own accuracy.** For each completed unit
+that predicted files and produced a merged PR, the retro agent diffs the
+PR's actual changed files against `predicted_files` and appends one
+coverage/precision row to a new "## Lane Prediction Accuracy" section in
+`process-retrospective.md`. That closes the loop: the same memory file a
+human reads to judge whether the prediction step is worth trusting, or needs
+a `serialize_globs` hint for a repo's actual magnet files.
+
+**Bounds are read-only aids, not correctness inputs.** A lane's merged
+`predicted_files` list caps at `MAX_LANE_PREDICTED_FILES` (60); the retro's
+predicted-vs-actual sample caps at `MAX_LANE_ACCURACY_SAMPLES` (40). Both
+only limit what a human or a prompt sees, never what `computeLanes()` unions
+or what `runPool()` drains.
+
+**Profile flag.** `serialize_globs` (optional, default `[]`) names patterns
+worth trusting even when predicted-file overlap alone wouldn't catch them: a
+shared schema, a central config, anything two issues could conflict on
+without their own predicted paths overlapping. Left unset, the engine still
+lanes on `depends_on` and predicted-file overlap alone.
 
 ## Failure semantics
 

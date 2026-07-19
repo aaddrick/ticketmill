@@ -524,6 +524,64 @@ test('reconcileGroups: members that all flipped to process_pr (a prior run creat
   assert.deepStrictEqual(units[0].members.map(function (m) { return m.issue }), [10, 11, 12])
 })
 
+// ---- deriveUnits: predicted_files/depends_on threading (issue #1, lane
+// scheduling data layer) — a singleton carries its own arrays straight through;
+// a group unit gets the union of every live member's arrays, with depends_on
+// additionally stripped of any self-reference onto a fellow member of the SAME
+// group (already satisfied by the merge, so it must never dangle a lane edge). ----
+
+test('deriveUnits: a singleton carries its own predicted_files/depends_on straight through, untouched', function () {
+  const context = bootConsolidation()
+  const live = [
+    { issue: 1, resume_point: 'implement', predicted_files: ['src/a.js'], depends_on: [2] },
+    { issue: 2, resume_point: 'implement', predicted_files: [], depends_on: [] },
+  ]
+  const units = context.deriveUnits(new Map(), live)
+  assert.strictEqual(units.length, 2)
+  const u1 = units.find(function (u) { return u.issue === 1 })
+  assert.deepStrictEqual(Array.from(u1.predicted_files), ['src/a.js'])
+  assert.deepStrictEqual(Array.from(u1.depends_on), [2])
+  const u2 = units.find(function (u) { return u.issue === 2 })
+  assert.deepStrictEqual(Array.from(u2.predicted_files), [])
+  assert.deepStrictEqual(Array.from(u2.depends_on), [])
+})
+
+test('deriveUnits: a singleton whose preflight never carried the optional fields at all gets no predicted_files/depends_on keys (no crash)', function () {
+  const context = bootConsolidation()
+  const live = [{ issue: 9, resume_point: 'implement' }] // fields absent, as an older/degraded preflight might be
+  const units = context.deriveUnits(new Map(), live)
+  assert.strictEqual(units.length, 1)
+  assert.strictEqual(units[0].predicted_files, undefined)
+  assert.strictEqual(units[0].depends_on, undefined)
+})
+
+test('deriveUnits: a group unit unions predicted_files across every live member, deduped, in first-seen order', function () {
+  const context = bootConsolidation()
+  const map = new Map()
+  map.set(1, { groupId: 1, primary: 1, members: [1, 2, 3], subsystem: 's', rationale: 'r' })
+  const live = [
+    { issue: 1, resume_point: 'implement', predicted_files: ['src/a.js', 'src/shared.js'], depends_on: [] },
+    { issue: 2, resume_point: 'implement', predicted_files: ['src/shared.js', 'src/b.js'], depends_on: [] },
+    { issue: 3, resume_point: 'implement', predicted_files: [], depends_on: [] },
+  ]
+  const units = context.deriveUnits(map, live)
+  assert.strictEqual(units.length, 1)
+  assert.deepStrictEqual(Array.from(units[0].predicted_files), ['src/a.js', 'src/shared.js', 'src/b.js'])
+})
+
+test('deriveUnits: a group unit\'s depends_on unions across members but drops any ref onto a fellow member of the SAME group', function () {
+  const context = bootConsolidation()
+  const map = new Map()
+  map.set(1, { groupId: 1, primary: 1, members: [1, 2], subsystem: 's', rationale: 'r' })
+  const live = [
+    { issue: 1, resume_point: 'implement', predicted_files: [], depends_on: [2, 5] }, // #2 is a fellow member -> dropped
+    { issue: 2, resume_point: 'implement', predicted_files: [], depends_on: [5, 6] }, // #5 deduped, #6 kept
+  ]
+  const units = context.deriveUnits(map, live)
+  assert.strictEqual(units.length, 1)
+  assert.deepStrictEqual(Array.from(units[0].depends_on), [5, 6])
+})
+
 test('reconcileGroups: a mix of process_pr and skip members excludes only the skipped one, the process_pr members stay grouped', function () {
   const context = bootConsolidation()
   const map = new Map()
@@ -538,4 +596,57 @@ test('reconcileGroups: a mix of process_pr and skip members excludes only the sk
 
   assert.strictEqual(reconciled.size, 1)
   assert.deepStrictEqual(reconciled.get(20).members.slice(), [20, 21])
+})
+
+// ---- deriveUnits: engineOwnedIntentional OR-fold (issue #3 test (ii)) — a
+// deliberate-engine member's flag must survive onto the group unit even when
+// it is NOT the primary. Object.assign({}, primaryRef, ...) alone would carry
+// only the primary's own flag; pickPrimary chooses a primary for group-identity
+// reasons (proposed primary, else lowest issue number) entirely orthogonal to
+// intent, so this is a real, not merely theoretical, mis-flag risk. ----
+
+test('deriveUnits: a group whose deliberate-engine member is NOT the primary still yields unit.engineOwnedIntentional === true', function () {
+  const context = bootConsolidation()
+  const map = new Map()
+  // primary is #30 (an ordinary application-code fix); #31, the non-primary
+  // member, is the one whose own prose targets an engine-owned path.
+  map.set(30, { groupId: 30, primary: 30, members: [30, 31], subsystem: 's', rationale: 'r' })
+  const live = [
+    { issue: 30, resume_point: 'implement', engineOwnedIntentional: false },
+    { issue: 31, resume_point: 'implement', engineOwnedIntentional: true },
+  ]
+
+  const reconciled = context.reconcileGroups(map, live)
+  assert.strictEqual(reconciled.get(30).primary, 30) // confirm #30 IS the primary, not #31
+
+  const units = context.deriveUnits(reconciled, live)
+
+  assert.strictEqual(units.length, 1)
+  assert.strictEqual(units[0].issue, 30) // primary-shaped unit
+  assert.strictEqual(units[0].engineOwnedIntentional, true) // OR-folded from member #31, not inherited from #30 alone
+})
+
+test('deriveUnits: a group where NO member targets an engine-owned path yields unit.engineOwnedIntentional === false', function () {
+  const context = bootConsolidation()
+  const map = new Map()
+  map.set(40, { groupId: 40, primary: 40, members: [40, 41], subsystem: 's', rationale: 'r' })
+  const live = [
+    { issue: 40, resume_point: 'implement', engineOwnedIntentional: false },
+    { issue: 41, resume_point: 'implement', engineOwnedIntentional: false },
+  ]
+
+  const units = context.deriveUnits(context.reconcileGroups(map, live), live)
+
+  assert.strictEqual(units[0].engineOwnedIntentional, false)
+})
+
+test('deriveUnits: a singleton unit carries its OWN engineOwnedIntentional flag straight through (no group to fold)', function () {
+  const context = bootConsolidation()
+  const live = [{ issue: 50, resume_point: 'implement', engineOwnedIntentional: true }]
+
+  const units = context.deriveUnits(new Map(), live)
+
+  assert.strictEqual(units.length, 1)
+  assert.strictEqual(units[0].groupId, null)
+  assert.strictEqual(units[0].engineOwnedIntentional, true)
 })

@@ -108,6 +108,13 @@ incident retrospectives. The machinery it keeps:
 - **Cross-run claims.** Issues are claimed before work starts, so batches started
   by different maintainers never double-process an issue (see Overlapping batches
   below).
+- **Mechanical merge recovery, tested before it's trusted.** A PR that goes
+  `CONFLICTING` after review gets one automatic rebase-and-retest attempt
+  before the run gives up on it: rebase onto the batch branch, resolve
+  mechanical conflicts, then a mandatory full test run on the exact state
+  about to be pushed. Anything that needs a human judgment call, or that
+  can't be re-verified green, still escalates to `needs_human` instead of
+  guessing.
 - **Circuit breakers.** Three failed issues, or three consecutive agent deaths
   (the usage-limit signature), stop the run with a resume plan instead of burning
   through the batch.
@@ -261,6 +268,7 @@ load-bearing fields:
 | `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes) |
 | `models` | Per-stage model/effort overrides |
 | `consolidation` | Default `true`. Set `false` to disable the Select-phase consolidation gate entirely (a resumed run still heals any group a prior run already committed to) |
+| `serialize_globs` | Optional, default `[]`. Patterns worth trusting as a lane-scheduling hint beyond predicted-file overlap alone: a shared schema, a magnet config, anything two issues could conflict on without their own predicted paths overlapping |
 
 ## Repo layout
 
