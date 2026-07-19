@@ -651,6 +651,113 @@ function timeline(ctx) {
   })
 }
 
+// Pure aggregation of per-issue/per-stage token deltas into per-issue and
+// per-model subtotals, plus a finished markdown "## Token Usage" section — all
+// math done here in JS, never delegated to an LLM. Takes no globals; harness-
+// testable in isolation.
+//   results      - the run's per-issue result array. Entries lacking a `.tokens`
+//                  field entirely (skipped/not_started — never got a ctx) or
+//                  carrying `.tokens.tracked === false` (ctx existed but no stage
+//                  ever sampled a usable budget.spent() pair) both render
+//                  "not tracked", never a false zero.
+//   spent        - the guarded, run-wide budget.spent() total (Number or null).
+//   concurrency  - CONCURRENCY. Selects the reconciliation story:
+//     === 1: stage deltas cannot overlap, so they're an exact partition of the
+//       run; an "orchestration/unattributed" remainder row (max(0, spent - sum
+//       of deltas)) is appended so the table sums exactly to `spent`
+//       (reconciles: true).
+//     > 1: multiple issues' stages run side by side against ONE shared
+//       monotonic counter — agent() returns schema content only, never a
+//       per-call usage figure, so there is no way to split budget.spent()'s
+//       movement between concurrent callers. Overlapping stages each see (and
+//       get attributed) the same movement, so deltas over-count and the whole
+//       breakdown is labelled approximate (reconciles: false).
+function aggregateTokens(results, spent, concurrency) {
+  const list = results || []
+  const byIssue = []
+  const byModel = {}
+  let sumDeltas = 0
+  let anyTracked = false
+
+  for (let i = 0; i < list.length; i++) {
+    const r = list[i]
+    const t = r && r.tokens
+    if (t && t.tracked) {
+      anyTracked = true
+      const total = t.total || 0
+      sumDeltas += total
+      byIssue.push({ issue: r.issue, total: total, byModel: Object.assign({}, t.byModel || {}), tracked: true })
+      const models = t.byModel || {}
+      for (const m in models) {
+        if (Object.prototype.hasOwnProperty.call(models, m)) byModel[m] = (byModel[m] || 0) + models[m]
+      }
+    } else {
+      byIssue.push({ issue: r && r.issue, total: null, byModel: {}, tracked: false })
+    }
+  }
+
+  const hasSpent = typeof spent === 'number' && isFinite(spent)
+  const runTotal = hasSpent ? spent : (anyTracked ? sumDeltas : null)
+  const tracked = anyTracked || hasSpent
+  const reconciles = concurrency === 1 && hasSpent && anyTracked
+  const remainder = reconciles ? Math.max(0, spent - sumDeltas) : null
+  const models = Object.keys(byModel).sort()
+
+  const lines = []
+  lines.push('## Token Usage')
+  lines.push('')
+  lines.push(hasSpent
+    ? 'Run total (output tokens, via budget.spent()): **' + spent + '**'
+    : 'Run total: not tracked (budget.spent() unavailable this run)')
+  lines.push('')
+
+  if (!anyTracked) {
+    lines.push('Per-issue / per-model breakdown: not tracked (no stage in this run reported a usable token delta).')
+  } else {
+    if (concurrency > 1) {
+      lines.push('_approximate - overlapping concurrent stages over-count and do NOT reconcile to the run total._')
+      lines.push('(A single shared monotonic counter cannot be split per concurrent call — agent() returns schema ' +
+        'content only, no per-call usage — so simultaneous issues each see the same counter movement.)')
+    } else if (reconciles) {
+      lines.push('_Reconciles exactly to the run total above — the "orchestration/unattributed" row below absorbs ' +
+        'whatever budget.spent() counted that no stage attributed._')
+    } else {
+      lines.push('_approximate — the run total above (budget.spent()) is unavailable this run, so this breakdown ' +
+        'cannot be checked against it._')
+    }
+    lines.push('')
+    const header = ['Issue'].concat(models).concat(['Subtotal'])
+    lines.push('| ' + header.join(' | ') + ' |')
+    lines.push('|' + header.map(function () { return ' --- ' }).join('|') + '|')
+    for (let i = 0; i < byIssue.length; i++) {
+      const row = byIssue[i]
+      const cells = ['#' + row.issue]
+      for (let m = 0; m < models.length; m++) cells.push(row.tracked ? String(row.byModel[models[m]] || 0) : 'not tracked')
+      cells.push(row.tracked ? String(row.total) : 'not tracked')
+      lines.push('| ' + cells.join(' | ') + ' |')
+    }
+    if (reconciles) {
+      const remCells = ['orchestration/unattributed']
+      for (let m = 0; m < models.length; m++) remCells.push('')
+      remCells.push(String(remainder))
+      lines.push('| ' + remCells.join(' | ') + ' |')
+    }
+    const totalCells = ['**Total**']
+    for (let m = 0; m < models.length; m++) totalCells.push('**' + byModel[models[m]] + '**')
+    totalCells.push('**' + (reconciles ? spent : sumDeltas) + '**')
+    lines.push('| ' + totalCells.join(' | ') + ' |')
+  }
+
+  return {
+    run_total: runTotal,
+    by_issue: byIssue,
+    by_model: byModel,
+    tracked: tracked,
+    reconciles: reconciles,
+    markdown: lines.join('\n'),
+  }
+}
+
 // Best-effort halt note on the issue so humans can triage from GitHub alone.
 async function postNote(ctx, stageKey, status, error) {
   if (STOP.tripped) return
@@ -1536,6 +1643,9 @@ async function implementIssue(ctx) {
     '   Title: conventional commit style referencing issue #' + ctx.issue + '.',
     '   Body MUST include "Closes #' + ctx.issue + '", an implementation summary, and key decisions from:',
     decisionChain(ctx),
+    '   Body MUST also include this exact line verbatim (approximate — this issue\'s stages only, not the run',
+    '   total; tokens only, no prices/currency): "Token usage (approximate, this issue only): ' +
+      (ctx.tokens && ctx.tokens.tracked ? ctx.tokens.total + ' output tokens' : 'not tracked') + '"',
     '4. If one exists: ensure it is up to date and comment that a new revision was pushed.',
     'Return status, pr_number, pr_url.',
   ].join('\n'), stageOpts('pr'), PR_SCHEMA)
@@ -2044,6 +2154,9 @@ if (HELD_CLAIMS.length) {
   if (!swept || !swept.posted) log('claims-release sweep incomplete — stale "' + CLAIM_LABEL + '" labels expire via the ' + Math.round(CLAIM_STALE_SECONDS / 3600) + 'h staleness window')
 }
 
+// ---- Token usage: JS-computed aggregation (no LLM math), injected verbatim below ----
+const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY)
+
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
 const completedIssues = results.filter(function (r) { return r && r.status === 'completed' })
@@ -2064,6 +2177,8 @@ if (completedIssues.length) {
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
     '   - a note that per-issue PRs were squash-merged into ' + TARGET + ' with full review trails on each issue.',
+    '   - this "## Token Usage" section, injected VERBATIM (already computed in JS — do not recompute, re-sum,',
+    '     or add commentary beyond copying it in):\n' + TOKEN_AGG.markdown,
     '3. If one exists: update its body to the current results (gh pr edit) and comment that the run refreshed it.',
     'Return status, pr_number, pr_url.',
   ].join('\n'), { label: 'batch-pr', phase: 'Report', schema: PR_SCHEMA, model: M.pr.model, effort: M.pr.effort })
@@ -2075,7 +2190,12 @@ if (completedIssues.length) {
 }
 
 // ---- Report ----
-const resultsJson = JSON.stringify({ state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts, verification_gaps: VERIFY_SKIPS, tokens_spent: budget.spent(), results: results }, null, 2)
+const resultsJson = JSON.stringify({
+  state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts,
+  verification_gaps: VERIFY_SKIPS, tokens_spent: budget.spent(),
+  tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
+  results: results,
+}, null, 2)
 const report = await agent([
   'Write the ticketmill run report.',
   '',
@@ -2086,7 +2206,9 @@ const report = await agent([
   '   from each result\'s "timeline" field (gates, verdicts, iterations), a "Verification Gaps" section if',
   '   verification_gaps is non-empty, a failures section with halt stages, and — if state is not "completed" —',
   '   a "Resume" section: re-run ticketmill with the same args (preflight skips finished work) or resume via',
-  '   resumeFromRunId.',
+  '   resumeFromRunId. Include this "## Token Usage" section VERBATIM (already computed in JS — do not',
+  '   recompute, re-sum, or add commentary beyond copying it in):',
+  TOKEN_AGG.markdown,
   '4. Include the current timestamp from: date -Iseconds',
   RUN_TAG === 'run' ? '5. The tag "run" is a collision-prone default: substitute the current date (date +%F) for "run" in BOTH filenames so successive runs do not overwrite each other, and return the actual path.' : '',
   '',
