@@ -190,6 +190,11 @@ const QUALITY_DEGRADE_WINDOW = 5
 const MAX_QUALITY_DEGRADES_IN_WINDOW = 3
 const MAX_CONSECUTIVE_AGENT_DEATHS = 3
 const STAGE_TRIES = 2
+// lane scheduling (issue #1): bounds a lane's merged predicted_files list (the
+// union of every member unit's own, already-capped-at-20 predicted_files) so a
+// lane spanning many units can't grow that list unboundedly — it's a DRY_RUN/
+// human-readability aid, not a correctness input, so a hard cap is safe.
+const MAX_LANE_PREDICTED_FILES = 60
 
 // ----- model policy (profile.models may override any stage key) -----
 const M = {
@@ -793,6 +798,180 @@ function deriveUnits(reconciledMap, livePreflights) {
     units.push(Object.assign({}, p, { members: [p], groupId: null }))
   }
   return units
+}
+
+// computeLanes: pure reducer (issue #1, lane scheduling) that groups deriveUnits()'s
+// output into lanes — sets of unit INDICES that must run serially (one worker
+// draining the lane in order) instead of racing. Reuses globToRe/matchesGlobs
+// (defined below; hoisted, so fine to call from here) for glob matching. Returns
+// an array of { unitIndices: [index,...], predicted_files: [path,...] }, one per
+// connected component, sorted by each lane's lowest unit index for determinism;
+// a unit connected to nothing is its own lane of size 1 — with no overlap
+// anywhere, this returns units.length singleton lanes, degenerating byte-for-byte
+// to today's every-unit-races-every-unit pool.
+//
+// Union-find over unit indices with two edge tiers:
+//   - TRUSTED (always unite, never dissolved): a serialize_globs pattern matched
+//     by >=1 predicted_files path of each unit (same pattern), or a depends_on
+//     reference from one unit onto another (resolved via each unit's own issue
+//     plus every member's issue, so a grouped unit's members all resolve to it).
+//   - HEURISTIC (unite unless suppressed by the collapse guard below): a shared
+//     normalized predicted_files path between two units, or — only when no path
+//     is shared — a shared basename (weaker, e.g. same filename in different
+//     directories).
+//
+// Cohesion-aware collapse guard (NOT size-keyed — a lane's fate never depends on
+// how many units or edges it has, only on overlap structure): heuristic edges are
+// trial-unioned on top of the trusted graph to see what lane they would form; a
+// resulting lane is kept for real only if its units co-predict (i.e. >=2 distinct
+// units carry the exact same normalized path) at least 2 distinct full paths.
+// A lane that reduces to exactly one (or zero) co-predicted path is a single-path
+// promiscuous connector — the shape a magnet file produces (many otherwise
+// unrelated units all touching one popular path) — and is dissolved back to
+// trusted-only, i.e. those units race instead of serializing. A lane sharing >=2
+// paths (e.g. an implementation file plus its test) is a genuine cluster and is
+// kept intact even if it spans most of the batch. Trusted edges are never
+// touched by this guard.
+//
+// DF (document-frequency) signal: advisory/metric-only, logged when a predicted
+// path is matched by more than half the batch (min 3 units) — surfaced for human
+// visibility but NEVER used to drop an intersection key or suppress an edge; that
+// job belongs solely to the collapse guard above. serialize_globs paths are never
+// counted toward DF (they're a deliberate trusted signal, not a magnet).
+function computeLanes(units, serializeGlobs) {
+  const n = (units || []).length
+  function find(p, x) { while (p[x] !== x) { p[x] = p[p[x]]; x = p[x] } return x }
+  function union(p, a, b) { const ra = find(p, a); const rb = find(p, b); if (ra !== rb) p[ra] = rb }
+
+  function normalizePath(f) { return String(f).trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/{2,}/g, '/') }
+  function basenameOf(f) { const parts = normalizePath(f).split('/'); return parts[parts.length - 1] }
+
+  const predictedSets = units.map(function (u) {
+    const s = {}
+    for (const f of (Array.isArray(u && u.predicted_files) ? u.predicted_files : [])) s[normalizePath(f)] = true
+    return s
+  })
+  const basenameSets = units.map(function (u) {
+    const s = {}
+    for (const f of (Array.isArray(u && u.predicted_files) ? u.predicted_files : [])) s[basenameOf(f)] = true
+    return s
+  })
+  // every issue number that resolves to this unit index — its own, plus every
+  // live member's (a group unit's members all point back to the one group unit).
+  const issueToIndex = {}
+  units.forEach(function (u, idx) {
+    if (u && u.issue != null) issueToIndex[u.issue] = idx
+    for (const m of (Array.isArray(u && u.members) ? u.members : [])) {
+      if (m && m.issue != null) issueToIndex[m.issue] = idx
+    }
+  })
+
+  const parent = []
+  for (let i = 0; i < n; i++) parent[i] = i
+
+  // ---- trusted: serialize_globs (unite every unit whose predicted_files hits
+  // the same pattern) ----
+  const globs = Array.isArray(serializeGlobs) ? serializeGlobs.filter(function (g) { return typeof g === 'string' && g.length > 0 }) : []
+  for (const g of globs) {
+    let first = -1
+    for (let i = 0; i < n; i++) {
+      const hit = Object.keys(predictedSets[i]).some(function (p) { return matchesGlobs(p, [g]) })
+      if (!hit) continue
+      if (first === -1) first = i
+      else union(parent, first, i)
+    }
+  }
+
+  // ---- trusted: depends_on ----
+  for (let i = 0; i < n; i++) {
+    for (const dep of (Array.isArray(units[i].depends_on) ? units[i].depends_on : [])) {
+      const j = issueToIndex[dep]
+      if (j != null && j !== i) union(parent, i, j)
+    }
+  }
+
+  // ---- DF signal: advisory/metric-only, logged, never used to drop keys ----
+  const isSerializeGlobPath = function (p) { return globs.some(function (g) { return matchesGlobs(p, [g]) }) }
+  const dfCount = {}
+  for (let i = 0; i < n; i++) {
+    for (const p of Object.keys(predictedSets[i])) {
+      if (isSerializeGlobPath(p)) continue // serialize_globs never counted
+      dfCount[p] = (dfCount[p] || 0) + 1
+    }
+  }
+  const magnets = Object.keys(dfCount).filter(function (p) { return dfCount[p] >= 3 && dfCount[p] > n / 2 })
+  if (magnets.length) {
+    log('computeLanes: DF magnet signal (advisory only — intersection keys NOT dropped): ' +
+      magnets.map(function (p) { return p + ' (' + dfCount[p] + '/' + n + ')' }).join(', '))
+  }
+
+  // ---- heuristic candidate edges: full-path intersection, else basename ----
+  const heuristicEdges = []
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      let shared = Object.keys(predictedSets[i]).filter(function (p) { return predictedSets[j][p] })
+      if (!shared.length) shared = Object.keys(basenameSets[i]).filter(function (b) { return basenameSets[j][b] })
+      if (shared.length) heuristicEdges.push({ i: i, j: j })
+    }
+  }
+
+  // ---- cohesion-aware collapse guard ----
+  const trial = parent.slice()
+  for (const e of heuristicEdges) union(trial, e.i, e.j)
+
+  const laneMembers = {} // trial root -> unit indices
+  for (let i = 0; i < n; i++) {
+    const r = find(trial, i)
+    if (!laneMembers[r]) laneMembers[r] = []
+    laneMembers[r].push(i)
+  }
+  const cohesionCount = {} // trial root -> count of distinct FULL paths co-predicted by >=2 units in that lane
+  Object.keys(laneMembers).forEach(function (r) {
+    const pathHolders = {}
+    for (const idx of laneMembers[r]) {
+      for (const p of Object.keys(predictedSets[idx])) pathHolders[p] = (pathHolders[p] || 0) + 1
+    }
+    let count = 0
+    for (const p of Object.keys(pathHolders)) { if (pathHolders[p] >= 2) count++ }
+    cohesionCount[r] = count
+  })
+
+  for (const e of heuristicEdges) {
+    const r = find(trial, e.i)
+    if (cohesionCount[r] >= 2) union(parent, e.i, e.j) // exempt: cohesive cluster, never dissolved
+    // else: single-path promiscuous connector — left dissolved, those units race
+  }
+
+  const dissolvedLanes = Object.keys(laneMembers).filter(function (r) { return laneMembers[r].length >= 2 && cohesionCount[r] < 2 })
+  if (dissolvedLanes.length) {
+    log('computeLanes: collapse guard dissolved ' + dissolvedLanes.length +
+      ' heuristic lane(s) — single-path promiscuous connector(s) with < 2 co-predicted paths; racing instead of serializing')
+  }
+
+  // ---- materialize final lanes, bounding predicted-set growth per lane ----
+  const groupsByRoot = {}
+  for (let i = 0; i < n; i++) {
+    const r = find(parent, i)
+    if (!groupsByRoot[r]) groupsByRoot[r] = []
+    groupsByRoot[r].push(i)
+  }
+  const lanes = Object.keys(groupsByRoot).map(function (r) {
+    const unitIndices = groupsByRoot[r]
+    const predicted = []
+    const seen = {}
+    for (const idx of unitIndices) {
+      if (predicted.length >= MAX_LANE_PREDICTED_FILES) break
+      for (const p of Object.keys(predictedSets[idx])) {
+        if (seen[p]) continue
+        if (predicted.length >= MAX_LANE_PREDICTED_FILES) break
+        seen[p] = true
+        predicted.push(p)
+      }
+    }
+    return { unitIndices: unitIndices, predicted_files: predicted }
+  })
+  lanes.sort(function (a, b) { return Math.min.apply(null, a.unitIndices) - Math.min.apply(null, b.unitIndices) })
+  return lanes
 }
 
 // ----- batch state -----
