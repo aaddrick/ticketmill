@@ -2946,7 +2946,22 @@ const state = STOP.tripped ? 'circuit_breaker'
   : (results.some(function (r) { return r.status !== 'completed' && r.status !== 'skipped' }) ? 'completed_with_errors' : 'completed')
 log('Batch done: ' + JSON.stringify(counts) + ' state=' + state + (STOP.tripped ? ' (' + STOP.reason + ')' : ''))
 
+// ---- Consolidation groups this run actually materialized and processed (post-
+// reconciliation, so this reflects live membership, not the pre-claim proposal) —
+// one entry per group unit, reused below by BOTH the batch PR body and the run
+// report so a reviewer sees primary/members/rationale explicitly, not just the
+// primary issue's line. counts/state above already treat a group as ONE unit
+// (runPool iterates `units`, one result per group, not per member) — nothing
+// further to aggregate there.
+const finalGroups = units.filter(function (u) { return u.groupId != null }).map(function (u) {
+  return { group_id: u.groupId, primary: u.issue, members: memberIssues(u), subsystem: u.subsystem, rationale: u.rationale }
+})
+
 // ---- Release any claims this run still holds (circuit-breaker leftovers, misses) ----
+// (toClaim/HELD_CLAIMS above and this sweep both operate on `preflights` — the raw
+// per-issue array untouched by consolidation — so every group member was claimed
+// individually and is released individually here; grouping never hides a member
+// from claim coordination.)
 phase('Report')
 if (HELD_CLAIMS.length) {
   const swept = await agent([
@@ -2971,6 +2986,12 @@ const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY)
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
 const completedIssues = results.filter(function (r) { return r && r.status === 'completed' })
+// Groups this run actually completed (a group unit's result carries the primary's
+// issue number, materialized/reconciled BEFORE processIssue ran — see finalGroups
+// above), reused for the explicit "## Consolidated Groups" section below.
+const completedGroups = finalGroups.filter(function (g) {
+  return completedIssues.some(function (r) { return r.issue === g.primary })
+})
 if (completedIssues.length) {
   const bp = await agent([
     'Create (or update) the batch integration PR for this run — DO NOT MERGE IT under any circumstances;',
@@ -2980,10 +3001,20 @@ if (completedIssues.length) {
     '2. If none: gh pr create --repo ' + REPO + ' --base ' + BASE + ' --head ' + TARGET,
     '   Title: "Batch ' + RUN_TAG + ': ' + completedIssues.length + ' issue(s) (' + TARGET + ')"',
     '   Body must contain:',
-    '   - one "Closes #<issue>" line per completed issue (this is what closes them on merge):',
-    completedIssues.map(function (r) { return '     Closes #' + r.issue }).join('\n'),
+    '   - one "Closes #<issue>" line per completed issue AND every issue absorbed into it via',
+    '     consolidation (flatMap so a completed group closes EVERY member, not just its primary —',
+    '     this is what closes them all on merge):',
+    completedIssues.flatMap(function (r) { return (r.members && r.members.length ? r.members : [r.issue]) })
+      .map(function (n) { return '     Closes #' + n }).join('\n'),
     '   - a results table (Issue | Title | PR into batch | Status) built from:',
     JSON.stringify(results.map(function (r) { return { issue: r.issue, title: r.title, pr: r.pr, status: r.status } })).slice(0, 6000),
+    completedGroups.length
+      ? '   - a "## Consolidated Groups" section the reviewer MUST see, listing EXACTLY these lines (one\n' +
+        '     line per group: its primary issue, every absorbed member, and why they were grouped):\n' +
+        completedGroups.map(function (g) {
+          return '     - primary #' + g.primary + ' — members: ' + g.members.map(function (n) { return '#' + n }).join(', ') + ' — ' + g.rationale
+        }).join('\n')
+      : '   - (no consolidation groups completed this run — every issue merged as its own unit)',
     VERIFY_SKIPS.length
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
@@ -3005,6 +3036,7 @@ const resultsJson = JSON.stringify({
   state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts,
   verification_gaps: VERIFY_SKIPS, tokens_spent: budget.spent(),
   tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
+  consolidation_groups: finalGroups,
   results: results,
 }, null, 2)
 const report = await agent([
@@ -3014,11 +3046,14 @@ const report = await agent([
   '2. Write the JSON below verbatim to ' + LOGS + '/summary-' + RUN_TAG + '.json',
   '3. Write a human-readable markdown summary to ' + LOGS + '/summary-' + RUN_TAG + '.md with:',
   '   a results table (Issue | Title | Status | PR | Follow-ups | Error), a per-issue pipeline narrative built',
-  '   from each result\'s "timeline" field (gates, verdicts, iterations), a "Verification Gaps" section if',
-  '   verification_gaps is non-empty, a failures section with halt stages, and — if state is not "completed" —',
-  '   a "Resume" section: re-run ticketmill with the same args (preflight skips finished work) or resume via',
-  '   resumeFromRunId. Include this "## Token Usage" section VERBATIM (already computed in JS — do not',
-  '   recompute, re-sum, or add commentary beyond copying it in):',
+  '   from each result\'s "timeline" field (gates, verdicts, iterations), a "Consolidated Groups" section if',
+  '   consolidation_groups is non-empty — one line per group naming its primary issue, every absorbed member,',
+  '   and the rationale it was grouped for (a group is ONE unit: its members share one worktree/branch/PR/result,',
+  '   so list them explicitly here rather than only showing the primary\'s row in the results table), a',
+  '   "Verification Gaps" section if verification_gaps is non-empty, a failures section with halt stages, and —',
+  '   if state is not "completed" — a "Resume" section: re-run ticketmill with the same args (preflight skips',
+  '   finished work) or resume via resumeFromRunId. Include this "## Token Usage" section VERBATIM (already',
+  '   computed in JS — do not recompute, re-sum, or add commentary beyond copying it in):',
   TOKEN_AGG.markdown,
   '4. Include the current timestamp from: date -Iseconds',
   RUN_TAG === 'run' ? '5. The tag "run" is a collision-prone default: substitute the current date (date +%F) for "run" in BOTH filenames so successive runs do not overwrite each other, and return the actual path.' : '',
