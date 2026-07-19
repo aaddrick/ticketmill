@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.17 (2026-07-19)
+
+- Test quality fix (#11): the previous test pass only exercised the pure
+  `aggregateTokens()` helper — the half of #11 that does the actual token
+  attribution, `stage()`'s tokensBefore/tokensAfter instrumentation and the
+  guarded `spentTokens()` wrapper it depends on, had no direct coverage, and
+  `tests/harness.js`'s `makeCtx()` fixture had no `tokens` field, so every
+  existing `stage()`-driving test silently no-opped through the new branch.
+  Added `tests/token-tracking.test.js`: seven tests drive `spentTokens()`
+  directly across all its guard branches (budget missing, `.spent` not a
+  function, `.spent()` throwing, and non-finite/non-numeric returns), and
+  eight more call `context.stage(...)` directly with a scripted, stateful
+  `budget.spent()` to prove the delta math end-to-end — the `Math.max(0, ...)`
+  clamp on a backwards-moving counter, one before/after sample spanning the
+  whole retry loop (not one per attempt), `byModel` accumulation across
+  multiple calls to the same model, the no-model and no-`ctx.tokens` no-ops,
+  and a permanently-throwing `budget.spent()` never affecting `stage()`'s
+  return value. `tests/harness.js`'s `makeCtx()` now defaults `ctx.tokens` to
+  the same zeroed/untracked shape `processIssue()` builds, closing the
+  fixture gap for future stage()-driving tests too.
+
 ## 0.1.16 (2026-07-19)
 
 - Fixed `aggregateTokens()` (#11 quality review) so `resultsJson.tokens.run_total`

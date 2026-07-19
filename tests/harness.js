@@ -61,6 +61,14 @@ function freshMetrics() {
   }
 }
 
+// A ctx.tokens shape matching processIssue()'s initial object exactly (workflows/
+// ticketmill.js, ~line 1823) — stage()'s token-tracking finally-block only fires
+// when `ctx && ctx.tokens` is truthy, so any fixture ctx omitting this field
+// silently no-ops through that instrumentation instead of exercising it.
+function freshTokens() {
+  return { total: 0, byModel: {}, tracked: false }
+}
+
 /** Read workflows/ticketmill.js as text (never executed directly). */
 function readEngineSource() {
   return fs.readFileSync(ENGINE_PATH, 'utf8')
@@ -174,8 +182,11 @@ function readGlobal(context, expr) {
  *                 test_iters, browser_iters, pr_review_iters } — all start at 0;
  *               loop tests assert against ctx.metrics.<field> after driving a
  *               loop, e.g. ctx.metrics.test_iters === MAX_TEST_ITERATIONS.
+ *   tokens    - { total, byModel, tracked } — stage()'s token-tracking finally-block
+ *               target; starts zeroed/untracked like the real ctx, so a stage()-driving
+ *               test only needs to override `budget` to exercise the instrumentation.
  * Pass `overrides` to set any field (e.g. `{ issue: 42 }`); deep fields like
- * `metrics` are shallow-merged over the zeroed defaults.
+ * `metrics`/`tokens` are shallow-merged over the zeroed defaults.
  */
 function makeCtx(overrides) {
   const o = overrides || {}
@@ -194,9 +205,11 @@ function makeCtx(overrides) {
       unresolved: [],
       approach: '',
       metrics: freshMetrics(),
+      tokens: freshTokens(),
     },
     o,
     { metrics: Object.assign(freshMetrics(), o.metrics) },
+    { tokens: Object.assign(freshTokens(), o.tokens) },
   )
 }
 
@@ -248,4 +261,5 @@ module.exports = {
   makeCtx,
   installScriptedAgent,
   freshMetrics,
+  freshTokens,
 }
