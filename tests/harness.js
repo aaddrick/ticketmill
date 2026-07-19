@@ -177,6 +177,10 @@ function readGlobal(context, expr) {
  *   notes     - [] consumed by collectNotes()/notesBlock()
  *   unresolved- [] (critical/major findings carried past a contrarian cap)
  *   approach  - string, evaluate's one-line approach summary
+ *   members   - [{issue}] consolidation-unit member refs (deriveUnits() shape);
+ *               defaults to a self-reference singleton [{issue: <this ctx's issue>}],
+ *               matching processIssue()'s own default for a no-group run.
+ *   groupId   - number|null, stable consolidation-group id; null outside a group
  *   metrics   - { approach_iters, plan_iters, tasks_done, tasks_failed,
  *                 task_review_attempts, quality_iters, quality_degrades,
  *                 test_iters, browser_iters, pr_review_iters } — all start at 0;
@@ -190,9 +194,10 @@ function readGlobal(context, expr) {
  */
 function makeCtx(overrides) {
   const o = overrides || {}
+  const issue = ('issue' in o) ? o.issue : 1
   return Object.assign(
     {
-      issue: 1,
+      issue: issue,
       title: 'Fixture issue',
       worktree: '/tmp/ticketmill-fixture-worktree',
       branch: 'issue-1-fixture',
@@ -204,6 +209,8 @@ function makeCtx(overrides) {
       notes: [],
       unresolved: [],
       approach: '',
+      members: [{ issue: issue }],
+      groupId: null,
       metrics: freshMetrics(),
       tokens: freshTokens(),
     },

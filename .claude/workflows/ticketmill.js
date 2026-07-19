@@ -379,6 +379,10 @@ const PLAN_SCHEMA = {
     status: { enum: ['success', 'error'] }, plan_path: { type: 'string' },
     tasks: { type: 'array', items: { type: 'object', required: ['id', 'description', 'agent'], properties: {
       id: { type: 'integer' }, description: { type: 'string' }, agent: { type: 'string' },
+      // origin_issue: only meaningful for a consolidated group unit — the member
+      // issue number whose requirement drives this task. Optional/absent for a
+      // singleton run; the plan-task sanitizer defaults it to ctx.issue either way.
+      origin_issue: { type: ['integer', 'null'] },
     } } },
     summary: { type: 'string' }, task_list_markdown: { type: 'string' }, error: { type: ['string', 'null'] },
   },
@@ -615,6 +619,28 @@ function pickPrimary(members, proposedPrimary) {
   return members.length ? stableGroupId(members) : proposedPrimary
 }
 
+// memberIssues: ctx.members is an array of preflight-shaped refs (deriveUnits());
+// most call sites (research/plan/PR-body/merge prompts, result objects) only need
+// the bare issue numbers. Shared here so every one of those call sites derives the
+// list the same way. For a singleton, ctx.members === [self], so this is always
+// [ctx.issue] — the no-group case never sees anything new here.
+function memberIssues(ctx) {
+  return (ctx.members || []).map(function (m) { return m.issue })
+}
+
+// worktreeAnchor: the issue number passed to setup-worktree.sh as the physical
+// worktree/branch anchor. A group's worktree/branch/PR identity is bound to its
+// STABLE groupId (the lowest issue number ever proposed as a member — see
+// stableGroupId()), never to the mutable logical primary (ctx.issue), because
+// reconcileGroups() can re-anchor the primary onto a different live member across
+// a resumed run — using ctx.issue there would spawn a second, orphaned worktree.
+// groupId is itself always a real member issue number, so `gh issue view` against
+// it (setup-worktree.sh's title-slug lookup) resolves exactly like any other issue.
+// For a singleton, ctx.groupId is always null, so this is always ctx.issue.
+function worktreeAnchor(ctx) {
+  return ctx.groupId != null ? ctx.groupId : ctx.issue
+}
+
 // toGroupEntry: build one out.set() value in the shape healGroups()/reconcileGroups()
 // share (groupId, primary, members, subsystem, rationale, +extra) — shared by
 // proposeConsolidation()'s DRY_RUN-preview and post-challenge acceptance paths so
@@ -775,16 +801,36 @@ function spentTokens() {
 // per-issue pipelines run side by side; the guard pins gh targets to this ctx's
 // issue and stamps every posted comment with a machine-checkable marker that
 // the contrarian gates use to detect and delete misfiled comments.
+//
+// A consolidation GROUP unit's stages legitimately need to post to / edit every
+// member issue (postNote's per-member halt note, the merge stage's per-member
+// claim release, ...) — a single-issue guard would flatly forbid that ("NEVER
+// post to them") and contradict every group-aware prompt built above. So the
+// guard widens its in-scope set to every ctx.members issue for a group unit,
+// while keeping the singleton branch byte-for-byte identical to before.
 function scopeGuard(ctx) {
-  const lines = [
-    '## Scope guard (ticketmill)',
-    'You are working EXCLUSIVELY on issue #' + ctx.issue + ' of ' + REPO + (ctx.pr ? ' (PR #' + ctx.pr + ')' : '') + '.',
-    'Every gh issue comment / gh pr comment / gh issue edit command MUST target issue #' + ctx.issue +
-    (ctx.pr ? ' or PR #' + ctx.pr : '') + ' exactly — re-read the number in the command line before running it.',
-    'Other issue/PR numbers appearing in context, handoff notes, or learnings belong to concurrent pipelines;',
-    'NEVER post to them.',
-    'End every comment body you post with this exact marker line: <!-- ticketmill ' + REPO + '#' + ctx.issue + ' -->',
-  ]
+  const isGroup = ctx.members && ctx.members.length > 1
+  const memberNums = isGroup ? memberIssues(ctx) : [ctx.issue]
+  const lines = isGroup
+    ? [
+        '## Scope guard (ticketmill)',
+        'You are working EXCLUSIVELY on consolidation group ' + ctx.groupId + ' of ' + REPO + (ctx.pr ? ' (PR #' + ctx.pr + ')' : '') +
+        ', covering member issues: ' + fmtIssues(memberNums) + '.',
+        'Every gh issue comment / gh pr comment / gh issue edit command MUST target one of these member issues (' +
+        fmtIssues(memberNums) + ')' + (ctx.pr ? ' or PR #' + ctx.pr : '') + ' exactly — re-read the number in the command line before running it.',
+        'Other issue/PR numbers appearing in context, handoff notes, or learnings belong to concurrent pipelines;',
+        'NEVER post to them.',
+        'End every comment you post on a member issue with THAT issue\'s own marker line: <!-- ticketmill ' + REPO + '#<that member\'s number> -->.',
+      ]
+    : [
+        '## Scope guard (ticketmill)',
+        'You are working EXCLUSIVELY on issue #' + ctx.issue + ' of ' + REPO + (ctx.pr ? ' (PR #' + ctx.pr + ')' : '') + '.',
+        'Every gh issue comment / gh pr comment / gh issue edit command MUST target issue #' + ctx.issue +
+        (ctx.pr ? ' or PR #' + ctx.pr : '') + ' exactly — re-read the number in the command line before running it.',
+        'Other issue/PR numbers appearing in context, handoff notes, or learnings belong to concurrent pipelines;',
+        'NEVER post to them.',
+        'End every comment body you post with this exact marker line: <!-- ticketmill ' + REPO + '#' + ctx.issue + ' -->',
+      ]
   if (BROWSER) {
     lines.push('The shared verification browser is lock-guarded (' + BW_LOCK + '): only use it if your prompt includes the')
     lines.push('"live browser feedback" protocol block — without that block, do NOT open the browser.')
@@ -1042,28 +1088,50 @@ function aggregateTokens(results, spent, concurrency) {
   }
 }
 
-// Best-effort halt note on the issue so humans can triage from GitHub alone.
+// Best-effort halt note on the issue so humans can triage from GitHub alone. For a
+// consolidation group (ctx.members.length > 1), the SAME halt fires the same note
+// on EVERY member issue — not just the primary — naming the group so a human
+// reading any one member's trail knows the whole unit halted together, and
+// releases every member's claim so a resumed run can re-pick up the group. The
+// singleton branch below is byte-for-byte the original single-issue prompt.
 async function postNote(ctx, stageKey, status, error) {
   if (STOP.tripped) return
-  const noted = await stage(ctx, 'halt-note-' + stageKey, [
-    'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (use gh issue comment).',
+  const isGroup = ctx.members && ctx.members.length > 1
+  const memberNums = isGroup ? memberIssues(ctx) : [ctx.issue]
+  const groupLine = isGroup
+    ? 'This issue is part of consolidation group ' + ctx.groupId + ' (primary #' + ctx.issue + '; members: ' + fmtIssues(memberNums) + ') — the whole group halted together.'
+    : ''
+  const lines = [
+    isGroup
+      ? 'Post a GitHub comment on EACH of these member issues in ' + REPO + ' (use gh issue comment for every one): ' + fmtIssues(memberNums) + '.'
+      : 'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (use gh issue comment).',
     'Title line: "## Automated Processing Halted"',
     'Body: state that the ticketmill workflow halted at stage "' + stageKey + '" with status "' + status + '".',
+  ]
+  if (isGroup) lines.push(groupLine)
+  lines.push(
     'Error: ' + String(error || 'unknown').slice(0, 800),
     'Include: "Resume: re-run the ticketmill workflow with the same args — completed stages are detected from GitHub/git state and skipped."',
-    'Also release the claim so another run can pick this issue up:',
-    'gh issue edit ' + ctx.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true',
+    'Also release the claim so another run can pick this ' + (isGroup ? 'group' : 'issue') + ' up' + (isGroup ? ' — do this for EVERY member issue listed above' : '') + ':',
+    isGroup
+      ? memberNums.map(function (n) { return 'gh issue edit ' + n + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true' }).join('\n')
+      : 'gh issue edit ' + ctx.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true',
     'Return posted=true/false.',
-  ].join('\n'), stageOpts('probe'), NOTE_SCHEMA, 1)
+  )
+  const noted = await stage(ctx, 'halt-note-' + stageKey, lines.join('\n'), stageOpts('probe'), NOTE_SCHEMA, 1)
   if (!noted || !noted.posted) log('#' + ctx.issue + ' halt note (' + stageKey + ') did not post — status is recorded in the run results only')
 }
 
+// fail(): called exactly once per unit — every call site is a `return fail(...)`,
+// so this fires (and increments BATCH.failures) exactly ONCE per unit regardless
+// of how many members it covers. A failed GROUP is still one breaker increment,
+// not one per member; postNote() above is what fans the halt note out per member.
 async function fail(ctx, status, stageKey, error) {
   log('#' + ctx.issue + ' -> ' + status + ' at ' + stageKey + ': ' + String(error || '').slice(0, 200))
   await postNote(ctx, stageKey, status, error)
   BATCH.failures++
   if (BATCH.failures >= MAX_BATCH_FAILURES) tripStop('circuit breaker: ' + BATCH.failures + ' issues failed')
-  return { issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice() }
+  return { issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx) }
 }
 
 // =============================================================================
@@ -1465,11 +1533,17 @@ async function runTestLoop(ctx) {
 // Top-level (not closed over ctx) so tests can exercise the stub guard directly;
 // still closes over IMPLEMENTERS, DEFAULT_IMPLEMENTER, and log from module scope.
 function sanitizeTasks(ctx, raw) {
+  // origin_issue must name an actual member of THIS unit — a hallucinated or
+  // stale issue number falls back to the primary (ctx.issue), same as a
+  // singleton always does (its only valid origin is ctx.issue itself).
+  const validOrigins = memberIssues(ctx)
   return (raw || []).map(function (t, i) {
+    const origin = (typeof t.origin_issue === 'number' && validOrigins.indexOf(t.origin_issue) !== -1) ? t.origin_issue : ctx.issue
     return {
       id: typeof t.id === 'number' ? t.id : i + 1,
       description: String(t.description || '').trim(),
       agent: IMPLEMENTERS.indexOf(t.agent) !== -1 ? t.agent : DEFAULT_IMPLEMENTER,
+      origin_issue: origin,
     }
   }).filter(function (t) {
     // Stub guard: a real task description is a sentence, not a token. Dropping
@@ -1830,13 +1904,17 @@ async function implementIssue(ctx) {
   const setupScript = ROOT + '/.claude/scripts/ticketmill/setup-worktree.sh'
   const envFiles = PROFILE.env_files || []
   const installCmds = PROFILE.install_commands || []
+  // A group's worktree/branch/PR identity is bound to its stable groupId, never
+  // the mutable logical primary (ctx.issue) — see worktreeAnchor()'s comment.
+  // For a singleton, anchor === ctx.issue, so this is a no-op.
+  const anchor = worktreeAnchor(ctx)
   const setup = await stage(ctx, 'setup', [
     'Set up the git worktree for issue #' + ctx.issue + ' (ticketmill workflow).',
     '',
     '0. Fetch the batch integration branch first: git -C ' + ROOT + ' fetch origin ' + TARGET,
     '1. Run exactly, from ' + ROOT + ', and capture its single-line JSON output:',
-    '   ' + setupScript + ' ' + ctx.issue + ' ' + TARGET + ' ' + ROOT + ' ' + WORKTREES + ' ' + REPO,
-    '   (Idempotent: reuses an existing worktree already on an issue-' + ctx.issue + '-* branch.)',
+    '   ' + setupScript + ' ' + anchor + ' ' + TARGET + ' ' + ROOT + ' ' + WORKTREES + ' ' + REPO,
+    '   (Idempotent: reuses an existing worktree already on an issue-' + anchor + '-* branch.)',
     '2. If success, make the worktree bootable:',
     envFiles.length
       ? '   - Copy env files from the root checkout if missing in the worktree: ' + envFiles.map(function (f) { return 'cp -n ' + ROOT + '/' + f + ' <worktree>/' + f + ' 2>/dev/null || true' }).join('; ')
@@ -1860,10 +1938,19 @@ async function implementIssue(ctx) {
   ctx.branch = setup.branch
 
   // ---- RESEARCH ----
-  const research = await stage(ctx, 'research', [
+  // Group unit: read EVERY member's issue, not just the primary — and keep each
+  // member's requirements attributed to its own issue number rather than blended
+  // into one synthesized narrative, so a task can later be traced back to the
+  // member issue that drove it (see the plan stage's origin_issue tagging below).
+  const isGroupUnit = ctx.members.length > 1
+  const researchIssueStep = isGroupUnit
+    ? '1. This is a CONSOLIDATED GROUP unit — read EVERY member issue AND its comments, not just the primary:\n' +
+      ctx.members.map(function (m) { return '   gh issue view ' + m.issue + ' --repo ' + REPO + ' --json title,body,comments' }).join('\n')
+    : '1. Read the issue AND all comments: gh issue view ' + ctx.issue + ' --repo ' + REPO + ' --json title,body,comments'
+  const researchLines = [
     'Research context for issue #' + ctx.issue + ' of ' + REPO + '. Read-only exploration in worktree ' + ctx.worktree + '.',
     '',
-    '1. Read the issue AND all comments: gh issue view ' + ctx.issue + ' --repo ' + REPO + ' --json title,body,comments',
+    researchIssueStep,
     '2. Check prior PRs referencing it: gh pr list --repo ' + REPO + ' --state all --search "' + ctx.issue + '" --json number,title,state,body',
     '3. If prior work exists (implementation comments, closed/rejected PRs, review feedback): summarize what was',
     '   attempted, the outcome, what to preserve vs change.',
@@ -1874,8 +1961,16 @@ async function implementIssue(ctx) {
     'You may also use WebSearch/WebFetch (load via ToolSearch) for external references the issue depends on',
     '(regulations, vendor docs, upstream APIs) — cite fetched URLs in the context you return.',
     bwFeedback(ctx),
-    'Return status, context {issue_title, issue_body (brief requirements), related_files, dependencies, prior_work}.',
-  ].join('\n'), stageOpts('research'), RESEARCH_SCHEMA)
+  ]
+  if (isGroupUnit) {
+    researchLines.push(
+      'Return context.issue_body as PER-MEMBER sections tagged by issue number (e.g. "#' + ctx.members[0].issue +
+      ': ...", "#' + ctx.members[1].issue + ': ..." for every member) — do NOT synthesize one blended narrative;',
+      'downstream stages need to trace a requirement back to the member issue it came from.'
+    )
+  }
+  researchLines.push('Return status, context {issue_title, issue_body (brief requirements), related_files, dependencies, prior_work}.')
+  const research = await stage(ctx, 'research', researchLines.join('\n'), stageOpts('research'), RESEARCH_SCHEMA)
   if (!research) return fail(ctx, 'halted', 'research', 'research agent died')
   if (research.status === 'error') return fail(ctx, 'failed', 'research', research.error || 'research failed')
   const rc = research.context || {}
@@ -2009,8 +2104,18 @@ async function implementIssue(ctx) {
         return '- ' + n + ': ' + String(d).slice(0, 240)
       }).join('\n')
     : '- implementer: built-in generalist software engineer charter (this project declared no implementer agents)'
+  // Group unit: each task must be tagged with origin_issue — the member issue
+  // whose requirement drives it — so downstream (task-implement prompts) can
+  // reference the issue a task actually originated from instead of always the
+  // primary. Singleton: identical to the original single-line instruction.
+  // (isGroupUnit is declared once above, in the RESEARCH section — reused here.)
+  const taskBreakdownLine = isGroupUnit
+    ? 'Break the work into ordered tasks with agent assignments. Each task: {id, description, agent, origin_issue}\n' +
+      '  — origin_issue is the member issue number (from the group members list above) whose requirement drives\n' +
+      '  that task; use the primary #' + ctx.issue + ' only for cross-cutting work not specific to one member.'
+    : 'Break the work into ordered tasks with agent assignments. Each task: {id, description, agent}.'
   const planPromptFor = function (revision) {
-    return [
+    const lines = [
       // Both variants anchor the worktree/branch explicitly — an unanchored
       // revision prompt once committed plan docs to the session's checked-out branch.
       revision ? 'Revise the implementation plan for issue #' + ctx.issue + ' (worktree ' + ctx.worktree + ', branch ' + ctx.branch + ') based on contrarian feedback below.' :
@@ -2019,7 +2124,10 @@ async function implementIssue(ctx) {
       '## Decision chain', decisionChain(ctx),
       settledBlock(ctx), '',
       revision || '',
-      'Break the work into ordered tasks with agent assignments. Each task: {id, description, agent}.',
+    ]
+    if (isGroupUnit) lines.push('This is a CONSOLIDATED GROUP unit spanning member issues: ' + fmtIssues(memberIssues(ctx)) + '.')
+    lines.push(
+      taskBreakdownLine,
       'Available agents (from the target project\'s own roster):',
       agentMenu,
       IMPLEMENTERS.length ? 'Assign each task\'s "agent" to exactly one of those names.' : 'Set each task\'s "agent" to "implementer".',
@@ -2033,8 +2141,9 @@ async function implementIssue(ctx) {
       'Post TWO issue comments: first plan -> "## Implementation Plan" (summary + collapsible full plan) and',
       '"## Task List" (checkbox markdown); a revision -> "## Revised Implementation Plan (iteration N)" and',
       '"## Revised Task List (iteration N)" so the trail shows which is current.',
-      'Return status, plan_path (empty string — plans are not files), tasks, summary, task_list_markdown.',
-    ].join('\n')
+      'Return status, plan_path (empty string — plans are not files), tasks, summary, task_list_markdown.'
+    )
+    return lines.join('\n')
   }
 
   let planR = await stage(ctx, 'plan', planPromptFor(null), stageOpts('plan'), PLAN_SCHEMA)
@@ -2138,10 +2247,14 @@ async function implementIssue(ctx) {
         ctx.unresolved.map(function (u) { return '- ' + u }).join('\n') +
         '\nResolve or explicitly verify each of these FIRST — they were never accepted, only carried past the iteration cap.'
       : ''
+    // A group task's origin_issue names the member issue whose requirement drove
+    // it (defaults to ctx.issue for a singleton, so the clause below never fires
+    // there — the line stays byte-for-byte identical).
+    const originNote = (task.origin_issue && task.origin_issue !== ctx.issue) ? ' (originating from member issue #' + task.origin_issue + ')' : ''
     const impl = await stage(ctx, 'task-' + task.id + '-implement', [
       implementerBlock(task.agent),
       '',
-      'Implement task ' + task.id + ' for issue #' + ctx.issue + ' in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ':',
+      'Implement task ' + task.id + ' for issue #' + ctx.issue + originNote + ' in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ':',
       '',
       task.description,
       '',
@@ -2257,6 +2370,13 @@ async function implementIssue(ctx) {
   }
 
   // ---- PR (with the fallback: probe gh if structured output lacks the number) ----
+  // Group unit: the PR carries one "Closes #N" per member (not just the primary)
+  // so the eventual batch PR's own Closes references stay meaningful per-issue.
+  const closesInstruction = ctx.members.length > 1
+    ? '   Body MUST include one "Closes #N" line for EACH member issue: ' +
+      ctx.members.map(function (m) { return 'Closes #' + m.issue }).join(', ') +
+      ' — plus an implementation summary, and key decisions from:'
+    : '   Body MUST include "Closes #' + ctx.issue + '", an implementation summary, and key decisions from:'
   const pr = await stage(ctx, 'pr', [
     'Create or update the PR for issue #' + ctx.issue + ' from branch ' + ctx.branch + ' (worktree ' + ctx.worktree + ').',
     '',
@@ -2264,7 +2384,7 @@ async function implementIssue(ctx) {
     '2. Existing PR? gh pr list --repo ' + REPO + ' --head ' + ctx.branch + ' --json number',
     '3. If none: gh pr create --repo ' + REPO + ' --base ' + TARGET + ' --head ' + ctx.branch,
     '   Title: conventional commit style referencing issue #' + ctx.issue + '.',
-    '   Body MUST include "Closes #' + ctx.issue + '", an implementation summary, and key decisions from:',
+    closesInstruction,
     decisionChain(ctx),
     '   Body MUST also include this exact line verbatim (approximate — this issue\'s stages only, not the run',
     '   total; tokens only, no prices/currency): "Token usage (approximate, this issue only): ' +
@@ -2394,6 +2514,12 @@ async function reviewAndMerge(ctx) {
 
   // ---- MERGE (complete comment, squash merge, follow-ups, cleanup) ----
   const deferredBlock = ctx.deferred.length ? ctx.deferred.map(function (d) { return '- ' + d }).join('\n') : ''
+  // Group unit: release the claim on EVERY member, not just the primary — every
+  // member's claim label was taken at Select and must be freed the same way.
+  const releaseClaimStep = ctx.members.length > 1
+    ? '6. Release the claim on EVERY member issue:\n   ' +
+      ctx.members.map(function (m) { return 'gh issue edit ' + m.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true' }).join('\n   ')
+    : '6. Release the claim: gh issue edit ' + ctx.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true'
   const merge = await stage(ctx, 'merge', [
     'Finalize and merge PR #' + ctx.pr + ' for issue #' + ctx.issue + ' in ' + REPO + '. It passed spec and code review in this run.',
     '',
@@ -2410,7 +2536,7 @@ async function reviewAndMerge(ctx) {
     '   "consider adding", plus the deferred suggestions below. Create one GitHub issue per distinct actionable item',
     '   (reference PR #' + ctx.pr + ' and issue #' + ctx.issue + '; label bug/enhancement/tech-debt as appropriate).',
     '   First check for existing duplicates — do not re-file.',
-    '6. Release the claim: gh issue edit ' + ctx.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true',
+    releaseClaimStep,
     '7. Cleanup (non-blocking): ' + (BROWSER ? 'fuser -k ' + bwPort(ctx.issue) + '/tcp 2>/dev/null || true;' : '') ,
     '   rm -rf /tmp/ticketmill-issue-' + ctx.issue + ' || true;',
     '   git -C ' + ROOT + ' worktree remove ' + ctx.worktree + ' --force; git -C ' + ROOT + ' worktree prune',
@@ -2424,7 +2550,7 @@ async function reviewAndMerge(ctx) {
   if (merge.status !== 'merged') return fail(ctx, 'needs_human', 'merge', merge.error || 'merge blocked (' + merge.status + ') — PR #' + ctx.pr + ' left open')
 
   log('#' + ctx.issue + ' merged PR #' + ctx.pr + (merge.follow_up_issues && merge.follow_up_issues.length ? ' (follow-ups: ' + merge.follow_up_issues.join(', ') + ')' : ''))
-  return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice() }
+  return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx) }
 }
 
 // =============================================================================
@@ -2450,16 +2576,22 @@ async function processIssue(pre) {
   }
   if (pre.resume_point === 'skip') {
     log('#' + ctx.issue + ' skipped: ' + pre.reason)
-    return { issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason }
+    return { issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx) }
   }
   if (pre.resume_point === 'process_pr') {
     log('#' + ctx.issue + ' healing: open PR #' + ctx.pr + ' found — jumping to review/merge')
-    // idempotent setup so review-fix stages have a worktree
+    // idempotent setup so review-fix stages have a worktree. Anchor on the stable
+    // groupId (see worktreeAnchor()) — reconcileGroups() only ever admits members
+    // whose OWN resume_point is 'implement', so a derived group unit never reaches
+    // this branch with today's reconciler, but a future healed-from-marker unit
+    // that arrives here already mid-review must still resolve the SAME worktree
+    // its implement phase created, not a fresh one keyed off a re-anchored primary.
+    const anchor = worktreeAnchor(ctx)
     const envFiles = PROFILE.env_files || []
     const setup = await stage(ctx, 'setup-for-review', [
       'Ensure a worktree exists for issue #' + ctx.issue + ' (an open PR already exists; we only need the checkout for potential fixes).',
       'First: git -C ' + ROOT + ' fetch origin ' + TARGET,
-      'Run from ' + ROOT + ': ' + ROOT + '/.claude/scripts/ticketmill/setup-worktree.sh ' + ctx.issue + ' ' + TARGET + ' ' + ROOT + ' ' + WORKTREES + ' ' + REPO,
+      'Run from ' + ROOT + ': ' + ROOT + '/.claude/scripts/ticketmill/setup-worktree.sh ' + anchor + ' ' + TARGET + ' ' + ROOT + ' ' + WORKTREES + ' ' + REPO,
       'Then: git -C <worktree> pull origin <branch> (branch from the script JSON) so the checkout matches the PR head.',
       envFiles.length ? 'Copy env files if missing: ' + envFiles.map(function (f) { return 'cp -n ' + ROOT + '/' + f + ' <worktree>/' + f + ' 2>/dev/null || true' }).join('; ') : '',
       'Return status, worktree, branch.',
@@ -2484,7 +2616,9 @@ async function runPool(items, limit, fn) {
       const i = next++
       if (i >= items.length) return
       if (STOP.tripped) {
-        results[i] = { issue: items[i].issue, title: items[i].title || '', status: 'not_started', pr: items[i].pr_number || null, follow_ups: [], stage: 'queue', error: 'not launched: ' + STOP.reason }
+        // items[i] is a unit (deriveUnits() shape) — .members is always present
+        // (a self-reference singleton, or real group members), never ctx-shaped.
+        results[i] = { issue: items[i].issue, title: items[i].title || '', status: 'not_started', pr: items[i].pr_number || null, follow_ups: [], stage: 'queue', error: 'not launched: ' + STOP.reason, members: (items[i].members || []).map(function (m) { return m.issue }) }
         continue
       }
       results[i] = await fn(items[i])
