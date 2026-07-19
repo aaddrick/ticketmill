@@ -825,6 +825,19 @@ function deriveUnits(reconciledMap, livePreflights) {
   return units
 }
 
+// laneKey/sortLanesByLowestIndex: small shared helpers for the lane-scheduling
+// reducers below (issue #1) and their DRY_RUN preview mirror further down. A
+// lane's canonical identity for membership comparison is its sorted unit-index
+// list joined into a string; its canonical display order is by lowest member
+// index, ascending.
+function laneKey(unitIndices) {
+  return unitIndices.slice().sort(function (a, b) { return a - b }).join(',')
+}
+function sortLanesByLowestIndex(lanes) {
+  lanes.sort(function (a, b) { return Math.min.apply(null, a.unitIndices) - Math.min.apply(null, b.unitIndices) })
+  return lanes
+}
+
 // computeLanes: pure reducer (issue #1, lane scheduling) that groups deriveUnits()'s
 // output into lanes — sets of unit INDICES that must run serially (one worker
 // draining the lane in order) instead of racing. Reuses globToRe/matchesGlobs
@@ -1014,8 +1027,7 @@ function computeLanes(units, serializeGlobs, opts) {
     }
     return { unitIndices: unitIndices, predicted_files: predicted }
   })
-  lanes.sort(function (a, b) { return Math.min.apply(null, a.unitIndices) - Math.min.apply(null, b.unitIndices) })
-  return lanes
+  return sortLanesByLowestIndex(lanes)
 }
 
 // applyRealRunCollapseGuard: pure reducer (issue #1, lane scheduling) — a final,
@@ -1054,14 +1066,13 @@ function applyRealRunCollapseGuard(units, lanes, concurrency, serializeGlobs) {
   const trustedLanes = computeLanes(units, serializeGlobs, { trustedOnly: true })
   const trustedKeys = {}
   trustedLanes.forEach(function (l) {
-    trustedKeys[l.unitIndices.slice().sort(function (a, b) { return a - b }).join(',')] = true
+    trustedKeys[laneKey(l.unitIndices)] = true
   })
   let dissolvedCount = 0
   const nextLanes = []
   lanes.forEach(function (lane) {
     if (lane.unitIndices.length < 2) { nextLanes.push(lane); return } // already a singleton
-    const key = lane.unitIndices.slice().sort(function (a, b) { return a - b }).join(',')
-    if (trustedKeys[key]) { nextLanes.push(lane); return } // trusted — always kept
+    if (trustedKeys[laneKey(lane.unitIndices)]) { nextLanes.push(lane); return } // trusted — always kept
     // heuristic lane: whole-lane cohesion — a path present in >= 2 of the lane's
     // OWN units, counted fresh here (not inherited from computeLanes()'s
     // per-chain scoping, which is exactly the gap this guard exists to catch).
@@ -1083,8 +1094,7 @@ function applyRealRunCollapseGuard(units, lanes, concurrency, serializeGlobs) {
     })
   })
   if (!dissolvedCount) return { lanes: lanes, dissolvedCount: 0, collapseRatio: collapseRatio }
-  nextLanes.sort(function (a, b) { return Math.min.apply(null, a.unitIndices) - Math.min.apply(null, b.unitIndices) })
-  return { lanes: nextLanes, dissolvedCount: dissolvedCount, collapseRatio: collapseRatio }
+  return { lanes: sortLanesByLowestIndex(nextLanes), dissolvedCount: dissolvedCount, collapseRatio: collapseRatio }
 }
 
 // ----- batch state -----
@@ -3381,14 +3391,13 @@ if (DRY_RUN) {
   const previewTrustedLanes = computeLanes(previewUnits, previewServeGlobs, { trustedOnly: true })
   const previewTrustedKeys = {}
   previewTrustedLanes.forEach(function (l) {
-    previewTrustedKeys[l.unitIndices.slice().sort(function (a, b) { return a - b }).join(',')] = true
+    previewTrustedKeys[laneKey(l.unitIndices)] = true
   })
   const lanesPreviewOut = previewLanes.map(function (l) {
-    const key = l.unitIndices.slice().sort(function (a, b) { return a - b }).join(',')
     return {
       issues: l.unitIndices.map(function (i) { return previewUnits[i].issue }),
       predicted_files: l.predicted_files,
-      provenance: l.unitIndices.length < 2 ? 'none' : (previewTrustedKeys[key] ? 'trusted' : 'heuristic'),
+      provenance: l.unitIndices.length < 2 ? 'none' : (previewTrustedKeys[laneKey(l.unitIndices)] ? 'trusted' : 'heuristic'),
     }
   })
   const predictedUnitCount = previewUnits.filter(function (u) {
