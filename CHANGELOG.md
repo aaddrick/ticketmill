@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.26 (2026-07-19)
+
+- Docs (#3, tech-docs stage): added an "Engine-owned path guardrail: three
+  regimes" section to `docs/ARCHITECTURE.md`, covering the select-phase skip
+  (regime a), deliberate engine work with a clean root (regime b), and the
+  post-implement hard-revert gate for incidental changes (regime c), plus
+  `scopeGuard()`'s advisory clause and the revert stage's override. Names the
+  incident (nonconvexlabs-com#77) and the `profile.engine_owned_globs` /
+  `profile.lockstep_installed_paths` fields. `skills/mill/SKILL.md` and
+  `skills/mill-init/SKILL.md` already covered the user-facing side (task 4);
+  this closes the design-decision record in ARCHITECTURE.md, which had no
+  entry for the new machinery. No engine code changed.
+
 ## 0.1.25 (2026-07-19)
 
 - Docs (#3, task 4 of 4): closed out the engine-owned path guardrail with doc

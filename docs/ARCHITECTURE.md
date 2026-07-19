@@ -204,6 +204,72 @@ result, including a `needs_human` result the thrash guard escalated, since
 `fail()` carries `ctx.metrics` through. The two counts never overlap: a
 thrashed issue escalates before it can also count as resolved.
 
+### Engine-owned path guardrail: three regimes
+
+A worktree only sees committed state. A freshly forged agent file, or a
+profile field just added at the repo root, stays invisible there until it's
+committed. An implementer that "reconciles" what looks like a stale diff in
+the worktree can restore the old committed version straight from git
+history. A later batch merge then overwrites the uncommitted root-tree work
+without ever raising a conflict: that's nonconvexlabs-com#77, the incident
+this guardrail exists to close.
+
+Engine-owned paths are the run's own tooling: the ticketmill profile
+(`.claude/ticketmill.json`), the agent roster (`.claude/agents/**`), and the
+engine's own installed copy (`.claude/workflows/ticketmill.js`,
+`.claude/scripts/ticketmill/**`). A profile can extend that default set via
+`profile.engine_owned_globs`. These paths stay read-only for a run unless an
+issue's own title or body plainly names one of them.
+
+Three regimes cover what happens next.
+
+**(a) Select-phase skip.** When an issue's prose names an engine-owned path
+(`engineOwnedHit`, a case-sensitive substring match) and the preflight probe
+finds the root tree already dirty under that same path
+(`root_dirty_engine_paths`), the issue is routed straight to `resume_point:
+skip` before a worktree is ever built. This is the only regime the engine
+can catch ahead of time, and only because git tracks the dirt: an
+uncommitted rename or a change outside git's view still slips through.
+
+**(b) Deliberate engine work, clean root.** An issue whose prose names an
+engine-owned path, with a clean root tree, is intentional engine work: this
+repo's own ticketmill issues look exactly like this. `ctx.engineOwnedIntentional`
+is computed once at Select from title and body, then OR-folded across a
+consolidation group's live members in `deriveUnits()` so a non-primary
+group member's intent survives `pickPrimary`'s unrelated choice of primary.
+The post-implement gate reads that flag and leaves the diff exactly as
+committed.
+
+**(c) Incidental change.** Engine-owned paths turn up in the diff, but
+nothing in the issue's prose named them. `runEngineOwnedGate(ctx)` runs
+right before the test loop, not after like `runBrowserCheck`, so a revert it
+triggers gets re-validated by that same run's test suite in-band rather than
+landing unverified. A deterministic JS pass filters the diff against the
+engine-owned set, then splits it again with `isHardRevertPath`: a
+single-purpose stage hard-reverts every path that isn't also listed in
+`profile.lockstep_installed_paths`, committing and pushing the revert. A
+lockstep path is exempt because it's a deliberate installed copy of a
+source-of-truth file elsewhere in the repo, kept in sync by the repo's own
+tooling: this repo sets `[".claude/workflows/ticketmill.js"]`, since
+`scripts/lint-engine.js` already keeps it byte-identical to
+`workflows/ticketmill.js`. Reverting a lockstep path here would fight that
+sync instead of undoing an incidental restore, so any drift on that path is
+left for `lint-engine`'s byte-compare to catch on its own.
+
+`scopeGuard()` carries a fourth, advisory layer on top of the two gates
+above: a clause appended to every stage prompt, unconditionally, telling the
+agent never to stage, commit, or restore an engine-owned path outside these
+mechanisms. It has to stay generic rather than naming a regime, since an
+agent mid-stage has no reliable way to know which one it's in. The one
+stage that's deliberately excused from that clause is the regime (c) revert
+stage itself: its prompt opens with an explicit override, because it is the
+guardrail acting on the agent's behalf, ahead of the checkout instruction
+the general clause would otherwise contradict.
+
+The gate never halts a run on its own. A dead diff probe or a failed revert
+stage degrades to a recorded `ctx.deferred` follow-up instead of blocking an
+otherwise-green issue.
+
 ### Incident-derived machinery (preserved from the source engine)
 
 | Mechanism | Incident it answers |
