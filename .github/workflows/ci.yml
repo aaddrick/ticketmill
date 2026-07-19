@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run profile test_command
+        run: |
+          CMD=$(jq -r '.test_command // ""' .claude/ticketmill.json)
+          if [ -z "$CMD" ]; then
+            echo "::notice::No test_command configured in .claude/ticketmill.json; skipping."
+            exit 0
+          fi
+          bash -c "$CMD"
