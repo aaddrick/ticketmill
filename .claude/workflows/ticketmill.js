@@ -197,6 +197,7 @@ const M = {
   setup:        { model: 'haiku', effort: 'low' },
   research:     { model: 'sonnet' },
   evaluate:     { model: 'opus' },
+  consolidation: { model: 'opus', effort: 'high' }, // proposeConsolidation's propose/revise calls (Select-phase gate)
   contrarian:   { model: 'opus', effort: 'high' },
   plan:         { model: 'opus', effort: 'high' },
   implement:    { model: 'sonnet' },
@@ -478,6 +479,17 @@ const CONSOLIDATION_SCHEMA = {
       rationale: { type: 'string' },
     } } },
     ungrouped: { type: 'array', items: { type: 'integer' } },
+  },
+}
+// CONSOLIDATION_MARKER_PROBE_SCHEMA: the read-only probe proposeConsolidation()
+// uses to fetch each candidate's existing consolidation-marker comment (if any),
+// feeding healGroups() so a prior decision is recognized before the opus gate runs.
+const CONSOLIDATION_MARKER_PROBE_SCHEMA = {
+  type: 'object', required: ['markers'],
+  properties: {
+    markers: { type: 'array', items: { type: 'object', required: ['issue', 'body'], properties: {
+      issue: { type: 'integer' }, body: { type: 'string' },
+    } } },
   },
 }
 
@@ -1412,6 +1424,263 @@ function sanitizeTasks(ctx, raw) {
     if (t.description.length > 0) log('#' + ctx.issue + ' plan: DROPPED stub task ' + t.id + ' ("' + t.description + '")')
     return false
   })
+}
+
+// =============================================================================
+// PROPOSECONSOLIDATION (Select-phase judgment gate; ABOVE the harness split like
+// implementIssue/reviewAndMerge, so tests/harness.js can drive it with a scripted
+// agent()). Proposes grouping CANDIDATE issues (preflight-shaped, resume_point
+// 'implement') into ONE worktree/branch/research/plan/PR unit when — and only
+// when — they share the same subsystem AND acceptance surface, or one explicitly
+// depends on another. Grouping is the EXCEPTION: the conservative-bar prompt below
+// treats "shared files touched" as a hint, never a reason, and an empty run
+// (0 or 1 candidates) short-circuits for free with no agent call at all.
+//
+// TWO-PHASE, LIKE THE APPROACH/PLAN GATES IN implementIssue() — WITH ONE
+// DELIBERATE ASYMMETRY:
+//   1. HEAL: fold in any group a PRIOR run already proposed and recorded via
+//      comment markers (buildConsolidationGroupComment/buildConsolidatedMemberComment,
+//      see the CONSOLIDATION FOUNDATIONS block above) — a resumed run recognizes an
+//      existing decision instead of re-litigating it. This runs even when
+//      PROFILE.consolidation === false: turning the gate off mid-run must not
+//      un-heal a group a PRIOR run already committed to.
+//   2. PROPOSE + CHALLENGE: only the residual, unmarked candidates go in front of
+//      the opus gate; each proposed group then runs a CAPPED contrarian challenge
+//      (reusing CHALLENGE_SCHEMA and the 'contrarian' role, exactly like the
+//      approach/plan gates). THE ASYMMETRY: where those gates proceed-with-caveats
+//      at the cap, a contested consolidation group instead DISSOLVES back into
+//      independent issues. Grouping entangles multiple issues' worktree/branch/PR
+//      into one unit — an unresolved "maybe these shouldn't be one unit" is not a
+//      caveat implementation can absorb the way "maybe this approach has a risk"
+//      is, and the safe fallback (process each issue independently) is always
+//      available — so the gate takes it instead of forcing a doubtful merge
+//      through. The same reasoning is why a DEAD challenger also dissolves rather
+//      than proceeding unchallenged (implementIssue's gates fail open there
+//      because the issue MUST be implemented regardless; this gate is a pure
+//      optimization it is always safe to skip).
+//
+// DRY_RUN: the marker heal and the opus PROPOSAL are read-only (gh issue view /
+// --json reads only — no writes) and run exactly the same under DRY_RUN as for
+// real. The CONTRARIAN CHALLENGE is skipped ENTIRELY under DRY_RUN (it posts
+// trail comments) — a dry run previews the raw, PRE-CHALLENGE proposal instead
+// (each such entry carries dry_run_preview: true so a caller never mistakes an
+// unchallenged preview group for a finalized one).
+//
+// MARKERS: posting the group/member consolidation-marker comments themselves is
+// deliberately NOT this function's job. Real membership is only settled after
+// claims (a member can be excluded by reconcileGroups() if its claim races or its
+// resume_point flips) — see reconcileGroups()/deriveUnits() above. Posting markers
+// here, before claims, could stamp a marker naming a member that never actually
+// joins the live unit; the post-claim materialization step (Select-phase wiring)
+// owns marker posting instead.
+//
+// RETURN: Map<groupId, {groupId, primary, members: [issueNumbers], subsystem,
+// rationale, dry_run_preview?}> — the SAME shape healGroups()/reconcileGroups()
+// return, so a caller can hand it straight to reconcileGroups(map, livePreflights)
+// after claims. Only ACCEPTED groups (healed, or opus-proposed + contrarian-
+// accepted) appear; dissolved/never-grouped candidates are simply absent — callers
+// fall them through to deriveUnits()'s ordinary singleton path, exactly like an
+// issue that was never a consolidation candidate at all.
+// =============================================================================
+
+// consolidationScopeGuard: scopeGuard(ctx) is single-issue by design (see its own
+// comment) — a consolidation judgment call spans MULTIPLE issues in one prompt, so
+// it needs its own guard pinning gh reads/writes to the exact candidate set
+// instead of pretending there is one ctx.issue.
+function consolidationScopeGuard(issueNumbers) {
+  return [
+    '## Scope guard (ticketmill consolidation gate)',
+    'You are evaluating ONLY these candidate issues of ' + REPO + ': ' + issueNumbers.map(function (n) { return '#' + n }).join(', ') + '.',
+    'Any gh issue view/comment/edit command MUST target one of exactly these numbers — re-read the number before',
+    'running it. Other issue/PR numbers appearing anywhere in context belong to concurrent pipelines; NEVER act on them.',
+    'If you post a comment, end it with the marker line "<!-- ticketmill ' + REPO + '#<issue> -->", naming the',
+    'SPECIFIC issue you posted to (never a different number).',
+  ].join('\n')
+}
+
+// fetchConsolidationMarkers: READ-ONLY (safe under DRY_RUN) — collects each
+// candidate's most recent consolidation-marker comment, if any, for healGroups().
+async function fetchConsolidationMarkers(issueNumbers) {
+  if (!issueNumbers.length) return []
+  const r = await agent([
+    consolidationScopeGuard(issueNumbers),
+    '',
+    'READ-ONLY: for each issue above, check whether it carries a prior ticketmill consolidation-marker comment —',
+    'one whose FIRST line is EXACTLY "' + CONSOLIDATION_MEMBER_TITLE + '" or "' + CONSOLIDATION_GROUP_TITLE + '".',
+    'gh issue view <n> --repo ' + REPO + ' --json comments',
+    'Return markers: [{issue, body}] — ONLY for issues carrying such a comment (its exact full body; if more than',
+    'one exists on an issue, the MOST RECENT). Omit issues with none entirely.',
+  ].join('\n'), { label: 'consolidation:marker-probe', phase: 'Select', schema: CONSOLIDATION_MARKER_PROBE_SCHEMA, model: stageOpts('probe').model, effort: stageOpts('probe').effort })
+  return (r && r.markers) || []
+}
+
+// challengeConsolidationGroup: the capped contrarian loop for ONE proposed group.
+// Returns the (possibly revised) accepted group, or null if it DISSOLVED (cap
+// reached without acceptance, or a dead challenger/reviser — see the module
+// comment above for why this gate fails conservatively, not open).
+async function challengeConsolidationGroup(group, settledCarrier) {
+  let current = group
+  for (let iter = 1; iter <= MAX_CONTRARIAN_ITERATIONS; iter++) {
+    const groupId = stableGroupId(current.members)
+    const ch = await agent([
+      consolidationScopeGuard(current.members),
+      '',
+      roleBlock('contrarian'),
+      '',
+      'Stress-test a PROPOSED ISSUE CONSOLIDATION for ' + REPO + ' (challenge iteration ' + iter + ').',
+      'Proposed group: primary #' + current.primary + ', members ' + current.members.map(function (n) { return '#' + n }).join(', ') + '.',
+      'Subsystem: ' + (current.subsystem || '(none given)'),
+      current.shared_surface ? 'Shared acceptance surface: ' + current.shared_surface : '',
+      current.dependency ? 'Dependency: ' + current.dependency : '',
+      'Rationale: ' + (current.rationale || '(none given)'),
+      '',
+      settledBlock(settledCarrier),
+      '',
+      'Read every member issue (gh issue view <n> --repo ' + REPO + ' --json title,body,comments) before judging.',
+      'Apply the CONSERVATIVE bar: grouping is the EXCEPTION. A finding is MAJOR OR WORSE if the group fails the',
+      'bar — same subsystem AND a genuinely shared acceptance surface (the SAME tests/endpoints/UI verify every',
+      'member), OR an explicit dependency — or if "files happen to overlap" is the ONLY justification offered.',
+      'Verify claims against the actual issue text; do not accept the proposal\'s framing uncritically.',
+      'ACCEPTANCE: verdict "sound_with_caveats" means ZERO unresolved critical/major findings.',
+      iter > 1 ? 'This is iteration ' + iter + ': the group was revised per your prior findings — check whether they are addressed.' : '',
+      'Post an issue comment on #' + current.primary + ' titled "## Contrarian: Consolidation Challenge (Group ' + groupId + ', Iteration ' + iter + ')" with your verdict and findings.',
+      'STRUCTURED OUTPUT CONTRACT: verdict must be EXACTLY one of sound_with_caveats | needs_rework | investigate_first.',
+      'Every concern goes in the findings ARRAY (severity, summary, recommendation), never only in prose.',
+    ].filter(Boolean).join('\n'), { label: 'consolidation:challenge-g' + groupId + '-i' + iter, phase: 'Select', schema: CHALLENGE_SCHEMA, model: stageOpts('contrarian').model, effort: stageOpts('contrarian').effort })
+
+    if (!ch) {
+      log('consolidation group ' + groupId + ' DISSOLVED — challenge agent died (fails conservatively, not open)')
+      return null
+    }
+    const criticalMajor = (ch.findings || []).filter(function (f) { return f.severity === 'critical' || f.severity === 'major' }).length
+    if (ch.verdict === 'sound_with_caveats' && criticalMajor === 0) {
+      settleDecision(settledCarrier, 'consolidation group ' + groupId, 'consolidation challenge i' + iter,
+        'group primary #' + current.primary + ' <- members ' + current.members.join(','), current.rationale, [])
+      return current
+    }
+    log('consolidation group ' + groupId + ' challenge i' + iter + ': ' + ch.verdict + ', ' + criticalMajor + ' critical/major')
+    if (iter === MAX_CONTRARIAN_ITERATIONS) {
+      log('consolidation group ' + groupId + ' DISSOLVED — contrarian cap (' + MAX_CONTRARIAN_ITERATIONS + ') reached without acceptance: ' + (ch.summary || ''))
+      await agent([
+        consolidationScopeGuard(current.members),
+        'Post a GitHub comment on issue #' + current.primary + ' in ' + REPO + ' (gh issue comment).',
+        'Title line: "## Consolidation Dissolved After Contrarian Cap"',
+        'Body: a proposed consolidation of ' + current.members.map(function (n) { return '#' + n }).join(', ') +
+          ' did not survive ' + MAX_CONTRARIAN_ITERATIONS + ' contrarian challenge iterations; each issue will be',
+        'processed independently instead. Last challenge summary: ' + String(ch.summary || '').slice(0, 900),
+        'Return posted=true/false.',
+      ].join('\n'), { label: 'consolidation:dissolve-note-g' + groupId, phase: 'Select', schema: NOTE_SCHEMA, model: stageOpts('probe').model, effort: stageOpts('probe').effort })
+        .catch(function () { return null })
+      return null
+    }
+    // Revise: give the opus gate one more look at just THIS group, with the
+    // challenge findings in hand. Reuses CONSOLIDATION_SCHEMA (a single-group
+    // response is just groups: [one] — or groups: [] if it now concludes the
+    // members should not be grouped at all, which dissolves immediately rather
+    // than spending remaining iterations defending an unsupported grouping).
+    const re = await agent([
+      consolidationScopeGuard(current.members),
+      '',
+      'Revise a proposed issue consolidation for ' + REPO + ' based on contrarian feedback (verdict: ' + ch.verdict + ').',
+      'Current group: primary #' + current.primary + ', members ' + current.members.map(function (n) { return '#' + n }).join(', ') + '.',
+      'Findings to address:',
+      (ch.findings || []).map(function (f) { return '- [' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || '') }).join('\n'),
+      'A challenger finding is a HYPOTHESIS, not a directive — verify each against the actual issues first. If, after',
+      'verifying, these issues genuinely should NOT be grouped, return groups: [] and list every member issue in',
+      'ungrouped instead (this ends the review — do not keep defending a grouping the evidence does not support).',
+      'Otherwise return EXACTLY ONE revised group (same schema as the original gate) addressing the CONFIRMED concerns.',
+      'Only consider these candidates — never introduce an issue number outside this exact set: ' + group.members.map(function (n) { return '#' + n }).join(', ') + '.',
+    ].join('\n'), { label: 'consolidation:revise-g' + groupId + '-i' + iter, phase: 'Select', schema: CONSOLIDATION_SCHEMA, model: stageOpts('consolidation').model, effort: stageOpts('consolidation').effort })
+
+    if (!re || !Array.isArray(re.groups) || !re.groups.length) {
+      log('consolidation group ' + groupId + ' DISSOLVED — revision concluded no grouping (or agent died)')
+      return null
+    }
+    const rg = re.groups[0]
+    const revisedMembers = (rg.members || []).filter(function (n) { return group.members.indexOf(n) !== -1 })
+    if (revisedMembers.length < 2) {
+      log('consolidation group ' + groupId + ' DISSOLVED — revision shrank below a group')
+      return null
+    }
+    const revisedPrimary = revisedMembers.indexOf(rg.primary) !== -1 ? rg.primary : stableGroupId(revisedMembers)
+    current = { primary: revisedPrimary, members: revisedMembers, subsystem: rg.subsystem || current.subsystem, shared_surface: rg.shared_surface, dependency: rg.dependency, rationale: rg.rationale || current.rationale }
+  }
+  return null // defensive; every loop iteration above returns before falling off the end
+}
+
+// proposeConsolidation: the Select-phase entry point (see the module comment
+// above for the full design). `candidates` are preflight-shaped objects
+// ({issue, title, ...}) — the caller is expected to have already filtered to
+// resume_point === 'implement' (see deriveUnits()'s comment: only live,
+// about-to-be-implemented issues are eligible to share a unit).
+async function proposeConsolidation(candidates) {
+  const list = (candidates || []).filter(function (c) { return c && c.issue })
+  if (list.length <= 1) return new Map() // free-skip: nothing to group, no agent call at all
+
+  // ---- HEAL (always runs — even with PROFILE.consolidation === false; turning the
+  // gate off mid-run must not un-heal a group a PRIOR run already committed to) ----
+  const markers = await fetchConsolidationMarkers(list.map(function (c) { return c.issue }))
+  const healed = healGroups(list, markers)
+  const healedIssues = {}
+  healed.forEach(function (g) { for (const n of g.members) healedIssues[n] = true })
+  const residual = list.filter(function (c) { return !healedIssues[c.issue] })
+  const out = new Map(healed)
+
+  if (!consolidationEnabled(PROFILE) || residual.length <= 1) return out
+
+  // ---- PROPOSE (opus gate, READ-ONLY, conservative bar) ----
+  const menu = residual.map(function (c) { return '- #' + c.issue + ': ' + (c.title || '(no title)') }).join('\n')
+  const proposal = await agent([
+    consolidationScopeGuard(residual.map(function (c) { return c.issue })),
+    '',
+    'READ-ONLY consolidation gate for a ticketmill batch run on ' + REPO + '. Decide whether any of these candidate',
+    'issues are cheaper to resolve as ONE worktree/branch/research/plan/PR unit instead of independently:',
+    menu,
+    '',
+    'Grouping is the EXCEPTION, not the rule — most runs should return an EMPTY groups array. Group two or more',
+    'issues ONLY when BOTH (a) they touch the SAME subsystem, AND (b) they share the SAME acceptance surface (the',
+    'same tests/endpoints/UI would verify all of them) — OR one issue has an EXPLICIT DEPENDENCY on another',
+    '(cannot be implemented or verified without it). Shared files touched is a HINT, never a REASON on its own —',
+    'many unrelated issues happen to touch the same file.',
+    'Read each issue first: gh issue view <n> --repo ' + REPO + ' --json title,body,comments',
+    'For each group: primary (the LOWEST issue number in the group — it will carry the comment trail), members',
+    '(every issue number in the group, primary included), subsystem, shared_surface OR dependency (populate',
+    'whichever reason applies — at least one is REQUIRED for any group; a group with neither is invalid),',
+    'rationale (1-3 concrete sentences).',
+    'Every candidate issue number listed above MUST appear in EXACTLY ONE of: some group\'s members, or ungrouped.',
+    'Return groups (possibly empty — that is the expected common case) and ungrouped.',
+  ].join('\n'), { label: 'consolidation:propose', phase: 'Select', schema: CONSOLIDATION_SCHEMA, model: stageOpts('consolidation').model, effort: stageOpts('consolidation').effort })
+
+  if (!proposal || !Array.isArray(proposal.groups) || !proposal.groups.length) return out // agent died, or found nothing to propose
+
+  const rawGroups = proposal.groups
+    .map(function (g) {
+      const members = (g.members || []).filter(function (n) { return residual.some(function (c) { return c.issue === n }) })
+      return Object.assign({}, g, { members: members, primary: members.indexOf(g.primary) !== -1 ? g.primary : stableGroupId(members.length ? members : [g.primary]) })
+    })
+    .filter(function (g) { return g.members.length >= 2 })
+
+  if (!rawGroups.length) return out
+
+  if (DRY_RUN) {
+    // DRY_RUN previews the RAW, PRE-CHALLENGE proposal — the contrarian challenge
+    // posts trail comments, so it never runs under DRY_RUN (see module comment).
+    for (const g of rawGroups) {
+      const groupId = stableGroupId(g.members)
+      out.set(groupId, { groupId: groupId, primary: g.primary, members: g.members.slice(), subsystem: g.subsystem || '', rationale: g.rationale || '', dry_run_preview: true })
+    }
+    return out
+  }
+
+  // ---- CHALLENGE (capped; cap DISSOLVES — see module comment for the asymmetry) ----
+  const consSettled = { settled: [] } // local carrier — reuses settleDecision()/settledBlock(); no per-issue ctx exists at this gate
+  for (const g of rawGroups) {
+    const accepted = await challengeConsolidationGroup(g, consSettled)
+    if (!accepted) continue // dissolved — members fall through to the caller's ordinary singleton path
+    const groupId = stableGroupId(accepted.members)
+    out.set(groupId, { groupId: groupId, primary: accepted.primary, members: accepted.members.slice(), subsystem: accepted.subsystem || '', rationale: accepted.rationale || '' })
+  }
+  return out
 }
 
 // =============================================================================
