@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.13 (2026-07-19)
+
+- Added `.github/workflows/ci.yml`: runs the profile's `test_command` on
+  every pull request (no branch filter) and on pushes to `main`, on
+  `ubuntu-latest` with Node 22. `permissions: contents: read` only — no
+  secrets, no `gh` auth, no `GITHUB_TOKEN` beyond checkout's default. The
+  run step extracts the command via
+  `jq -r '.test_command // ""' .claude/ticketmill.json` and executes it
+  with `bash -c`, so the command itself is never restated in the YAML —
+  `.claude/ticketmill.json` stays the single source of truth. An empty
+  `test_command` prints a `::notice::` and exits 0 instead of failing. A
+  syntax error anywhere in the profile's test chain (engine, scripts,
+  manifests, unit/bash suites) now turns this check red on the PR.
+
 ## 0.1.12 (2026-07-19)
 
 - Added `scripts/lint-engine.js`, a zero-dependency sandbox-rule lint for
