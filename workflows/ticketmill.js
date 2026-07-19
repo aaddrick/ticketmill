@@ -2588,10 +2588,10 @@ async function processIssue(pre) {
     unresolved: [], // critical/major findings carried past a contrarian iteration cap
     approach: '',   // evaluate's approach one-liner, threaded into fix/test prompts
     // Consolidation (unit-of-work): live preflight refs for every issue this unit
-    // covers. deriveUnits() sets these on a group unit; anything else (today, always
-    // — Select doesn't build units yet) defaults to a self-reference singleton, so
-    // ctx.members === [pre] and ctx.groupId === null for every issue, matching the
-    // byte-for-byte no-group behavior the unit-of-work abstraction must preserve.
+    // covers. deriveUnits() sets these on a group unit; anything else defaults to
+    // a self-reference singleton, so ctx.members === [pre] and ctx.groupId === null
+    // for every issue, matching the byte-for-byte no-group behavior the
+    // unit-of-work abstraction must preserve.
     members: Array.isArray(pre.members) && pre.members.length ? pre.members : [pre],
     groupId: ('groupId' in pre && pre.groupId != null) ? pre.groupId : null, // stable consolidation-group id; null outside a group
     metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0 },
@@ -2947,10 +2947,11 @@ if (toClaim.length) {
 // ---- Select: materialize final consolidation units now that claims are settled —
 // claims (and any claim-race resume_point flip just above, e.g. p.resume_point =
 // 'skip') make membership authoritative over the pre-claim proposal.
-// reconcileGroups() drops any member whose LIVE preflight resume_point isn't
-// 'implement' (a skip-flipped member falls through deriveUnits() to an ordinary
+// reconcileGroups() drops any member whose LIVE preflight resume_point is
+// 'skip' (a skip-flipped member falls through deriveUnits() to an ordinary
 // skip singleton, handled by processIssue()'s existing resume_point==='skip'
-// return path); dissolves a group left with fewer than 2 live members; re-anchors
+// return path) and keeps 'implement' or 'process_pr' members live; dissolves
+// a group left with fewer than 2 live members; re-anchors
 // the primary onto another live member (by stableGroupId, so the group's
 // worktree/branch/PR identity never moves) when the proposed primary itself was
 // excluded. deriveUnits() then translates the reconciled groups plus every other
