@@ -43,6 +43,18 @@ export const meta = {
 //     "install_commands": ["composer install --no-interaction"],
 //     "env_files": [".env"],             // copied root -> worktree at setup
 //     "simplify_globs": ["**/*.php"],    // files worth a simplify pass; null = always run
+//     "serialize_globs": ["**/config/*.php"], // OPTIONAL (issue #1, lane scheduling):
+//                                        // any two issues whose predicted_files both
+//                                        // hit one of these patterns are a TRUSTED
+//                                        // edge for computeLanes() — they always run
+//                                        // in the same serial lane instead of racing,
+//                                        // never dissolved by the collapse guard.
+//                                        // Use it for hot/shared files (a central
+//                                        // router, a schema, a magnet config) that
+//                                        // predicted_files' own path-overlap
+//                                        // heuristic can't be trusted to catch on its
+//                                        // own. Unset/[] = only depends_on and actual
+//                                        // predicted-file overlap drive lanes.
 //     "docblock_globs": ["app/**/*.php"],// files needing docblocks; null = skip stage
 //     "docs_dir": "docs",                // tech-docs stage target; null = skip stage
 //     "logs_dir": "logs/ticketmill",
@@ -195,6 +207,11 @@ const STAGE_TRIES = 2
 // lane spanning many units can't grow that list unboundedly — it's a DRY_RUN/
 // human-readability aid, not a correctness input, so a hard cap is safe.
 const MAX_LANE_PREDICTED_FILES = 60
+// lane scheduling (issue #1): bounds how many completed units' predicted-vs-
+// actual data the Report-phase retrospective agent is handed (each entry is a
+// small {issue, pr, predicted_files} tuple) — a human-readability/prompt-size
+// cap on the accuracy sample, not a correctness input.
+const MAX_LANE_ACCURACY_SAMPLES = 40
 
 // ----- model policy (profile.models may override any stage key) -----
 const M = {
@@ -467,7 +484,15 @@ const REPORT_SCHEMA = {
 }
 const RETRO_SCHEMA = {
   type: 'object', required: ['summary'],
-  properties: { learnings_added: { type: 'integer' }, learnings_deprecated: { type: 'integer' }, summary: { type: 'string' } },
+  properties: {
+    learnings_added: { type: 'integer' }, learnings_deprecated: { type: 'integer' }, summary: { type: 'string' },
+    // lane_prediction_accuracy (issue #1, lane scheduling): one plain-text line
+    // summarizing predicted vs. actual changed files across this run's completed,
+    // predicted units — e.g. "7/9 actual changed files were predicted (78%
+    // coverage) across 4 completed issues with predictions". Optional/absent
+    // when this run had nothing to measure (no completed unit had predictions).
+    lane_prediction_accuracy: { type: 'string' },
+  },
 }
 const LEARNINGS_SCHEMA = {
   type: 'object', required: ['found'],
@@ -3331,6 +3356,66 @@ const consolidationCandidates = preflights
 const consolidationMap = await proposeConsolidation(consolidationCandidates)
 
 if (DRY_RUN) {
+  // ---- lane-scheduling preview (issue #1) — read-only, mirrors the real-run
+  // call sequence (reconcileGroups -> deriveUnits -> computeLanes ->
+  // applyRealRunCollapseGuard, see that sequence below the harness split just
+  // before runPool()) so the dry-run output has an actual unit source instead
+  // of guessing lanes from predicted_files alone. DRY_RUN never runs the claim
+  // loop (claims can flip a resume_point to 'skip' for a real run), so this
+  // preview derives straight from `preflights` as probed — a real run's units
+  // can still differ if a claim race flips something between now and then;
+  // that's inherent to any preview and is exactly why it's still called a
+  // preview, not a plan.
+  const previewGroups = reconcileGroups(consolidationMap, preflights)
+  const previewUnits = deriveUnits(previewGroups, preflights)
+  const previewServeGlobs = PROFILE.serialize_globs || []
+  const previewRawLanes = computeLanes(previewUnits, previewServeGlobs)
+  const previewGuard = applyRealRunCollapseGuard(previewUnits, previewRawLanes, CONCURRENCY, previewServeGlobs)
+  const previewLanes = previewGuard.lanes
+  // Edge provenance per lane: a lane is 'trusted' when its exact membership
+  // also comes out of computeLanes({trustedOnly:true}) — i.e. it would exist
+  // on serialize_globs/depends_on alone, with no heuristic predicted-file
+  // overlap needed. Any other multi-unit lane is 'heuristic'; a size-1 lane
+  // (nothing united it with anything) is 'none'. Mirrors the same key-set
+  // comparison applyRealRunCollapseGuard() uses internally.
+  const previewTrustedLanes = computeLanes(previewUnits, previewServeGlobs, { trustedOnly: true })
+  const previewTrustedKeys = {}
+  previewTrustedLanes.forEach(function (l) {
+    previewTrustedKeys[l.unitIndices.slice().sort(function (a, b) { return a - b }).join(',')] = true
+  })
+  const lanesPreviewOut = previewLanes.map(function (l) {
+    const key = l.unitIndices.slice().sort(function (a, b) { return a - b }).join(',')
+    return {
+      issues: l.unitIndices.map(function (i) { return previewUnits[i].issue }),
+      predicted_files: l.predicted_files,
+      provenance: l.unitIndices.length < 2 ? 'none' : (previewTrustedKeys[key] ? 'trusted' : 'heuristic'),
+    }
+  })
+  const predictedUnitCount = previewUnits.filter(function (u) {
+    return (u.predicted_files || []).length > 0 || (u.depends_on || []).length > 0
+  }).length
+  // DF-flagged paths: the same magnet threshold computeLanes() logs internally
+  // (matched by more than half the batch, min 3 units) — computeLanes() only
+  // logs this (advisory, never drops an intersection key), so it's recomputed
+  // here, read-only, purely for dry-run visibility. serialize_globs paths are
+  // excluded, same as computeLanes()'s own DF signal.
+  const previewIsSerializeGlobPath = function (p) { return previewServeGlobs.some(function (g) { return matchesGlobs(p, [g]) }) }
+  const previewDfCount = {}
+  previewUnits.forEach(function (u) {
+    for (const p of (Array.isArray(u.predicted_files) ? u.predicted_files : [])) {
+      if (previewIsSerializeGlobPath(p)) continue
+      previewDfCount[p] = (previewDfCount[p] || 0) + 1
+    }
+  })
+  const dfFlaggedPaths = Object.keys(previewDfCount)
+    .filter(function (p) { return previewDfCount[p] >= 3 && previewDfCount[p] > previewUnits.length / 2 })
+    .map(function (p) { return { path: p, count: previewDfCount[p], batch_size: previewUnits.length } })
+  // ref_possibly_stale: the shared preflight-fetch probe (Select phase, above)
+  // is the only thing predicted_files is grounded against — if it failed,
+  // every predicted_files entry (and therefore every heuristic lane here) may
+  // be resolved against a stale origin/TARGET, not what a real run would fetch.
+  const refPossiblyStale = !targetFetch || targetFetch.status !== 'success'
+
   return {
     state: 'dry_run', root: ROOT, repo: REPO, base_branch: BASE,
     profile: { test_command: TEST_CMD, browser: !!BROWSER, implementers: IMPLEMENTERS, roles: ROLES },
@@ -3345,6 +3430,23 @@ if (DRY_RUN) {
     consolidation_groups: Array.from(consolidationMap.values()).map(function (g) {
       return { group_id: g.groupId, primary: g.primary, members: g.members, subsystem: g.subsystem, rationale: g.rationale, dry_run_preview: !!g.dry_run_preview }
     }),
+    // Lane-scheduling preview (issue #1) — see the block above for how each
+    // field is derived. ref_possibly_stale flags the WHOLE preview (lanes and
+    // df_flagged_paths both depend on predicted_files) rather than annotating
+    // individual paths, since a stale fetch taints every prediction equally.
+    lane_scheduling: {
+      lanes: lanesPreviewOut,
+      lane_count: previewLanes.length,
+      max_lane_size: previewLanes.length ? Math.max.apply(null, previewLanes.map(function (l) { return l.unitIndices.length })) : 0,
+      effective_concurrency: Math.min(CONCURRENCY, previewLanes.length),
+      collapse_ratio: previewGuard.collapseRatio,
+      prediction_coverage: previewUnits.length ? predictedUnitCount / previewUnits.length : 0,
+      df_flagged_paths: dfFlaggedPaths,
+      ref_possibly_stale: refPossiblyStale,
+      ref_possibly_stale_note: refPossiblyStale
+        ? 'preflight-fetch of origin/' + TARGET + ' failed — predicted_files (and every lane/DF signal above) may be grounded against a stale ref'
+        : null,
+    },
     note: 'No changes made. Re-run without dry_run to execute.',
   }
 }
@@ -3576,13 +3678,34 @@ const report = await agent([
 ].join('\n'), { label: 'report', phase: 'Report', schema: REPORT_SCHEMA, model: M.report.model, effort: M.report.effort })
 
 // ---- Retrospective (the pipeline improves itself) ----
+// lanePredictions (issue #1, lane scheduling): predicted-vs-actual accuracy
+// input. `units`/`results` are index-aligned (runPool() preserves that — see
+// its module comment), so this zip is safe. Scoped to units that both
+// predicted something AND completed with a real PR to diff actual changed
+// files against — nothing to measure otherwise. Actual changed files require
+// git/gh access the engine JS sandbox doesn't have, so the retro agent (which
+// already has that access for its other steps) resolves each PR's files
+// itself rather than the engine guessing/faking it here.
+const lanePredictions = units
+  .map(function (u, i) { return { unit: u, result: results[i] } })
+  .filter(function (x) {
+    return x.result && x.result.status === 'completed' && x.result.pr &&
+      Array.isArray(x.unit.predicted_files) && x.unit.predicted_files.length > 0
+  })
+  .map(function (x) { return { issue: x.unit.issue, pr: x.result.pr, predicted_files: x.unit.predicted_files } })
+  .slice(0, MAX_LANE_ACCURACY_SAMPLES)
 const retro = await agent([
   'Update the ticketmill process-retrospective memory from this batch run.',
   '',
   'Memory file: ' + LOGS + '/process-retrospective.md (seed with "## Active Learnings",',
-  '"## Deprecated Learnings", "## Run History" sections if missing).',
+  '"## Deprecated Learnings", "## Run History", "## Lane Prediction Accuracy" sections if missing).',
   '',
   'Run data:', resultsJson.slice(0, 20000),
+  '',
+  lanePredictions.length
+    ? ['Lane-scheduling predicted-vs-actual data (issue #1) — one entry per completed unit that had a',
+        'prediction, ' + REPO + ':', JSON.stringify(lanePredictions)].join('\n')
+    : 'Lane-scheduling predicted-vs-actual data (issue #1): none this run (no completed unit had predicted_files).',
   '',
   'Instructions:',
   '1. Read the memory file and its existing learnings.',
@@ -3593,9 +3716,19 @@ const retro = await agent([
   '   flips and cap-outs), and "handoff_notes" (env workarounds agents discovered — prime test_loop learnings).',
   '3. Update the file: add new learnings, deprecate contradicted ones, append one Run History row per issue.',
   '   Enforce caps: 20 active learnings, 10 deprecated, 20 history rows (drop oldest).',
-  'Return learnings_added, learnings_deprecated, summary.',
+  '4. Lane prediction accuracy (issue #1 — SKIP entirely, leave lane_prediction_accuracy empty and add no row,',
+  '   if the predicted-vs-actual data above is "none this run"): for each entry, run',
+  '   gh pr view <pr> --repo ' + REPO + ' --json files --jq \'.files[].path\' (read-only; the PR is already',
+  '   merged, this just lists what it touched) to get that unit\'s actual changed files. Compare against its',
+  '   predicted_files (repo-relative path match). Compute, across ALL entries combined: coverage = (actual files',
+  '   that were predicted) / (total actual files), and precision = (predicted files that were actually changed) /',
+  '   (total predicted files). Append ONE row to "## Lane Prediction Accuracy" (date, issue count, coverage %,',
+  '   precision %, e.g. "2026-07-19 — 4 issues — coverage 78% (7/9) — precision 64% (7/11)"). Cap that section at',
+  '   20 rows (drop oldest). Set lane_prediction_accuracy to that same line.',
+  'Return learnings_added, learnings_deprecated, summary, lane_prediction_accuracy (omit/empty if step 4 was skipped).',
 ].join('\n'), { label: 'retrospective', phase: 'Report', schema: RETRO_SCHEMA, model: M.retro.model })
 if (!retro) log('retrospective agent died (non-fatal)')
+else if (retro.lane_prediction_accuracy) log('lane prediction accuracy: ' + retro.lane_prediction_accuracy)
 
 return {
   state: state,
@@ -3609,6 +3742,7 @@ return {
   results: results,
   report: report ? report.report_path : null,
   summary_table: report ? report.markdown_summary : null,
+  lane_prediction_accuracy: retro ? (retro.lane_prediction_accuracy || null) : null,
   stopped: STOP.tripped ? STOP.reason : null,
   resume_hint: state === 'completed' ? null :
     'Re-run ticketmill with the same args PLUS batch_branch: "' + TARGET + '" (so healing lands on the same integration branch) — the Select-phase preflight skips merged/closed issues, routes open PRs straight to review/merge, and continues partial branches. For exact journal replay use Workflow({scriptPath, resumeFromRunId}).',
