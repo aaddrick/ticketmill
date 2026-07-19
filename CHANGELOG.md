@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.10 (2026-07-19)
+
+- Wired `node --test` into the profile's `test_command`, after the existing
+  `node --check` / `bash -n` / manifest-JSON smoke checks — the 33-test suite
+  added in issue #4 (`tests/`: a truncate-and-evaluate vm harness plus unit
+  tests for `sanitizeTasks`, `scopeGuard`, the decision/settled/notes ledger
+  helpers, `timeline`, `pickFixAgent`, `globToRe`/`matchesGlobs`, and the test
+  loop's `MAX_TEST_ITERATIONS` cap) now gates every mill run instead of just
+  syntax checks.
+- Confirmed the gate has teeth two ways: the repeatable `tests/harness.test.js`
+  meta-test (mutates the stub-task guard in memory and asserts the resulting
+  unit-test assertion fails), and a one-time hand check that reverting a
+  covered helper on disk turns `node --test` red (3/33 failing), then cleanly
+  reverting it back to green.
+- `test_command` uses bare `node --test` (auto-discovers `tests/*.test.js`),
+  not `node --test tests/` — the directory-argument form throws
+  `MODULE_NOT_FOUND` on Node 22.22.0.
+
 ## 0.1.9 (2026-07-19)
 
 - Onboarded this repo for its own mill runs (dogfooding): `.claude/ticketmill.json`
