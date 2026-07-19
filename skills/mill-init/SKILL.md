@@ -30,6 +30,7 @@ every profile field. Show the user the proposal and confirm the load-bearing one
   "install_commands": ["composer install --no-interaction"],
   "env_files": [".env"],
   "simplify_globs": ["**/*.php"],
+  "serialize_globs": [],
   "docblock_globs": null,
   "docs_dir": null,
   "logs_dir": "logs/ticketmill",
@@ -62,6 +63,14 @@ Field rules:
   self-hosted) sets `lockstep_installed_paths: [".claude/workflows/ticketmill.js"]`,
   since `scripts/lint-engine.js` keeps that installed copy byte-identical to
   `workflows/ticketmill.js`. Leave it empty for every other repo.
+- `serialize_globs`: OPTIONAL, default `[]`. Lane scheduling (issue #1) already
+  predicts likely file overlap per issue and serializes those issues instead of
+  racing them — this field is only for files that heuristic alone can't be
+  trusted to catch: a magnet config, a shared schema/router, anything where two
+  issues touching it concurrently would conflict even if their predicted-file
+  sets don't otherwise overlap. Leave it `[]` unless the user names such a file;
+  propose it only when the stack detection in Step 2 surfaces an obvious
+  candidate (e.g. a single central routes/config file every feature touches).
 
 ## Step 3 — Map project agents onto pipeline roles
 

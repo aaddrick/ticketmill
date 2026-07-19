@@ -43,6 +43,18 @@ export const meta = {
 //     "install_commands": ["composer install --no-interaction"],
 //     "env_files": [".env"],             // copied root -> worktree at setup
 //     "simplify_globs": ["**/*.php"],    // files worth a simplify pass; null = always run
+//     "serialize_globs": ["**/config/*.php"], // OPTIONAL (issue #1, lane scheduling):
+//                                        // any two issues whose predicted_files both
+//                                        // hit one of these patterns are a TRUSTED
+//                                        // edge for computeLanes() — they always run
+//                                        // in the same serial lane instead of racing,
+//                                        // never dissolved by the collapse guard.
+//                                        // Use it for hot/shared files (a central
+//                                        // router, a schema, a magnet config) that
+//                                        // predicted_files' own path-overlap
+//                                        // heuristic can't be trusted to catch on its
+//                                        // own. Unset/[] = only depends_on and actual
+//                                        // predicted-file overlap drive lanes.
 //     "docblock_globs": ["app/**/*.php"],// files needing docblocks; null = skip stage
 //     "docs_dir": "docs",                // tech-docs stage target; null = skip stage
 //     "logs_dir": "logs/ticketmill",
@@ -202,6 +214,16 @@ const QUALITY_DEGRADE_WINDOW = 5
 const MAX_QUALITY_DEGRADES_IN_WINDOW = 3
 const MAX_CONSECUTIVE_AGENT_DEATHS = 3
 const STAGE_TRIES = 2
+// lane scheduling (issue #1): bounds a lane's merged predicted_files list (the
+// union of every member unit's own, already-capped-at-20 predicted_files) so a
+// lane spanning many units can't grow that list unboundedly — it's a DRY_RUN/
+// human-readability aid, not a correctness input, so a hard cap is safe.
+const MAX_LANE_PREDICTED_FILES = 60
+// lane scheduling (issue #1): bounds how many completed units' predicted-vs-
+// actual data the Report-phase retrospective agent is handed (each entry is a
+// small {issue, pr, predicted_files} tuple) — a human-readability/prompt-size
+// cap on the accuracy sample, not a correctness input.
+const MAX_LANE_ACCURACY_SAMPLES = 40
 
 // ----- model policy (profile.models may override any stage key) -----
 const M = {
@@ -344,6 +366,12 @@ const PREFLIGHT_SCHEMA = {
     // ROOT status --porcelain` reports dirty right now — the regime (a)
     // root-dirty read applyEngineOwnedRootDirtySkip() acts on. [] when clean.
     root_dirty_engine_paths: { type: 'array', items: { type: 'string' } },
+    // OPTIONAL lane-scheduling prediction (issue #1): real repo-relative paths
+    // resolved against origin/TARGET (never guessed), and in-batch issue refs
+    // parsed from body text. Both fail open to [] — see the probe prompt below
+    // and deriveUnits() for how they're threaded onto the unit shape.
+    predicted_files: { type: 'array', items: { type: 'string' } },
+    depends_on: { type: 'array', items: { type: 'integer' } },
   },
 }
 const SETUP_SCHEMA = {
@@ -353,6 +381,10 @@ const SETUP_SCHEMA = {
 const BATCH_BRANCH_SCHEMA = {
   type: 'object', required: ['status'],
   properties: { status: { enum: ['success', 'error'] }, branch: { type: 'string' }, error: { type: ['string', 'null'] } },
+}
+const TARGET_FETCH_SCHEMA = {
+  type: 'object', required: ['status'],
+  properties: { status: { enum: ['success', 'error'] }, error: { type: ['string', 'null'] } },
 }
 const UI_PROBE_SCHEMA = {
   type: 'object', required: ['ui_files'],
@@ -534,7 +566,15 @@ const REPORT_SCHEMA = {
 }
 const RETRO_SCHEMA = {
   type: 'object', required: ['summary'],
-  properties: { learnings_added: { type: 'integer' }, learnings_deprecated: { type: 'integer' }, summary: { type: 'string' } },
+  properties: {
+    learnings_added: { type: 'integer' }, learnings_deprecated: { type: 'integer' }, summary: { type: 'string' },
+    // lane_prediction_accuracy (issue #1, lane scheduling): one plain-text line
+    // summarizing predicted vs. actual changed files across this run's completed,
+    // predicted units — e.g. "7/9 actual changed files were predicted (78%
+    // coverage) across 4 completed issues with predictions". Optional/absent
+    // when this run had nothing to measure (no completed unit had predictions).
+    lane_prediction_accuracy: { type: 'string' },
+  },
 }
 const LEARNINGS_SCHEMA = {
   type: 'object', required: ['found'],
@@ -810,6 +850,23 @@ function reconcileGroups(map, livePreflights) {
   return out
 }
 
+// unionField: dedupe the union of an array-valued field across a group's live
+// member refs, in first-seen order. Shared by deriveUnits() below for both
+// predicted_files and depends_on so a group unit sees everything its members
+// individually predicted, not just the primary's own slice.
+function unionField(memberRefs, field) {
+  const seen = {}
+  const out = []
+  for (const m of memberRefs) {
+    const arr = m && Array.isArray(m[field]) ? m[field] : []
+    for (const v of arr) {
+      const key = String(v)
+      if (!seen[key]) { seen[key] = true; out.push(v) }
+    }
+  }
+  return out
+}
+
 // deriveUnits: the final translation from "reconciled groups" + "live preflights" to
 // the array runPool() actually iterates. Every reconciled group becomes ONE unit
 // (a live-preflight-shaped object for the primary, with members: the live preflight
@@ -825,6 +882,16 @@ function reconcileGroups(map, livePreflights) {
 // primary would be invisible to any consumer reading it off the unit. A singleton
 // unit needs no such fold: Object.assign({}, p, {...}) below already spreads p's
 // OWN engineOwnedIntentional through untouched.
+//
+// predicted_files/depends_on (issue #1, lane scheduling): every preflight carries
+// these two OPTIONAL arrays (normalized to [] by the probe's .then() above). A
+// singleton unit carries its own straight through the Object.assign spread below
+// (p.predicted_files/p.depends_on are already on p) — no extra work needed. A
+// group unit's predicted_files is the union over every live member (unionField
+// above); its depends_on is that same union MINUS any ref onto a fellow member of
+// THIS group — that dependency is already satisfied by the merge (both issues land
+// in the same unit), so keeping it would dangle a lane edge onto an issue number
+// that no longer exists as its own unit once grouped.
 function deriveUnits(reconciledMap, livePreflights) {
   const byIssue = {}
   for (const p of livePreflights || []) byIssue[p.issue] = p
@@ -836,13 +903,289 @@ function deriveUnits(reconciledMap, livePreflights) {
     const primaryRef = byIssue[g.primary] || memberRefs[0]
     memberRefs.forEach(function (m) { consumed[m.issue] = true })
     const engineOwnedIntentional = memberRefs.some(function (m) { return m.engineOwnedIntentional })
-    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale, engineOwnedIntentional: engineOwnedIntentional }))
+    const memberIssueSet = {}
+    memberRefs.forEach(function (m) { memberIssueSet[m.issue] = true })
+    const predictedFiles = unionField(memberRefs, 'predicted_files')
+    const dependsOn = unionField(memberRefs, 'depends_on').filter(function (n) { return !memberIssueSet[n] })
+    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale, engineOwnedIntentional: engineOwnedIntentional, predicted_files: predictedFiles, depends_on: dependsOn }))
   })
   for (const p of (livePreflights || [])) {
     if (consumed[p.issue]) continue
     units.push(Object.assign({}, p, { members: [p], groupId: null }))
   }
   return units
+}
+
+// laneKey/sortLanesByLowestIndex: small shared helpers for the lane-scheduling
+// reducers below (issue #1) and their DRY_RUN preview mirror further down. A
+// lane's canonical identity for membership comparison is its sorted unit-index
+// list joined into a string; its canonical display order is by lowest member
+// index, ascending.
+function laneKey(unitIndices) {
+  return unitIndices.slice().sort(function (a, b) { return a - b }).join(',')
+}
+function sortLanesByLowestIndex(lanes) {
+  lanes.sort(function (a, b) { return Math.min.apply(null, a.unitIndices) - Math.min.apply(null, b.unitIndices) })
+  return lanes
+}
+
+// computeLanes: pure reducer (issue #1, lane scheduling) that groups deriveUnits()'s
+// output into lanes — sets of unit INDICES that must run serially (one worker
+// draining the lane in order) instead of racing. Reuses globToRe/matchesGlobs
+// (defined below; hoisted, so fine to call from here) for glob matching. Returns
+// an array of { unitIndices: [index,...], predicted_files: [path,...] }, one per
+// connected component, sorted by each lane's lowest unit index for determinism;
+// a unit connected to nothing is its own lane of size 1 — with no overlap
+// anywhere, this returns units.length singleton lanes, degenerating byte-for-byte
+// to today's every-unit-races-every-unit pool.
+//
+// Union-find over unit indices with two edge tiers:
+//   - TRUSTED (always unite, never dissolved): a serialize_globs pattern matched
+//     by >=1 predicted_files path of each unit (same pattern), or a depends_on
+//     reference from one unit onto another (resolved via each unit's own issue
+//     plus every member's issue, so a grouped unit's members all resolve to it).
+//   - HEURISTIC (unite unless suppressed by the collapse guard below): a shared
+//     normalized predicted_files path between two units, or — only when no path
+//     is shared — a shared basename (weaker, e.g. same filename in different
+//     directories).
+//
+// Cohesion-aware collapse guard (NOT size-keyed — a lane's fate never depends on
+// how many units or edges it has, only on overlap structure): every heuristic
+// edge is graded by what the SPECIFIC PAIR it connects directly co-predicts —
+// STRONG (that pair alone shares >=2 distinct paths/basenames — e.g. an
+// implementation file plus its test) is self-sufficient and always survives.
+// WEAK (that pair shares exactly one) only survives as part of a WEAK-EDGE-ONLY
+// chain whose edges collectively touch >=2 DISTINCT keys, counted strictly from
+// the weak edges' own shared keys — never inherited from a neighboring strong
+// cluster's unrelated paths. That scoping is what stops a single popular path
+// (a magnet) from dragging a unit that touches only it into a lane that is
+// cohesive for entirely unrelated reasons: a unit sharing only a magnet path
+// with one member of a genuine 2-path cluster must not serialize with the whole
+// cluster just because that cluster happens to pass the >=2 bar on its own.
+// A weak chain that never reaches 2 distinct keys is a single-path promiscuous
+// connector — the shape a magnet file produces (many otherwise unrelated units
+// all touching one popular path) — and dissolves back to trusted-only, i.e.
+// those units race instead of serializing. Trusted edges are never touched by
+// this guard.
+//
+// DF (document-frequency) signal: advisory/metric-only, logged when a predicted
+// path is matched by more than half the batch (min 3 units) — surfaced for human
+// visibility but NEVER used to drop an intersection key or suppress an edge; that
+// job belongs solely to the collapse guard above. serialize_globs paths are never
+// counted toward DF (they're a deliberate trusted signal, not a magnet).
+//
+// opts.trustedOnly (issue #1, lane scheduling — used by the real-run collapse
+// guard right before runPool() drains, workflows below the harness split): skips
+// the DF log and the whole heuristic-edge/collapse-guard section, unioning ONLY
+// serialize_globs + depends_on. Lets the drive code ask "which of the lanes I
+// already computed would exist on trusted edges ALONE?" without re-deriving that
+// graph by hand — a lane whose membership is identical trustedOnly is provably
+// never touched by a heuristic edge and must never be dissolved.
+function computeLanes(units, serializeGlobs, opts) {
+  const trustedOnly = !!(opts && opts.trustedOnly)
+  const n = (units || []).length
+  function find(p, x) { while (p[x] !== x) { p[x] = p[p[x]]; x = p[x] } return x }
+  function union(p, a, b) { const ra = find(p, a); const rb = find(p, b); if (ra !== rb) p[ra] = rb }
+
+  function normalizePath(f) { return String(f).trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/{2,}/g, '/') }
+  function basenameOf(f) { const parts = normalizePath(f).split('/'); return parts[parts.length - 1] }
+
+  const predictedSets = units.map(function (u) {
+    const s = {}
+    for (const f of (Array.isArray(u && u.predicted_files) ? u.predicted_files : [])) s[normalizePath(f)] = true
+    return s
+  })
+  const basenameSets = units.map(function (u) {
+    const s = {}
+    for (const f of (Array.isArray(u && u.predicted_files) ? u.predicted_files : [])) s[basenameOf(f)] = true
+    return s
+  })
+  // every issue number that resolves to this unit index — its own, plus every
+  // live member's (a group unit's members all point back to the one group unit).
+  const issueToIndex = {}
+  units.forEach(function (u, idx) {
+    if (u && u.issue != null) issueToIndex[u.issue] = idx
+    for (const m of (Array.isArray(u && u.members) ? u.members : [])) {
+      if (m && m.issue != null) issueToIndex[m.issue] = idx
+    }
+  })
+
+  const parent = []
+  for (let i = 0; i < n; i++) parent[i] = i
+
+  // ---- trusted: serialize_globs (unite every unit whose predicted_files hits
+  // the same pattern) ----
+  const globs = Array.isArray(serializeGlobs) ? serializeGlobs.filter(function (g) { return typeof g === 'string' && g.length > 0 }) : []
+  for (const g of globs) {
+    let first = -1
+    for (let i = 0; i < n; i++) {
+      const hit = Object.keys(predictedSets[i]).some(function (p) { return matchesGlobs(p, [g]) })
+      if (!hit) continue
+      if (first === -1) first = i
+      else union(parent, first, i)
+    }
+  }
+
+  // ---- trusted: depends_on ----
+  for (let i = 0; i < n; i++) {
+    for (const dep of (Array.isArray(units[i].depends_on) ? units[i].depends_on : [])) {
+      const j = issueToIndex[dep]
+      if (j != null && j !== i) union(parent, i, j)
+    }
+  }
+
+  // ---- DF signal + heuristic edges + collapse guard: entirely skipped in
+  // trustedOnly mode — the caller wants ONLY the serialize_globs/depends_on
+  // union above, with no heuristic edge (and therefore no DF log / dissolve log
+  // noise) considered at all. ----
+  if (!trustedOnly) {
+    // ---- DF signal: advisory/metric-only, logged, never used to drop keys ----
+    const isSerializeGlobPath = function (p) { return globs.some(function (g) { return matchesGlobs(p, [g]) }) }
+    const dfCount = {}
+    for (let i = 0; i < n; i++) {
+      for (const p of Object.keys(predictedSets[i])) {
+        if (isSerializeGlobPath(p)) continue // serialize_globs never counted
+        dfCount[p] = (dfCount[p] || 0) + 1
+      }
+    }
+    const magnets = Object.keys(dfCount).filter(function (p) { return dfCount[p] >= 3 && dfCount[p] > n / 2 })
+    if (magnets.length) {
+      log('computeLanes: DF magnet signal (advisory only — intersection keys NOT dropped): ' +
+        magnets.map(function (p) { return p + ' (' + dfCount[p] + '/' + n + ')' }).join(', '))
+    }
+
+    // ---- heuristic candidate edges: full-path intersection, else basename ----
+    const heuristicEdges = []
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        let shared = Object.keys(predictedSets[i]).filter(function (p) { return predictedSets[j][p] })
+        if (!shared.length) shared = Object.keys(basenameSets[i]).filter(function (b) { return basenameSets[j][b] })
+        if (shared.length) heuristicEdges.push({ i: i, j: j, shared: shared })
+      }
+    }
+
+    // ---- cohesion-aware collapse guard: strong edges are self-sufficient; weak
+    // edges only survive as a weak-only chain that reaches 2 distinct keys on its
+    // own (see docstring above) ----
+    const strongEdges = heuristicEdges.filter(function (e) { return e.shared.length >= 2 })
+    const weakEdges = heuristicEdges.filter(function (e) { return e.shared.length === 1 })
+
+    for (const e of strongEdges) union(parent, e.i, e.j)
+
+    const weakParent = []
+    for (let i = 0; i < n; i++) weakParent[i] = i
+    for (const e of weakEdges) union(weakParent, e.i, e.j)
+
+    const weakKeysByRoot = {} // weak-only root -> set of distinct shared keys among its weak edges
+    for (const e of weakEdges) {
+      const r = find(weakParent, e.i)
+      if (!weakKeysByRoot[r]) weakKeysByRoot[r] = {}
+      weakKeysByRoot[r][e.shared[0]] = true
+    }
+
+    for (const e of weakEdges) {
+      const r = find(weakParent, e.i)
+      if (Object.keys(weakKeysByRoot[r]).length >= 2) union(parent, e.i, e.j) // exempt: weak chain reaches 2 distinct keys on its own
+      // else: single-path promiscuous connector — left dissolved, those units race
+    }
+
+    const dissolvedRoots = Object.keys(weakKeysByRoot).filter(function (r) { return Object.keys(weakKeysByRoot[r]).length < 2 })
+    if (dissolvedRoots.length) {
+      log('computeLanes: collapse guard dissolved ' + dissolvedRoots.length +
+        ' heuristic lane(s) — single-path promiscuous connector(s) with < 2 co-predicted paths; racing instead of serializing')
+    }
+  }
+
+  // ---- materialize final lanes, bounding predicted-set growth per lane ----
+  const groupsByRoot = {}
+  for (let i = 0; i < n; i++) {
+    const r = find(parent, i)
+    if (!groupsByRoot[r]) groupsByRoot[r] = []
+    groupsByRoot[r].push(i)
+  }
+  const lanes = Object.keys(groupsByRoot).map(function (r) {
+    const unitIndices = groupsByRoot[r]
+    const predicted = []
+    const seen = {}
+    for (const idx of unitIndices) {
+      if (predicted.length >= MAX_LANE_PREDICTED_FILES) break
+      for (const p of Object.keys(predictedSets[idx])) {
+        if (seen[p]) continue
+        if (predicted.length >= MAX_LANE_PREDICTED_FILES) break
+        seen[p] = true
+        predicted.push(p)
+      }
+    }
+    return { unitIndices: unitIndices, predicted_files: predicted }
+  })
+  return sortLanesByLowestIndex(lanes)
+}
+
+// applyRealRunCollapseGuard: pure reducer (issue #1, lane scheduling) — a final,
+// run-time safety net called immediately before runPool()'s real drain (dry-run
+// separately previews lanes read-only, before claims settle — see the DRY_RUN
+// block). computeLanes() already guards its OWN edges locally/per-chain (see its
+// module comment) — this is coarser and whole-batch scoped, for a shape its local
+// view can't see: a long chain of pairwise-weak edges, each sharing a DIFFERENT
+// path with its neighbor, can reach computeLanes()'s own ">=2 distinct keys" bar
+// in aggregate without the lane, taken as a whole, actually cohering around
+// anything. Only recomputes anything when collapse_ratio (effective lane
+// concurrency over what a flat pool would've given) < 0.5 AND there was enough
+// work to want that concurrency in the first place (unitCount >= concurrency) —
+// with too little work, `lanes` passes through completely untouched.
+//
+// Mirrors computeLanes()'s discriminator one level up (whole lanes, not edges): a
+// lane whose membership is IDENTICAL to recomputing computeLanes() with heuristic
+// edges disabled (serialize_globs + depends_on only, via { trustedOnly: true }) is
+// TRUSTED and is always kept, no matter its size. Any other multi-unit lane is
+// HEURISTIC; it survives only if its units, taken as a whole, actually co-predict
+// >= 2 distinct paths (a genuinely cohesive cluster) — otherwise it's a
+// single-path magnet connector computeLanes()'s local/chained view let slip
+// through in aggregate, and is dissolved back into one singleton lane per unit
+// (those units then race instead of serializing).
+//
+// Returns { lanes, dissolvedCount, collapseRatio } so the caller can log/branch
+// without duplicating the ratio math; `lanes` is the SAME array reference when
+// dissolvedCount is 0 (no-op fast path).
+function applyRealRunCollapseGuard(units, lanes, concurrency, serializeGlobs) {
+  const n = (units || []).length
+  const flatConcurrency = Math.min(concurrency, n)
+  const effectiveConcurrency = Math.min(concurrency, (lanes || []).length)
+  const collapseRatio = flatConcurrency ? effectiveConcurrency / flatConcurrency : 1
+  if (n < concurrency || collapseRatio >= 0.5) return { lanes: lanes, dissolvedCount: 0, collapseRatio: collapseRatio }
+
+  const trustedLanes = computeLanes(units, serializeGlobs, { trustedOnly: true })
+  const trustedKeys = {}
+  trustedLanes.forEach(function (l) {
+    trustedKeys[laneKey(l.unitIndices)] = true
+  })
+  let dissolvedCount = 0
+  const nextLanes = []
+  lanes.forEach(function (lane) {
+    if (lane.unitIndices.length < 2) { nextLanes.push(lane); return } // already a singleton
+    if (trustedKeys[laneKey(lane.unitIndices)]) { nextLanes.push(lane); return } // trusted — always kept
+    // heuristic lane: whole-lane cohesion — a path present in >= 2 of the lane's
+    // OWN units, counted fresh here (not inherited from computeLanes()'s
+    // per-chain scoping, which is exactly the gap this guard exists to catch).
+    const pathCounts = {}
+    lane.unitIndices.forEach(function (i) {
+      const seen = {}
+      for (const p of (Array.isArray(units[i].predicted_files) ? units[i].predicted_files : [])) {
+        const norm = String(p).trim().replace(/\\/g, '/').replace(/^\.\//, '')
+        if (seen[norm]) continue
+        seen[norm] = true
+        pathCounts[norm] = (pathCounts[norm] || 0) + 1
+      }
+    })
+    const sharedPaths = Object.keys(pathCounts).filter(function (p) { return pathCounts[p] >= 2 }).length
+    if (sharedPaths >= 2) { nextLanes.push(lane); return } // cohesive cluster — exempt
+    dissolvedCount++
+    lane.unitIndices.forEach(function (i) {
+      nextLanes.push({ unitIndices: [i], predicted_files: (units[i].predicted_files || []).slice() })
+    })
+  })
+  if (!dissolvedCount) return { lanes: lanes, dissolvedCount: 0, collapseRatio: collapseRatio }
+  return { lanes: sortLanesByLowestIndex(nextLanes), dissolvedCount: dissolvedCount, collapseRatio: collapseRatio }
 }
 
 // ----- batch state -----
@@ -3215,25 +3558,124 @@ async function processIssue(pre) {
   return reviewAndMerge(ctx)
 }
 
-// Bounded worker pool (issue-level concurrency; agent-level pool is capped by the harness)
-async function runPool(items, limit, fn) {
+// Bounded worker pool (issue-level concurrency; agent-level pool is capped by the
+// harness). Lane-aware work-stealing (issue #1, lane scheduling): `lanes` — the
+// computeLanes() shape, [{unitIndices:[idx,...], ...}], omitted, or empty — groups
+// `items` INDICES into sets that must run serially instead of racing. min(limit,
+// lanes.length) workers each steal ONE WHOLE LANE at a time (a shared `nextLane`
+// counter — the same "grab whatever's next" contract the old flat pool had over
+// `items` directly) and drain every unit in that lane ONE AT A TIME, in
+// depends_on order (laneDrainOrder() below), before stealing another lane.
+//
+// No lanes arg — or every lane a singleton, which is exactly what computeLanes()
+// returns when nothing overlaps — degenerates BYTE-FOR-BYTE to the pre-lane pool:
+// each lane is one item, so "steal a lane, drain it serially" IS "grab the next
+// item", in the same original order, with workers = min(limit, items.length).
+//
+// results stays length === items.length, keyed by ORIGINAL item index regardless
+// of lane membership or drain order — every caller downstream (counts, batch PR
+// body, run report) already assumes that flat, index-stable shape.
+//
+// STOP is checked before EVERY unit, not once per lane: once tripped, every
+// remaining unit in the lane a worker is currently draining gets a not_started
+// result without calling fn — and so does every unit in every lane no worker has
+// stolen yet, because a worker that finishes (or STOP-sweeps) its current lane
+// immediately steals the next one and STOP-sweeps that too. Exactly one
+// not_started per remaining unit, same shape the old flat pool produced per
+// remaining item.
+//
+// A throw from fn() is caught PER UNIT inside drainUnit(), never left to bubble
+// into Promise.all: it becomes a `failed` result for that one unit and the worker
+// moves on (next unit in the lane, then next lane) exactly like a stage()-level
+// failure would. So Promise.all over the worker promises never rejects because of
+// unit-level work — a throw partway through one lane can never tear down another
+// lane's in-flight or already-written results, and results.length always stays
+// items.length no matter what any single fn() call does.
+async function runPool(items, limit, fn, lanes) {
   const results = new Array(items.length)
-  let next = 0
+  const laneList = (Array.isArray(lanes) && lanes.length)
+    ? lanes
+    : items.map(function (_, i) { return { unitIndices: [i] } })
+
+  // laneDrainOrder: topological sort of one lane's unit indices by depends_on,
+  // scoped to units actually IN this lane (a depends_on edge reaching outside the
+  // lane would already have united that target into it — computeLanes()'s
+  // depends_on union is trusted and never dissolved — so resolving only within the
+  // lane here is a defensive no-op for any edge that somehow still points out).
+  // Kahn's algorithm, always picking the SMALLEST-INDEX ready unit, so a lane with
+  // no depends_on at all (the common case) drains in plain ascending
+  // original-index order. Falls back to remaining ascending order on an
+  // (unexpected) cycle rather than hanging — preflight's depends_on parsing
+  // deterministically breaks 2-cycles, so this should never actually fire.
+  function laneDrainOrder(unitIndices) {
+    if (unitIndices.length <= 1) return unitIndices.slice()
+    const issueToIdx = {}
+    items.forEach(function (u, idx) {
+      if (u && u.issue != null) issueToIdx[u.issue] = idx
+      for (const m of (Array.isArray(u && u.members) ? u.members : [])) {
+        if (m && m.issue != null) issueToIdx[m.issue] = idx
+      }
+    })
+    const inLane = {}
+    unitIndices.forEach(function (i) { inLane[i] = true })
+    const indegree = {}
+    const successors = {}
+    unitIndices.forEach(function (i) { indegree[i] = 0; successors[i] = [] })
+    unitIndices.forEach(function (i) {
+      const deps = Array.isArray(items[i].depends_on) ? items[i].depends_on : []
+      for (const dep of deps) {
+        const j = issueToIdx[dep]
+        if (j != null && j !== i && inLane[j]) { successors[j].push(i); indegree[i]++ }
+      }
+    })
+    const ascending = unitIndices.slice().sort(function (a, b) { return a - b })
+    const done = {}
+    const order = []
+    while (order.length < unitIndices.length) {
+      let picked = -1
+      for (const i of ascending) {
+        if (done[i] || indegree[i] > 0) continue
+        picked = i
+        break
+      }
+      if (picked === -1) {
+        for (const i of ascending) if (!done[i]) order.push(i) // cycle fallback
+        break
+      }
+      order.push(picked)
+      done[picked] = true
+      for (const s of successors[picked]) indegree[s]--
+    }
+    return order
+  }
+
+  async function drainUnit(i) {
+    if (STOP.tripped) {
+      // items[i] is a unit (deriveUnits() shape) — .members is always present
+      // (a self-reference singleton, or real group members), never ctx-shaped.
+      results[i] = { issue: items[i].issue, title: items[i].title || '', status: 'not_started', pr: items[i].pr_number || null, follow_ups: [], stage: 'queue', error: 'not launched: ' + STOP.reason, members: (items[i].members || []).map(function (m) { return m.issue }) }
+      return
+    }
+    try {
+      results[i] = await fn(items[i])
+    } catch (e) {
+      // Isolate a throw to THIS unit only — never let it reject the worker
+      // promise and tear down sibling lanes via Promise.all below.
+      results[i] = { issue: items[i].issue, title: items[i].title || '', status: 'failed', pr: items[i].pr_number || null, follow_ups: [], stage: 'pool', error: 'runPool: ' + String((e && e.message) || e), members: (items[i].members || []).map(function (m) { return m.issue }) }
+    }
+  }
+
+  let nextLane = 0
   async function worker() {
     for (;;) {
-      const i = next++
-      if (i >= items.length) return
-      if (STOP.tripped) {
-        // items[i] is a unit (deriveUnits() shape) — .members is always present
-        // (a self-reference singleton, or real group members), never ctx-shaped.
-        results[i] = { issue: items[i].issue, title: items[i].title || '', status: 'not_started', pr: items[i].pr_number || null, follow_ups: [], stage: 'queue', error: 'not launched: ' + STOP.reason, members: (items[i].members || []).map(function (m) { return m.issue }) }
-        continue
-      }
-      results[i] = await fn(items[i])
+      const laneIdx = nextLane++
+      if (laneIdx >= laneList.length) return
+      const order = laneDrainOrder(laneList[laneIdx].unitIndices)
+      for (const i of order) await drainUnit(i)
     }
   }
   const workers = []
-  for (let w = 0; w < Math.min(limit, items.length); w++) workers.push(worker())
+  for (let w = 0; w < Math.min(limit, laneList.length); w++) workers.push(worker())
   await Promise.all(workers)
   return results
 }
@@ -3411,6 +3853,23 @@ const learnPromise = agent([
 // interpolated into every probe below so `git status --porcelain` gets plain
 // literal paths, never the raw '**' globs it doesn't interpret.
 const enginePathspec = buildEngineOwnedPathspec(ENGINE_OWNED)
+// One shared fetch of origin/TARGET before the per-issue Promise.all below —
+// each probe's predicted_files step reads this ref read-only. Fetching it once
+// here (rather than once per issue inside the unbounded Promise.all) avoids N
+// concurrent `git fetch` calls racing on the same ref's lock file in ROOT.
+// Best-effort: on failure, probes still run and fall open to predicted_files=[]
+// against whatever origin/TARGET already pointed at (batch-branch creation
+// above already fetched it once too).
+const targetFetch = await agent(
+  ['Run: git -C ' + ROOT + ' fetch origin ' + TARGET + ' (read-only — updates the ref only, never checks anything out).',
+    'Return status=success, or status=error with error if the fetch failed.'].join('\n'),
+  { label: 'preflight-fetch', phase: 'Select', schema: TARGET_FETCH_SCHEMA, model: M.setup.model, effort: M.setup.effort })
+if (!targetFetch || targetFetch.status !== 'success') log('preflight: git fetch origin ' + TARGET + ' failed (non-fatal) — predicted_files will fall open to [] wherever it depended on a fresher ref: ' + String((targetFetch && targetFetch.error) || 'agent died'))
+
+// batchIssueNumbers: this run's whole candidate set, used below to scope
+// depends_on parsing — a body reference to an issue outside the batch is
+// dropped (there's no unit for computeLanes to point it at).
+const batchIssueNumbers = issueList.map(function (it) { return it.number })
 let preflights = (await Promise.all(issueList.map(function (it) {
   return agent([
     'Probe the current state of GitHub issue #' + it.number + ' in ' + REPO + ' (READ-ONLY: gh + git inspection, no changes).',
@@ -3425,16 +3884,48 @@ let preflights = (await Promise.all(issueList.map(function (it) {
     '   git -C ' + ROOT + ' status --porcelain -- ' + enginePathspec.join(' '),
     '   Return every dirty path under that pathspec as root_dirty_engine_paths (empty array if the pathspec is clean).',
     '',
+    '4. predicted_files (best-effort lane-scheduling hint — fail open to [] on ANY doubt, never guess a path):',
+    '   a. From the issue title + body, extract ONLY high-signal identifiers: backticked spans (`like this`),',
+    '      quoted spans ("like this"), path-like strings (contain a / or a file extension such as .js/.md/.json/.sh),',
+    '      and code-symbol tokens (PascalCase, camelCase, snake_case, or ALL_CAPS words of 3+ chars).',
+    '      REJECT bare dictionary/English nouns used in ordinary prose (e.g. "engine", "button", "config" alone,',
+    '      with no code formatting, path shape, or distinctive casing) — those are not identifiers.',
+    '      If nothing clears this bar, predicted_files = [] and skip the rest of this step.',
+    '   b. Resolve each surviving identifier against the REAL tree at origin/' + TARGET + ' (already fetched read-only',
+    '      before this step; never the working directory, which may be on a different branch):',
+    '      git -C ' + ROOT + ' grep -l -I -F -i -- "<identifier>" origin/' + TARGET + ' for a content match, and',
+    '      git -C ' + ROOT + ' ls-tree -r --name-only origin/' + TARGET + ' filtered for a',
+    '      case-insensitive substring match for a path/filename match. Keep ONLY the exact repo-relative paths those',
+    '      commands actually return — never fabricate or normalize a path yourself.',
+    '   c. Dedupe and cap at 20 paths. If every resolution comes back empty, or any command errors, predicted_files = [].',
+    '5. depends_on (best-effort lane-scheduling hint — fail open to [] on ANY doubt):',
+    '   a. Scan the issue body for "depends on #N", "depends-on #N", or "follow-up to #N" (case-insensitive). Collect each N.',
+    '   b. Drop any N that is not one of this batch\'s issue numbers (' + batchIssueNumbers.join(', ') + '), and drop N == ' + it.number + '.',
+    '   c. For each remaining N, check whether #N itself ALSO references "depends on #' + it.number + '" or',
+    '      "follow-up to #' + it.number + '" in ITS OWN body (gh issue view N --repo ' + REPO + ' --json body, read-only).',
+    '      If so this is a two-issue cycle: keep the edge ONLY on the lower-numbered issue of the pair and drop it from',
+    '      the higher-numbered one (deterministic by issue number, so both probes agree without coordinating).',
+    '   d. Return the surviving numbers as depends_on. Empty array if none, or on any doubt/error.',
+    '',
     'Decide resume_point:',
     '- "skip": issue is closed OR a related PR is already merged',
     '- "process_pr": a related PR is OPEN (implementation exists; it needs review + merge)',
     '- "implement": otherwise (fresh, or partial branch/worktree — implementation will continue from existing commits)',
-    'Return issue, title, body, issue_state, pr_number, pr_state, branch, worktree_exists, commits_ahead, resume_point, reason (one line), root_dirty_engine_paths.',
+    'Return issue, title, body, issue_state, pr_number, pr_state, branch, worktree_exists, commits_ahead, resume_point, reason (one line), root_dirty_engine_paths,',
+    'predicted_files (array of real repo-relative paths, [] if none/uncertain), depends_on (array of in-batch issue numbers, [] if none/uncertain).',
   ].join('\n'), { label: it.number + ':preflight', phase: 'Select', schema: PREFLIGHT_SCHEMA, model: M.probe.model, effort: M.probe.effort })
     .then(function (r) {
-      if (r) { if (!r.title && it.title) r.title = it.title; return r }
+      if (r) {
+        if (!r.title && it.title) r.title = it.title
+        // Normalize the two optional prediction fields to real arrays regardless
+        // of what the agent omitted/returned — every downstream reader (deriveUnits,
+        // eventually computeLanes) can then assume Array.isArray() without re-checking.
+        r.predicted_files = Array.isArray(r.predicted_files) ? r.predicted_files : []
+        r.depends_on = Array.isArray(r.depends_on) ? r.depends_on : []
+        return r
+      }
       // probe died -> assume full implement; the pipeline stages are individually idempotent
-      return { issue: it.number, title: it.title || '', body: '', issue_state: 'unknown', pr_number: null, pr_state: 'none', branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)', root_dirty_engine_paths: [] }
+      return { issue: it.number, title: it.title || '', body: '', issue_state: 'unknown', pr_number: null, pr_state: 'none', branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)', root_dirty_engine_paths: [], predicted_files: [], depends_on: [] }
     })
 }))).filter(Boolean)
 
@@ -3489,6 +3980,65 @@ const consolidationCandidates = preflights
 const consolidationMap = await proposeConsolidation(consolidationCandidates)
 
 if (DRY_RUN) {
+  // ---- lane-scheduling preview (issue #1) — read-only, mirrors the real-run
+  // call sequence (reconcileGroups -> deriveUnits -> computeLanes ->
+  // applyRealRunCollapseGuard, see that sequence below the harness split just
+  // before runPool()) so the dry-run output has an actual unit source instead
+  // of guessing lanes from predicted_files alone. DRY_RUN never runs the claim
+  // loop (claims can flip a resume_point to 'skip' for a real run), so this
+  // preview derives straight from `preflights` as probed — a real run's units
+  // can still differ if a claim race flips something between now and then;
+  // that's inherent to any preview and is exactly why it's still called a
+  // preview, not a plan.
+  const previewGroups = reconcileGroups(consolidationMap, preflights)
+  const previewUnits = deriveUnits(previewGroups, preflights)
+  const previewServeGlobs = PROFILE.serialize_globs || []
+  const previewRawLanes = computeLanes(previewUnits, previewServeGlobs)
+  const previewGuard = applyRealRunCollapseGuard(previewUnits, previewRawLanes, CONCURRENCY, previewServeGlobs)
+  const previewLanes = previewGuard.lanes
+  // Edge provenance per lane: a lane is 'trusted' when its exact membership
+  // also comes out of computeLanes({trustedOnly:true}) — i.e. it would exist
+  // on serialize_globs/depends_on alone, with no heuristic predicted-file
+  // overlap needed. Any other multi-unit lane is 'heuristic'; a size-1 lane
+  // (nothing united it with anything) is 'none'. Mirrors the same key-set
+  // comparison applyRealRunCollapseGuard() uses internally.
+  const previewTrustedLanes = computeLanes(previewUnits, previewServeGlobs, { trustedOnly: true })
+  const previewTrustedKeys = {}
+  previewTrustedLanes.forEach(function (l) {
+    previewTrustedKeys[laneKey(l.unitIndices)] = true
+  })
+  const lanesPreviewOut = previewLanes.map(function (l) {
+    return {
+      issues: l.unitIndices.map(function (i) { return previewUnits[i].issue }),
+      predicted_files: l.predicted_files,
+      provenance: l.unitIndices.length < 2 ? 'none' : (previewTrustedKeys[laneKey(l.unitIndices)] ? 'trusted' : 'heuristic'),
+    }
+  })
+  const predictedUnitCount = previewUnits.filter(function (u) {
+    return (u.predicted_files || []).length > 0 || (u.depends_on || []).length > 0
+  }).length
+  // DF-flagged paths: the same magnet threshold computeLanes() logs internally
+  // (matched by more than half the batch, min 3 units) — computeLanes() only
+  // logs this (advisory, never drops an intersection key), so it's recomputed
+  // here, read-only, purely for dry-run visibility. serialize_globs paths are
+  // excluded, same as computeLanes()'s own DF signal.
+  const previewIsSerializeGlobPath = function (p) { return previewServeGlobs.some(function (g) { return matchesGlobs(p, [g]) }) }
+  const previewDfCount = {}
+  previewUnits.forEach(function (u) {
+    for (const p of (Array.isArray(u.predicted_files) ? u.predicted_files : [])) {
+      if (previewIsSerializeGlobPath(p)) continue
+      previewDfCount[p] = (previewDfCount[p] || 0) + 1
+    }
+  })
+  const dfFlaggedPaths = Object.keys(previewDfCount)
+    .filter(function (p) { return previewDfCount[p] >= 3 && previewDfCount[p] > previewUnits.length / 2 })
+    .map(function (p) { return { path: p, count: previewDfCount[p], batch_size: previewUnits.length } })
+  // ref_possibly_stale: the shared preflight-fetch probe (Select phase, above)
+  // is the only thing predicted_files is grounded against — if it failed,
+  // every predicted_files entry (and therefore every heuristic lane here) may
+  // be resolved against a stale origin/TARGET, not what a real run would fetch.
+  const refPossiblyStale = !targetFetch || targetFetch.status !== 'success'
+
   return {
     state: 'dry_run', root: ROOT, repo: REPO, base_branch: BASE,
     profile: { test_command: TEST_CMD, browser: !!BROWSER, implementers: IMPLEMENTERS, roles: ROLES },
@@ -3503,6 +4053,23 @@ if (DRY_RUN) {
     consolidation_groups: Array.from(consolidationMap.values()).map(function (g) {
       return { group_id: g.groupId, primary: g.primary, members: g.members, subsystem: g.subsystem, rationale: g.rationale, dry_run_preview: !!g.dry_run_preview }
     }),
+    // Lane-scheduling preview (issue #1) — see the block above for how each
+    // field is derived. ref_possibly_stale flags the WHOLE preview (lanes and
+    // df_flagged_paths both depend on predicted_files) rather than annotating
+    // individual paths, since a stale fetch taints every prediction equally.
+    lane_scheduling: {
+      lanes: lanesPreviewOut,
+      lane_count: previewLanes.length,
+      max_lane_size: previewLanes.length ? Math.max.apply(null, previewLanes.map(function (l) { return l.unitIndices.length })) : 0,
+      effective_concurrency: Math.min(CONCURRENCY, previewLanes.length),
+      collapse_ratio: previewGuard.collapseRatio,
+      prediction_coverage: previewUnits.length ? predictedUnitCount / previewUnits.length : 0,
+      df_flagged_paths: dfFlaggedPaths,
+      ref_possibly_stale: refPossiblyStale,
+      ref_possibly_stale_note: refPossiblyStale
+        ? 'preflight-fetch of origin/' + TARGET + ' failed — predicted_files (and every lane/DF signal above) may be grounded against a stale ref'
+        : null,
+    },
     note: 'No changes made. Re-run without dry_run to execute.',
   }
 }
@@ -3584,8 +4151,31 @@ if (groupUnitCount) log('consolidation: ' + groupUnitCount + ' group unit(s) mat
 // explicit guard documents that no marker is ever posted for a preview.
 if (!DRY_RUN) await postConsolidationMarkers(units)
 
+// ---- Process: lane scheduling (issue #1) — group `units` into lanes that must
+// run serially (predicted-file overlap, a serialize_globs pattern hit, or a
+// depends_on edge) instead of racing; computeLanes() itself already guards every
+// heuristic edge (see its module comment: strong edges self-sufficient, weak
+// edges only survive as part of a >=2-distinct-key weak-only chain, trusted edges
+// never touched). serialize_globs is an OPTIONAL profile field, read the same way
+// PROFILE.simplify_globs/test_globs are above — [] when unset, so a profile that
+// never opts in still gets computeLanes()'s depends_on/heuristic unioning off
+// predicted_files alone, on top of today's racing behavior for anything left over.
+const serializeGlobs = PROFILE.serialize_globs || []
+const rawLanes = computeLanes(units, serializeGlobs)
+// applyRealRunCollapseGuard (pure reducer, above the harness split — see its
+// module comment for the full "why") is the run-time-only safety net on top of
+// computeLanes()'s own per-edge guard; a no-op (same array back, dissolvedCount
+// 0) whenever collapse_ratio is healthy or the batch is too small to care.
+const guard = applyRealRunCollapseGuard(units, rawLanes, CONCURRENCY, serializeGlobs)
+const lanes = guard.lanes
+if (guard.dissolvedCount) {
+  log('runPool: real-run collapse guard dissolved ' + guard.dissolvedCount + ' heuristic lane(s) back to racing ' +
+    '(collapse_ratio=' + guard.collapseRatio.toFixed(2) + ' < 0.5 with ' + units.length + ' units >= concurrency ' + CONCURRENCY + ')')
+}
+if (lanes.length < units.length) log('lane scheduling: ' + lanes.length + ' lane(s) for ' + units.length + ' unit(s) — effective concurrency ' + Math.min(CONCURRENCY, lanes.length) + '/' + CONCURRENCY)
+
 // ---- Process: per-issue pipeline with issue-level concurrency + breakers ----
-const results = await runPool(units, CONCURRENCY, processIssue)
+const results = await runPool(units, CONCURRENCY, processIssue, lanes)
 
 const counts = {}
 for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1
@@ -3720,13 +4310,34 @@ const report = await agent([
 ].join('\n'), { label: 'report', phase: 'Report', schema: REPORT_SCHEMA, model: M.report.model, effort: M.report.effort })
 
 // ---- Retrospective (the pipeline improves itself) ----
+// lanePredictions (issue #1, lane scheduling): predicted-vs-actual accuracy
+// input. `units`/`results` are index-aligned (runPool() preserves that — see
+// its module comment), so this zip is safe. Scoped to units that both
+// predicted something AND completed with a real PR to diff actual changed
+// files against — nothing to measure otherwise. Actual changed files require
+// git/gh access the engine JS sandbox doesn't have, so the retro agent (which
+// already has that access for its other steps) resolves each PR's files
+// itself rather than the engine guessing/faking it here.
+const lanePredictions = units
+  .map(function (u, i) { return { unit: u, result: results[i] } })
+  .filter(function (x) {
+    return x.result && x.result.status === 'completed' && x.result.pr &&
+      Array.isArray(x.unit.predicted_files) && x.unit.predicted_files.length > 0
+  })
+  .map(function (x) { return { issue: x.unit.issue, pr: x.result.pr, predicted_files: x.unit.predicted_files } })
+  .slice(0, MAX_LANE_ACCURACY_SAMPLES)
 const retro = await agent([
   'Update the ticketmill process-retrospective memory from this batch run.',
   '',
   'Memory file: ' + LOGS + '/process-retrospective.md (seed with "## Active Learnings",',
-  '"## Deprecated Learnings", "## Run History" sections if missing).',
+  '"## Deprecated Learnings", "## Run History", "## Lane Prediction Accuracy" sections if missing).',
   '',
   'Run data:', resultsJson.slice(0, 20000),
+  '',
+  lanePredictions.length
+    ? ['Lane-scheduling predicted-vs-actual data (issue #1) — one entry per completed unit that had a',
+        'prediction, ' + REPO + ':', JSON.stringify(lanePredictions)].join('\n')
+    : 'Lane-scheduling predicted-vs-actual data (issue #1): none this run (no completed unit had predicted_files).',
   '',
   'Instructions:',
   '1. Read the memory file and its existing learnings.',
@@ -3737,9 +4348,19 @@ const retro = await agent([
   '   flips and cap-outs), and "handoff_notes" (env workarounds agents discovered — prime test_loop learnings).',
   '3. Update the file: add new learnings, deprecate contradicted ones, append one Run History row per issue.',
   '   Enforce caps: 20 active learnings, 10 deprecated, 20 history rows (drop oldest).',
-  'Return learnings_added, learnings_deprecated, summary.',
+  '4. Lane prediction accuracy (issue #1 — SKIP entirely, leave lane_prediction_accuracy empty and add no row,',
+  '   if the predicted-vs-actual data above is "none this run"): for each entry, run',
+  '   gh pr view <pr> --repo ' + REPO + ' --json files --jq \'.files[].path\' (read-only; the PR is already',
+  '   merged, this just lists what it touched) to get that unit\'s actual changed files. Compare against its',
+  '   predicted_files (repo-relative path match). Compute, across ALL entries combined: coverage = (actual files',
+  '   that were predicted) / (total actual files), and precision = (predicted files that were actually changed) /',
+  '   (total predicted files). Append ONE row to "## Lane Prediction Accuracy" (date, issue count, coverage %,',
+  '   precision %, e.g. "2026-07-19 — 4 issues — coverage 78% (7/9) — precision 64% (7/11)"). Cap that section at',
+  '   20 rows (drop oldest). Set lane_prediction_accuracy to that same line.',
+  'Return learnings_added, learnings_deprecated, summary, lane_prediction_accuracy (omit/empty if step 4 was skipped).',
 ].join('\n'), { label: 'retrospective', phase: 'Report', schema: RETRO_SCHEMA, model: M.retro.model })
 if (!retro) log('retrospective agent died (non-fatal)')
+else if (retro.lane_prediction_accuracy) log('lane prediction accuracy: ' + retro.lane_prediction_accuracy)
 
 return {
   state: state,
@@ -3755,6 +4376,7 @@ return {
   results: results,
   report: report ? report.report_path : null,
   summary_table: report ? report.markdown_summary : null,
+  lane_prediction_accuracy: retro ? (retro.lane_prediction_accuracy || null) : null,
   stopped: STOP.tripped ? STOP.reason : null,
   resume_hint: state === 'completed' ? null :
     'Re-run ticketmill with the same args PLUS batch_branch: "' + TARGET + '" (so healing lands on the same integration branch) — the Select-phase preflight skips merged/closed issues, routes open PRs straight to review/merge, and continues partial branches. For exact journal replay use Workflow({scriptPath, resumeFromRunId}).',
