@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.1.17 (2026-07-19)
+
+- Test quality fix (#11): the previous test pass only exercised the pure
+  `aggregateTokens()` helper — the half of #11 that does the actual token
+  attribution, `stage()`'s tokensBefore/tokensAfter instrumentation and the
+  guarded `spentTokens()` wrapper it depends on, had no direct coverage, and
+  `tests/harness.js`'s `makeCtx()` fixture had no `tokens` field, so every
+  existing `stage()`-driving test silently no-opped through the new branch.
+  Added `tests/token-tracking.test.js`: seven tests drive `spentTokens()`
+  directly across all its guard branches (budget missing, `.spent` not a
+  function, `.spent()` throwing, and non-finite/non-numeric returns), and
+  eight more call `context.stage(...)` directly with a scripted, stateful
+  `budget.spent()` to prove the delta math end-to-end — the `Math.max(0, ...)`
+  clamp on a backwards-moving counter, one before/after sample spanning the
+  whole retry loop (not one per attempt), `byModel` accumulation across
+  multiple calls to the same model, the no-model and no-`ctx.tokens` no-ops,
+  and a permanently-throwing `budget.spent()` never affecting `stage()`'s
+  return value. `tests/harness.js`'s `makeCtx()` now defaults `ctx.tokens` to
+  the same zeroed/untracked shape `processIssue()` builds, closing the
+  fixture gap for future stage()-driving tests too.
+
+## 0.1.16 (2026-07-19)
+
+- Fixed `aggregateTokens()` (#11 quality review) so `resultsJson.tokens.run_total`
+  never disagrees with the "## Token Usage" markdown it ships alongside. When
+  `budget.spent()` is unavailable but a stage delta was still tracked,
+  `run_total` used to fall back to the summed deltas — a real number — while
+  the markdown unconditionally said "Run total: not tracked". `run_total` is
+  now `null` in that case too, matching the prose. Added a regression test in
+  `tests/token-usage.test.js`.
+
+## 0.1.15 (2026-07-19)
+
+- Added per-run token tracking (#11). `stage()` samples the runtime's guarded
+  `budget.spent()` before and after each retry loop, attributing the delta to
+  `ctx.tokens.total` and `ctx.tokens.byModel[opts.model]` with no wall-clock
+  dependency and no effect on retry/STOP control flow. A new pure
+  `aggregateTokens(results, spent, concurrency)` helper turns those per-issue
+  deltas into a "## Token Usage" section: at concurrency 1 an
+  "orchestration/unattributed" remainder row makes the table reconcile
+  exactly to the run's `budget.spent()` total; at concurrency above 1 the
+  whole breakdown is labelled approximate, since a single shared monotonic
+  counter can't be split across overlapping concurrent stages. Surfaced in
+  the batch PR body, the run report JSON/markdown, and per-issue PR bodies
+  (subtotal only). Tokens only — no currency or per-token price anywhere, and
+  a missing/unavailable counter renders "not tracked" rather than a false
+  zero. Added `tests/token-usage.test.js` covering both reconciliation modes
+  and the "not tracked" degrade path via the harness.
+
 ## 0.1.14 (2026-07-19)
 
 - Forged `.claude/agents/ticketmill-doc-writer.md` and staffed the profile's

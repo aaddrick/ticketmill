@@ -467,6 +467,25 @@ function tripStop(reason) {
   if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; log('STOP: ' + reason) }
 }
 
+// True only for values safe to do arithmetic on (excludes NaN/Infinity/non-numbers).
+function isFiniteNumber(v) {
+  return typeof v === 'number' && isFinite(v)
+}
+
+// Guarded wrapper over the runtime's budget.spent() (cumulative output tokens
+// for the whole run, monotonic). Never throws; returns a finite Number or null
+// when the runtime hook is unavailable or reports something non-numeric, so
+// callers can render "not tracked" instead of a false zero.
+function spentTokens() {
+  try {
+    if (typeof budget === 'undefined' || !budget || typeof budget.spent !== 'function') return null
+    const v = budget.spent()
+    return isFiniteNumber(v) ? v : null
+  } catch (e) {
+    return null
+  }
+}
+
 // stage(): one agent call with retry, journal-unique prompts, death accounting.
 // Returns the validated object, or null after STAGE_TRIES attempts.
 // Every prompt carries a scope guard: at concurrency N, agents from different
@@ -492,27 +511,48 @@ function scopeGuard(ctx) {
 async function stage(ctx, key, prompt, opts, schema, tries) {
   const n = tries || STAGE_TRIES
   const guarded = scopeGuard(ctx) + '\n\n' + prompt
-  for (let attempt = 1; attempt <= n; attempt++) {
-    if (STOP.tripped) return null
-    const p = attempt === 1 ? guarded : guarded +
-      '\n\n(RETRY attempt ' + attempt + ': a previous attempt failed or died mid-flight. ' +
-      'Re-check current state before acting — work may be partially done. Make every action idempotent.)'
-    let r = null
-    try {
-      r = await agent(p, Object.assign({ label: ctx.issue + ':' + key, phase: 'Issue #' + ctx.issue, schema: schema }, opts))
-    } catch (e) {
-      const msg = String((e && e.message) || e)
-      if (/budget|token target|ceiling/i.test(msg)) { tripStop('token budget exhausted (' + msg + ')'); return null }
-      log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' threw: ' + msg)
+  const tokensBefore = spentTokens()
+  try {
+    for (let attempt = 1; attempt <= n; attempt++) {
+      if (STOP.tripped) return null
+      const p = attempt === 1 ? guarded : guarded +
+        '\n\n(RETRY attempt ' + attempt + ': a previous attempt failed or died mid-flight. ' +
+        'Re-check current state before acting — work may be partially done. Make every action idempotent.)'
+      let r = null
+      try {
+        r = await agent(p, Object.assign({ label: ctx.issue + ':' + key, phase: 'Issue #' + ctx.issue, schema: schema }, opts))
+      } catch (e) {
+        const msg = String((e && e.message) || e)
+        if (/budget|token target|ceiling/i.test(msg)) { tripStop('token budget exhausted (' + msg + ')'); return null }
+        log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' threw: ' + msg)
+      }
+      if (r) { BATCH.consecutiveDeaths = 0; return r }
+      log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' returned null' + (attempt < n ? ' — retrying' : ''))
     }
-    if (r) { BATCH.consecutiveDeaths = 0; return r }
-    log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' returned null' + (attempt < n ? ' — retrying' : ''))
+    BATCH.consecutiveDeaths++
+    if (BATCH.consecutiveDeaths >= MAX_CONSECUTIVE_AGENT_DEATHS) {
+      tripStop(MAX_CONSECUTIVE_AGENT_DEATHS + ' consecutive agent deaths — likely usage limit or API outage. Resume later with the same args (preflight will skip finished work) or resumeFromRunId.')
+    }
+    return null
+  } finally {
+    // Token attribution is instrumentation only — isolated in its own try/catch so
+    // a tracking failure (e.g. budget.spent() misbehaving) can never alter the
+    // STOP/retry/return control flow above. Sampled around the whole retry loop
+    // (not per-attempt) so retries and STOP/budget-exhaust early returns all
+    // accumulate into one delta; opts.model is stable across attempts.
+    try {
+      const tokensAfter = spentTokens()
+      if (isFiniteNumber(tokensBefore) && isFiniteNumber(tokensAfter) && ctx && ctx.tokens) {
+        const delta = Math.max(0, tokensAfter - tokensBefore)
+        ctx.tokens.total += delta
+        const model = opts && opts.model
+        if (model) ctx.tokens.byModel[model] = (ctx.tokens.byModel[model] || 0) + delta
+        ctx.tokens.tracked = true
+      }
+    } catch (e) {
+      // never let tracking failures affect stage() control flow
+    }
   }
-  BATCH.consecutiveDeaths++
-  if (BATCH.consecutiveDeaths >= MAX_CONSECUTIVE_AGENT_DEATHS) {
-    tripStop(MAX_CONSECUTIVE_AGENT_DEATHS + ' consecutive agent deaths — likely usage limit or API outage. Resume later with the same args (preflight will skip finished work) or resumeFromRunId.')
-  }
-  return null
 }
 
 // ----- decision chain -----
@@ -616,6 +656,112 @@ function timeline(ctx) {
   })
 }
 
+// Pure aggregation of per-issue/per-stage token deltas into per-issue and
+// per-model subtotals, plus a finished markdown "## Token Usage" section — all
+// math done here in JS, never delegated to an LLM. Takes no globals; harness-
+// testable in isolation.
+//   results      - the run's per-issue result array. Entries lacking a `.tokens`
+//                  field entirely (skipped/not_started — never got a ctx) or
+//                  carrying `.tokens.tracked === false` (ctx existed but no stage
+//                  ever sampled a usable budget.spent() pair) both render
+//                  "not tracked", never a false zero.
+//   spent        - the guarded, run-wide budget.spent() total (Number or null).
+//   concurrency  - CONCURRENCY. Selects the reconciliation story:
+//     === 1: stage deltas cannot overlap, so they're an exact partition of the
+//       run; an "orchestration/unattributed" remainder row (max(0, spent - sum
+//       of deltas)) is appended so the table sums exactly to `spent`
+//       (reconciles: true).
+//     > 1: multiple issues' stages run side by side against ONE shared
+//       monotonic counter — agent() returns schema content only, never a
+//       per-call usage figure, so there is no way to split budget.spent()'s
+//       movement between concurrent callers. Overlapping stages each see (and
+//       get attributed) the same movement, so deltas over-count and the whole
+//       breakdown is labelled approximate (reconciles: false).
+function aggregateTokens(results, spent, concurrency) {
+  const list = results || []
+  const byIssue = []
+  const byModel = {}
+  let sumDeltas = 0
+  let anyTracked = false
+
+  for (const r of list) {
+    const t = r && r.tokens
+    if (t && t.tracked) {
+      anyTracked = true
+      const total = t.total || 0
+      sumDeltas += total
+      byIssue.push({ issue: r.issue, total: total, byModel: Object.assign({}, t.byModel || {}), tracked: true })
+      const models = t.byModel || {}
+      for (const m in models) {
+        if (Object.prototype.hasOwnProperty.call(models, m)) byModel[m] = (byModel[m] || 0) + models[m]
+      }
+    } else {
+      byIssue.push({ issue: r && r.issue, total: null, byModel: {}, tracked: false })
+    }
+  }
+
+  const hasSpent = isFiniteNumber(spent)
+  // run_total must agree with the markdown's "Run total" line, which only ever
+  // renders the guarded budget.spent() figure or "not tracked" — never a
+  // sumDeltas fallback (see CHANGELOG for the Quality Review finding this fixes).
+  const runTotal = hasSpent ? spent : null
+  const tracked = anyTracked || hasSpent
+  const reconciles = concurrency === 1 && hasSpent && anyTracked
+  const remainder = reconciles ? Math.max(0, spent - sumDeltas) : null
+  const models = Object.keys(byModel).sort()
+
+  const lines = []
+  lines.push('## Token Usage')
+  lines.push('')
+  lines.push(hasSpent
+    ? 'Run total (output tokens, via budget.spent()): **' + spent + '**'
+    : 'Run total: not tracked (budget.spent() unavailable this run)')
+  lines.push('')
+
+  if (!anyTracked) {
+    lines.push('Per-issue / per-model breakdown: not tracked (no stage in this run reported a usable token delta).')
+  } else {
+    if (concurrency > 1) {
+      lines.push('_approximate - overlapping concurrent stages over-count and do NOT reconcile to the run total._')
+      lines.push('(A single shared monotonic counter cannot be split per concurrent call — agent() returns schema ' +
+        'content only, no per-call usage — so simultaneous issues each see the same counter movement.)')
+    } else if (reconciles) {
+      lines.push('_Reconciles exactly to the run total above — the "orchestration/unattributed" row below absorbs ' +
+        'whatever budget.spent() counted that no stage attributed._')
+    } else {
+      lines.push('_approximate — the run total above (budget.spent()) is unavailable this run, so this breakdown ' +
+        'cannot be checked against it._')
+    }
+    lines.push('')
+    const header = ['Issue'].concat(models).concat(['Subtotal'])
+    lines.push('| ' + header.join(' | ') + ' |')
+    lines.push('|' + header.map(function () { return ' --- ' }).join('|') + '|')
+    for (const row of byIssue) {
+      const cells = ['#' + row.issue].concat(models.map(function (m) {
+        return row.tracked ? String(row.byModel[m] || 0) : 'not tracked'
+      }))
+      cells.push(row.tracked ? String(row.total) : 'not tracked')
+      lines.push('| ' + cells.join(' | ') + ' |')
+    }
+    if (reconciles) {
+      const remCells = ['orchestration/unattributed'].concat(models.map(function () { return '' })).concat([String(remainder)])
+      lines.push('| ' + remCells.join(' | ') + ' |')
+    }
+    const totalCells = ['**Total**'].concat(models.map(function (m) { return '**' + byModel[m] + '**' }))
+    totalCells.push('**' + (reconciles ? spent : sumDeltas) + '**')
+    lines.push('| ' + totalCells.join(' | ') + ' |')
+  }
+
+  return {
+    run_total: runTotal,
+    by_issue: byIssue,
+    by_model: byModel,
+    tracked: tracked,
+    reconciles: reconciles,
+    markdown: lines.join('\n'),
+  }
+}
+
 // Best-effort halt note on the issue so humans can triage from GitHub alone.
 async function postNote(ctx, stageKey, status, error) {
   if (STOP.tripped) return
@@ -637,7 +783,7 @@ async function fail(ctx, status, stageKey, error) {
   await postNote(ctx, stageKey, status, error)
   BATCH.failures++
   if (BATCH.failures >= MAX_BATCH_FAILURES) tripStop('circuit breaker: ' + BATCH.failures + ' issues failed')
-  return { issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice() }
+  return { issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice() }
 }
 
 // =============================================================================
@@ -1501,6 +1647,9 @@ async function implementIssue(ctx) {
     '   Title: conventional commit style referencing issue #' + ctx.issue + '.',
     '   Body MUST include "Closes #' + ctx.issue + '", an implementation summary, and key decisions from:',
     decisionChain(ctx),
+    '   Body MUST also include this exact line verbatim (approximate — this issue\'s stages only, not the run',
+    '   total; tokens only, no prices/currency): "Token usage (approximate, this issue only): ' +
+      (ctx.tokens && ctx.tokens.tracked ? ctx.tokens.total + ' output tokens' : 'not tracked') + '"',
     '4. If one exists: ensure it is up to date and comment that a new revision was pushed.',
     'Return status, pr_number, pr_url.',
   ].join('\n'), stageOpts('pr'), PR_SCHEMA)
@@ -1656,7 +1805,7 @@ async function reviewAndMerge(ctx) {
   if (merge.status !== 'merged') return fail(ctx, 'needs_human', 'merge', merge.error || 'merge blocked (' + merge.status + ') — PR #' + ctx.pr + ' left open')
 
   log('#' + ctx.issue + ' merged PR #' + ctx.pr + (merge.follow_up_issues && merge.follow_up_issues.length ? ' (follow-ups: ' + merge.follow_up_issues.join(', ') + ')' : ''))
-  return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, timeline: timeline(ctx), handoff_notes: ctx.notes.slice() }
+  return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice() }
 }
 
 // =============================================================================
@@ -1671,6 +1820,7 @@ async function processIssue(pre) {
     unresolved: [], // critical/major findings carried past a contrarian iteration cap
     approach: '',   // evaluate's approach one-liner, threaded into fix/test prompts
     metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0 },
+    tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
   }
   if (pre.resume_point === 'skip') {
     log('#' + ctx.issue + ' skipped: ' + pre.reason)
@@ -2008,6 +2158,9 @@ if (HELD_CLAIMS.length) {
   if (!swept || !swept.posted) log('claims-release sweep incomplete — stale "' + CLAIM_LABEL + '" labels expire via the ' + Math.round(CLAIM_STALE_SECONDS / 3600) + 'h staleness window')
 }
 
+// ---- Token usage: JS-computed aggregation (no LLM math), injected verbatim below ----
+const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY)
+
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
 const completedIssues = results.filter(function (r) { return r && r.status === 'completed' })
@@ -2028,6 +2181,8 @@ if (completedIssues.length) {
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
     '   - a note that per-issue PRs were squash-merged into ' + TARGET + ' with full review trails on each issue.',
+    '   - this "## Token Usage" section, injected VERBATIM (already computed in JS — do not recompute, re-sum,',
+    '     or add commentary beyond copying it in):\n' + TOKEN_AGG.markdown,
     '3. If one exists: update its body to the current results (gh pr edit) and comment that the run refreshed it.',
     'Return status, pr_number, pr_url.',
   ].join('\n'), { label: 'batch-pr', phase: 'Report', schema: PR_SCHEMA, model: M.pr.model, effort: M.pr.effort })
@@ -2039,7 +2194,12 @@ if (completedIssues.length) {
 }
 
 // ---- Report ----
-const resultsJson = JSON.stringify({ state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts, verification_gaps: VERIFY_SKIPS, tokens_spent: budget.spent(), results: results }, null, 2)
+const resultsJson = JSON.stringify({
+  state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts,
+  verification_gaps: VERIFY_SKIPS, tokens_spent: budget.spent(),
+  tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
+  results: results,
+}, null, 2)
 const report = await agent([
   'Write the ticketmill run report.',
   '',
@@ -2050,7 +2210,9 @@ const report = await agent([
   '   from each result\'s "timeline" field (gates, verdicts, iterations), a "Verification Gaps" section if',
   '   verification_gaps is non-empty, a failures section with halt stages, and — if state is not "completed" —',
   '   a "Resume" section: re-run ticketmill with the same args (preflight skips finished work) or resume via',
-  '   resumeFromRunId.',
+  '   resumeFromRunId. Include this "## Token Usage" section VERBATIM (already computed in JS — do not',
+  '   recompute, re-sum, or add commentary beyond copying it in):',
+  TOKEN_AGG.markdown,
   '4. Include the current timestamp from: date -Iseconds',
   RUN_TAG === 'run' ? '5. The tag "run" is a collision-prone default: substitute the current date (date +%F) for "run" in BOTH filenames so successive runs do not overwrite each other, and return the actual path.' : '',
   '',

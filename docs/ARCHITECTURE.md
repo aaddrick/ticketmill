@@ -159,6 +159,35 @@ to opus at high effort; workhorse implementation and reviews run sonnet;
 mechanical probes and the test runner are haiku at low effort. Override any stage
 via `profile.models`.
 
+### Token tracking: instrumentation, never a gate
+
+`stage()` samples the runtime's `budget.spent()` (cumulative output tokens for
+the whole run) before and after each retry loop, attributing the delta to
+`ctx.tokens.total` and `ctx.tokens.byModel[opts.model]`. That sampling sits in
+its own `try/finally` wrapped around the existing retry loop. A tracking
+failure, whether `budget.spent()` throws or the runtime hook is missing
+outright, can never change `stage()`'s retry, STOP, or return behavior. This
+is instrumentation, not a gate: a run with no working counter still ships,
+just with "not tracked" standing in for the numbers instead of a false zero.
+
+`aggregateTokens(results, spent, concurrency)` turns those per-issue deltas
+into a "## Token Usage" section in plain JS. The pipeline injects the finished
+markdown into the batch PR and run report prompts verbatim, so no subagent is
+ever asked to sum or double-check the arithmetic. At concurrency 1, stage
+deltas can't overlap, so they're an exact partition of the run: an
+"orchestration/unattributed" remainder row (`spent` minus the summed deltas)
+makes the table reconcile exactly to the run total. Above concurrency 1,
+several issues' stages run against the same shared monotonic counter, and
+`agent()` returns schema content only, never a per-call usage figure. There is
+no way to split a shared counter's movement across concurrent callers, so the
+whole breakdown is labeled approximate rather than claiming a precision it
+doesn't have. Per-issue PR bodies get one line of the same figures (that
+issue's stages only, not the run total).
+
+Tokens only, never dollars: price varies by model and shifts over time, so no
+currency figure appears anywhere in the engine, profile, or output. The
+per-model-tier breakdown is what lets a human run that math outside the tool.
+
 ### Claims interop
 
 Ticketmill honors fresh claims left by its ancestor engine ("## Batch Processing
