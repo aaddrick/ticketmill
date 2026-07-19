@@ -147,8 +147,10 @@ test('proposeConsolidation: a group that never clears the contrarian bar DISSOLV
   assert.strictEqual(dissolveNoteCalls.length, 1) // the dissolve is announced exactly once
 
   // Members fall through to ordinary independent-issue singletons downstream.
-  const preflights = candidates.map(function (c) { return Object.assign({}, c) })
-  const units = context.deriveUnits(context.reconcileGroups(map, preflights), preflights)
+  // (reconcileGroups/deriveUnits are pure — they never mutate the preflights
+  // they're given, so candidates can be reused directly, same as the
+  // no-overlap test above.)
+  const units = context.deriveUnits(context.reconcileGroups(map, candidates), candidates)
   assert.strictEqual(units.length, 3)
   units.forEach(function (u) { assert.strictEqual(u.groupId, null) })
 })
