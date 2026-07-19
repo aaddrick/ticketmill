@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.11 (2026-07-19)
+
+- Added `tests/setup-worktree.test.sh`, a self-contained plain-bash suite for
+  `scripts/setup-worktree.sh` (no bats, no global installs). Each of its five
+  cases builds a fresh scratch git repo plus an offline local bare `origin`
+  seeded with the base branch, and stubs `gh` on `PATH` so the script runs
+  with no network and no `gh` auth: fresh branch/worktree creation with valid
+  JSON stdout, idempotent reuse of an `issue-<N>-*` branch even when the
+  upstream title changes (a pre-planted sentinel file proves the worktree
+  isn't destroyed), stale-worktree replacement when the checked-out branch
+  doesn't match the prefix, a missing-args usage error, and an unfetchable
+  base-branch error — the last two assert a non-zero exit plus the JSON error
+  shape. Also runs `shellcheck` on the script when available.
+- Fixed a real contract bug the new suite caught: `git branch <name>
+  origin/<base>` in `scripts/setup-worktree.sh` was unredirected and leaked a
+  "set up to track ..." line onto stdout on every fresh-branch path,
+  corrupting the JSON-on-stdout contract the engine parses. Redirected it to
+  match the adjacent `worktree add` call.
+- Wired `&& bash tests/setup-worktree.test.sh` onto the profile's
+  `test_command` in `.claude/ticketmill.json`, appended after the existing
+  `node --test` entry — a `.test.sh` file is invisible to `node --test`'s
+  `tests/*.test.js` discovery, so both suites run and neither shadows the
+  other.
+
 ## 0.1.10 (2026-07-19)
 
 - Wired `node --test` into the profile's `test_command`, after the existing

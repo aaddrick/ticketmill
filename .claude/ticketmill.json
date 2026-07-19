@@ -1,6 +1,6 @@
 {
   "repo": "aaddrick/ticketmill",
-  "test_command": "node --check workflows/ticketmill.js && bash -n scripts/setup-worktree.sh && node -e \"['.claude-plugin/plugin.json','.claude-plugin/marketplace.json'].forEach(f=>JSON.parse(require('fs').readFileSync(f,'utf8')))\" && node --test",
+  "test_command": "node --check workflows/ticketmill.js && bash -n scripts/setup-worktree.sh && node -e \"['.claude-plugin/plugin.json','.claude-plugin/marketplace.json'].forEach(f=>JSON.parse(require('fs').readFileSync(f,'utf8')))\" && node --test && bash tests/setup-worktree.test.sh",
   "test_globs": ["workflows/**", "scripts/**", ".claude-plugin/**", "tests/**"],
   "install_commands": [],
   "env_files": [],
