@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.21 (2026-07-19)
+
+- Engine-owned path guardrail, foundation (#3, task 1 of 4): added
+  `ENGINE_OWNED_GLOBS` (`.claude/ticketmill.json`, `.claude/agents/**`,
+  `.claude/workflows/ticketmill.js`, `.claude/scripts/ticketmill/**`) — paths
+  a run must treat as read-only, extensible via a new optional
+  `profile.engine_owned_globs` (`mergeEngineOwnedGlobs`). Added a new optional
+  `profile.lockstep_installed_paths` (default `[]`) naming engine-owned paths
+  that are a deliberate installed copy of a source-of-truth file elsewhere in
+  the repo; this repo sets `[".claude/workflows/ticketmill.js"]`. Three pure
+  helpers, unit-tested via `tests/engine-owned.test.js`:
+  `engineOwnedHit(text, globs)` (case-sensitive substring hit against a
+  literalized prefix, for detecting when an issue's prose plainly targets an
+  engine-owned path), `buildEngineOwnedPathspec(globs)` (the same
+  literalization built into a `git ... --` pathspec), and
+  `isHardRevertPath(file, engineGlobs, lockstepPaths)` (file-level predicate
+  built on the existing `matchesGlobs`, not a glob-string set difference, so a
+  lockstep path nested under a directory glob is correctly exempted). Neither
+  helper is wired into a gate yet — that's tasks 2 (select-phase skip) and 3
+  (post-implement hard-revert) of #3.
+
 ## 0.1.20 (2026-07-19)
 
 - Test quality fix for the merge auto-resolve harness coverage (#2): closed a

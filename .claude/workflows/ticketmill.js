@@ -48,6 +48,18 @@ export const meta = {
 //     "logs_dir": "logs/ticketmill",
 //     "claim_label": "ticketmill",
 //     "verify_notes": ["tests need the pgvector container: podman start ncl_test"],
+//     "engine_owned_globs": [],          // extends the built-in engine-owned set
+//                                        // (.claude/ticketmill.json, .claude/agents/**,
+//                                        // .claude/workflows/ticketmill.js,
+//                                        // .claude/scripts/ticketmill/**) — read-only
+//                                        // during a run; see ENGINE_OWNED_GLOBS.
+//     "lockstep_installed_paths": [],    // engine-owned paths that are a deliberate
+//                                        // installed copy of a source-of-truth file
+//                                        // elsewhere in THIS repo, kept in lockstep by
+//                                        // its own tooling — exempted from the
+//                                        // post-implement hard-revert gate; see
+//                                        // isHardRevertPath. This repo sets
+//                                        // [".claude/workflows/ticketmill.js"].
 //     "browser": null,                   // OPT-IN browser verification:
 //     // { "serve_command": "php artisan serve --port={port}", "build_command": null,
 //     //   "ui_globs": ["resources/views/**"], "port_base": 8100, "notes": "..." }
@@ -243,6 +255,12 @@ let LOGS = null                 // ROOT + '/' + profile.logs_dir
 let CLAIM_LABEL = 'ticketmill'
 let BROWSER = null              // profile.browser or null
 let VERIFY_SKIPS = []           // human-visible verification gaps -> batch PR body
+// ENGINE_OWNED / LOCKSTEP_INSTALLED_PATHS (issue #3): populated at Select from
+// ENGINE_OWNED_GLOBS (~line 1244, declared after this point — assigned via
+// mergeEngineOwnedGlobs, not referenced eagerly here) merged with
+// PROFILE.engine_owned_globs, and PROFILE.lockstep_installed_paths respectively.
+let ENGINE_OWNED = []
+let LOCKSTEP_INSTALLED_PATHS = []
 
 function stageOpts(key) {
   const base = M[key] || { model: 'sonnet' }
@@ -284,7 +302,19 @@ const BOOT_SCHEMA = {
 }
 const PROFILE_SCHEMA = {
   type: 'object', required: ['found'],
-  properties: { found: { type: 'boolean' }, raw: { type: 'string' } },
+  // found/raw describe the probe's own response shape (does the profile file
+  // exist, and its raw text). engine_owned_globs/lockstep_installed_paths
+  // document — for readers of this schema — the two optional array fields
+  // issue #3 added to the parsed .claude/ticketmill.json profile itself (read
+  // via PROFILE.engine_owned_globs / PROFILE.lockstep_installed_paths at
+  // Select, see mergeEngineOwnedGlobs); they are not part of the probe
+  // response and additionalProperties is unset, so listing them here is
+  // documentation only, not enforcement.
+  properties: {
+    found: { type: 'boolean' }, raw: { type: 'string' },
+    engine_owned_globs: { type: 'array', items: { type: 'string' } },
+    lockstep_installed_paths: { type: 'array', items: { type: 'string' } },
+  },
 }
 const AGENTS_SCHEMA = {
   type: 'object', required: ['agents'],
@@ -1240,6 +1270,92 @@ function matchesGlobs(file, globs) {
   if (!Array.isArray(globs)) return true // null/absent = match everything
   for (const g of globs) { if (globToRe(g).test(String(file))) return true }
   return false
+}
+
+// =============================================================================
+// ENGINE-OWNED PATHS (issue #3): the ticketmill profile, agent roster, and the
+// engine's own installed copy are read-only artifacts of THIS run's tooling —
+// not the target repo's application code. A worktree's committed state of
+// these paths can be stale relative to the root working tree driving the run
+// (nonconvexlabs-com #77): an implementer that "reconciles" a stale diff here
+// silently clobbers newer state that exists only uncommitted at ROOT.
+// ENGINE_OWNED_GLOBS is the default set; a profile may extend it via
+// PROFILE.engine_owned_globs (mergeEngineOwnedGlobs). Some engine-owned paths
+// are legitimately installed/lockstepped alongside a source-of-truth copy
+// elsewhere in the repo (this repo's own .claude/workflows/ticketmill.js,
+// kept byte-identical to workflows/ticketmill.js by scripts/lint-engine.js) —
+// PROFILE.lockstep_installed_paths (default []) names those so a hard-revert
+// gate can exempt them (isHardRevertPath).
+// =============================================================================
+const ENGINE_OWNED_GLOBS = [
+  '.claude/ticketmill.json',
+  '.claude/agents/**',
+  '.claude/workflows/ticketmill.js',
+  '.claude/scripts/ticketmill/**',
+]
+
+// mergeEngineOwnedGlobs: the module default plus an optional profile
+// extension (PROFILE.engine_owned_globs). Pure so tests can exercise it
+// without seeding module state.
+function mergeEngineOwnedGlobs(profile) {
+  const extra = profile && Array.isArray(profile.engine_owned_globs) ? profile.engine_owned_globs.map(String) : []
+  return ENGINE_OWNED_GLOBS.concat(extra)
+}
+
+// literalizeGlob: strips a trailing run of '*' characters (covers '/**',
+// '/*', and a bare trailing '*' uniformly) down to the fixed prefix before
+// it, e.g. '.claude/agents/**' -> '.claude/agents/'. An exact-file glob with
+// no trailing star (e.g. '.claude/ticketmill.json') is returned unchanged.
+// Shared by engineOwnedHit's prose substring match and
+// buildEngineOwnedPathspec's git pathspec.
+function literalizeGlob(g) {
+  return String(g).replace(/\*+$/, '')
+}
+
+// engineOwnedHit: case-sensitive substring scan of free text (an issue title
+// + body) for any literalized engine-owned prefix. Returns the literalized
+// prefix that hit (a truthy string a caller can name in a reason/log line),
+// or null when nothing matched. Deliberately dumb — substring, not path
+// parsing — because the callers need a cheap, deterministic proxy for "does
+// this issue's prose plainly target an engine-owned path", not a parser.
+function engineOwnedHit(text, globs) {
+  const s = String(text || '')
+  const list = Array.isArray(globs) ? globs : []
+  for (const g of list) {
+    const prefix = literalizeGlob(g)
+    if (prefix && s.indexOf(prefix) !== -1) return prefix
+  }
+  return null
+}
+
+// buildEngineOwnedPathspec: the same literalization as engineOwnedHit,
+// applied to build a `git ... -- <pathspec>` argument list. Trailing '*'
+// characters are already stripped, so every entry is a plain literal path
+// git can match directly — a directory prefix (e.g. '.claude/agents/')
+// matches everything under it, an exact file path matches only itself; no
+// pathspec magic (':(literal)' etc) is needed since no glob metacharacters
+// remain. Deduplicates in case a profile's engine_owned_globs re-lists a
+// default entry.
+function buildEngineOwnedPathspec(globs) {
+  const list = Array.isArray(globs) ? globs : []
+  const out = []
+  for (const g of list) {
+    const p = literalizeGlob(g)
+    if (p && out.indexOf(p) === -1) out.push(p)
+  }
+  return out
+}
+
+// isHardRevertPath: file-level predicate for the post-implement hard-revert
+// gate — true when `file` falls under the engine-owned set AND is NOT one of
+// the profile's lockstep-installed exceptions. Built on matchesGlobs (full
+// glob matching, file-match time) rather than a glob-STRING set difference:
+// a glob-string diff can't express "this lockstep file sits nested under
+// that engine-owned directory glob" (e.g. '.claude/agents/pinned.md' vs
+// '.claude/agents/**') — matching at the file level gets nesting right
+// without special-casing it.
+function isHardRevertPath(file, engineGlobs, lockstepPaths) {
+  return matchesGlobs(file, engineGlobs) && !matchesGlobs(file, lockstepPaths)
 }
 
 async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
@@ -2954,6 +3070,8 @@ function __seed(o) {
   if ('TARGET' in o) TARGET = o.TARGET
   if ('REPO' in o) REPO = o.REPO
   if ('ROOT' in o) ROOT = o.ROOT
+  if ('ENGINE_OWNED' in o) ENGINE_OWNED = o.ENGINE_OWNED
+  if ('LOCKSTEP_INSTALLED_PATHS' in o) LOCKSTEP_INSTALLED_PATHS = o.LOCKSTEP_INSTALLED_PATHS
 }
 
 // ---- TICKETMILL-TEST-HARNESS-SPLIT: tests/harness.js truncates the source at this
@@ -2999,6 +3117,8 @@ LOGS = ROOT + '/' + String(PROFILE.logs_dir || 'logs/ticketmill').replace(/^\/+|
 CLAIM_LABEL = String(PROFILE.claim_label || 'ticketmill')
 BROWSER = PROFILE.browser || null
 if (BROWSER && !BROWSER.serve_command) throw new Error('profile.browser is set but has no serve_command — browser verification cannot boot the app')
+ENGINE_OWNED = mergeEngineOwnedGlobs(PROFILE)
+LOCKSTEP_INSTALLED_PATHS = Array.isArray(PROFILE.lockstep_installed_paths) ? PROFILE.lockstep_installed_paths.map(String) : []
 
 // ---- Select: resolve roles against the target repo's agent roster ----
 const R = PROFILE.roles || {}
