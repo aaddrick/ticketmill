@@ -194,6 +194,57 @@ Ticketmill honors fresh claims left by its ancestor engine ("## Batch Processing
 Claimed" comments) as foreign claims, one-way, so both can coexist on a repo
 during a migration without double-processing issues.
 
+### Consolidation gate: grouping issues cheaper to resolve as one unit
+
+Select can propose folding several selected issues into ONE worktree, branch,
+research/plan pass, and PR when they share a subsystem and acceptance surface
+(or an explicit dependency) closely enough that solving them separately would
+duplicate work. This is a judgment call, not a heuristic: `proposeConsolidation()`
+is an opus-tier gate, prompted with a deliberately conservative bar — grouping
+is the exception, and shared files alone are never sufficient reason, only a
+hint. The proposal then runs the same capped contrarian challenge pattern as
+the approach/plan gates before it can take effect, reusing `CHALLENGE_SCHEMA`
+and the settled-decisions ledger.
+
+Everywhere else, the engine layers a group on top of the existing per-issue
+path rather than replacing it: a unit is a singleton (`ctx.members = [ctx.issue]`,
+the original code path verbatim) or a group (`ctx.members.length > 1`), so a
+no-overlap run with zero proposed groups is byte-for-byte identical to the
+engine before this gate existed. Grouping tags plan tasks by originating issue
+(no synthesized merged-issue text); one primary issue carries the comment
+trail while absorbed members get a "consolidated into #X" marker comment; the
+group PR carries one `Closes #N` per member.
+
+**Stable group id, not the mutable primary.** A group's physical identity
+(worktree path, branch name, PR head) is bound to a `stableGroupId()` — the
+lowest issue number ever in the group — rather than to whichever issue is
+currently "primary." The two need to differ: claims settle after the proposal
+is judged, so a proposed primary can turn out to be already claimed or to flip
+to `skip` before materialization, forcing a re-anchor onto another live
+member. If the physical identity had been hard-bound to the primary, re-anchoring
+would mean silently moving a worktree/branch/PR that another process might
+already be looking at. Binding identity to a stable id instead makes re-anchor
+just a bookkeeping update: the same worktree and branch persist across a
+primary change, and a resumed run's marker heal recognizes the group by that
+id even after a re-anchor.
+
+**Cap-dissolves, not proceed-with-caveats.** The approach and plan contrarian
+gates proceed with unresolved caveats when the iteration cap is hit, because a
+single issue still has to go somewhere. A consolidation proposal has a safe
+fallback the others don't: independent per-issue processing, which is exactly
+what the engine already does everywhere else. So hitting `MAX_CONTRARIAN_ITERATIONS`
+on a group challenge, or a dead challenger/reviser mid-loop, DISSOLVES the
+group back to its independent member issues instead of shipping a
+still-contested grouping decision. Conservatism costs nothing here: dissolving
+only forgoes an efficiency, it never blocks progress.
+
+**Profile flag.** `profile.consolidation` (boolean, default `true`) disables
+the gate entirely when set to `false` — no proposal, no contrarian challenge,
+though a resumed run still heals any group a prior run already committed to
+via its comment markers, so turning the flag off mid-run can't strand a group
+that already exists on GitHub. Single-issue runs and runs with at most one
+`implement`-bound candidate skip the gate for free (there is nothing to group).
+
 ## Failure semantics
 
 - Stage dies twice -> the issue fails/halts at that stage with an issue comment
@@ -204,3 +255,10 @@ during a migration without double-processing issues.
   the issue: that rate signals a systemic problem, not flakiness.
 - Reviewer death at the PR gate -> `needs_human`, PR left open; reviewer death at
   the task gate -> provisional accept, flagged for extra PR-gate scrutiny.
+- A failed consolidation group -> ONE circuit-breaker increment, not one per
+  member (`fail()` runs exactly once per unit); every member issue's claim is
+  released; each member gets its own resume comment naming the group and the
+  failing stage, so any one member's trail is enough to understand the whole
+  unit halted together. On resume, preflight healing recognizes the group from
+  that comment's marker and re-proposes the SAME group rather than reprocessing
+  its members as independent issues.

@@ -260,6 +260,7 @@ load-bearing fields:
 | `simplify_globs`, `docblock_globs`, `docs_dir` | Gate the simplify, docblock, and tech-docs stages; `null` skips |
 | `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes) |
 | `models` | Per-stage model/effort overrides |
+| `consolidation` | Default `true`. Set `false` to disable the Select-phase consolidation gate entirely (a resumed run still heals any group a prior run already committed to) |
 
 ## Repo layout
 
