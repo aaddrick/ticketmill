@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.7 (2026-07-18)
+
+- README: new Follow-up issues section on the one place the engine files new
+  issues (successful merges), what feeds them, and how they are labeled and
+  deduplicated.
+- ARCHITECTURE: rebuilt the pipeline diagram. Quoted labels with `<br/>` breaks
+  instead of `\n` (fixes clipped boxes), phase rows stacked left-to-right
+  instead of one tall chain, explicit challenge/fix loop edges with caps, and a
+  dashed learnings edge into the next run. Render-checked in a browser.
+
 ## 0.1.6 (2026-07-18)
 
 - README: added an Author section above the license, with GitHub and LinkedIn

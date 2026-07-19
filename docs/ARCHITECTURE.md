@@ -8,41 +8,54 @@ plain JavaScript; every unit of actual work is a schema-validated subagent call.
 
 ```mermaid
 flowchart TD
-    subgraph Select
-        P[Load profile\n.claude/ticketmill.json] --> D[Resolve roles vs\n.claude/agents roster]
-        D --> B[Create batch branch\nBatch_ts from BASE]
-        B --> I[Resolve issue list\nnumbers or labels]
-        I --> F[Preflight probe per issue\nskip / process_pr / implement]
-        F --> C[Claim all selected issues\nlabel + comment, advisory]
+    subgraph SEL["Select"]
+        direction LR
+        P["Load profile<br/>.claude/ticketmill.json"] --> D["Resolve roles vs<br/>.claude/agents roster"] --> B["Create batch branch<br/>Batch_ts from BASE"] --> I["Resolve issue list<br/>numbers or labels"] --> F["Preflight probe<br/>skip / review / implement"] --> C["Claim issues<br/>label + comment, advisory"]
     end
 
-    C --> Pool[Worker pool, concurrency 1-5]
+    SEL --> POOL["Worker pool<br/>concurrency 1-5<br/>circuit breakers"]
+    POOL --> PLAN
 
-    subgraph PerIssue[Per issue]
-        S[Setup worktree +\ninstall_commands + env_files] --> R[Research]
-        R --> E[Evaluate approach]
-        E <-->|challenge / revise, capped| CA[Contrarian: approach]
-        CA --> PL[Plan tasks]
-        PL <-->|challenge / revise, capped| CP[Contrarian: plan]
-        CP --> T[Per task: implement ->\nreview -> fix loop -> quality loop]
-        T --> TL[Test loop: run -> fix ->\nvalidate -> fix, halts on error]
-        TL --> BW[Browser verification\nopt-in, serial, locked]
-        BW --> DB[Docblocks, gated]
-        DB --> PR[PR into batch branch]
-        PR --> RV[Spec + code review\nin parallel, fix loop]
-        RV --> BW2[Browser re-check\npre-merge]
-        BW2 --> TD[Tech docs, gated]
-        TD --> MG[Squash-merge into batch branch\n+ follow-up issues]
+    subgraph PLAN["Per issue: plan"]
+        direction LR
+        S["Setup worktree<br/>installs + env files"] --> R["Research"] --> E["Evaluate<br/>approach"]
+        E -->|proposal| CA["Contrarian<br/>approach gate"]
+        CA -->|"challenge, capped"| E
+        CA -->|approved| PL["Plan tasks"]
+        PL -->|plan| CP["Contrarian<br/>plan gate"]
+        CP -->|"challenge, capped"| PL
     end
 
-    Pool --> PerIssue
-    MG --> Rep
+    PLAN --> BUILD
 
-    subgraph Rep[Report]
-        RL[Release held claims] --> BP[Batch PR: Batch_ts -> BASE\nnever auto-merged\nwith Verification Gaps section]
-        BP --> RO[Run report JSON + markdown]
-        RO --> RT[Retrospective: update\nprocess-retrospective.md]
+    subgraph BUILD["Per issue: build"]
+        direction LR
+        IM["Implement<br/>task"] --> TR["Task review"]
+        TR -->|"findings, capped"| IM
+        TR -->|pass| QL["Quality loop<br/>simplify pass"]
+        QL -->|"next task"| IM
+        QL -->|"all tasks done"| TL["Test loop<br/>run + validate, halts on error"]
+        TL -->|fix| TL
+        TL --> BW["Browser verify<br/>opt-in, locked"]
     end
+
+    BUILD --> SHIP
+
+    subgraph SHIP["Per issue: ship"]
+        direction LR
+        DB["Docblocks<br/>gated"] --> PR["PR into<br/>batch branch"] --> RV["Spec + code review<br/>in parallel"]
+        RV -->|"fix findings, capped"| RV
+        RV -->|approved| BW2["Browser<br/>re-check"] --> TDOC["Tech docs<br/>gated"] --> MG["Squash-merge<br/>+ follow-up issues"]
+    end
+
+    SHIP --> REP
+
+    subgraph REP["Report"]
+        direction LR
+        RL["Release<br/>held claims"] --> BP["Batch PR to BASE<br/>never auto-merged<br/>Verification Gaps"] --> RO["Run report<br/>JSON + markdown"] --> RT["Retrospective<br/>process-retrospective.md"]
+    end
+
+    REP -.->|"learnings feed the next run"| NEXT(("next run"))
 ```
 
 ## Design decisions

@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ticketmill",
   "displayName": "Ticketmill",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Batch-process GitHub issues end-to-end: contrarian-gated planning, per-task implementation with quality loops, test loops, PR review, and squash-merge into a human-reviewed batch PR. Discovers and uses the target project's own agents.",
   "author": {
     "name": "aaddrick",

@@ -141,6 +141,26 @@ The run narrates itself in the places you already look:
 - **Live.** While a run is going, `/workflows` in Claude Code shows the progress
   tree: which issues are in flight and which stage each one is in.
 
+## Follow-up issues
+
+Besides comments and labels, the engine writes one more thing to your tracker:
+at each successful squash-merge, it files new issues for work the run saw and
+deliberately did not do.
+
+- Two sources feed them. The merge stage scans the PR and issue trails for
+  deferred-work phrases ("follow-up", "out of scope but", "technical debt",
+  "future improvement", "consider adding"). It also drains a ledger the
+  pipeline carries: reviewer suggestions that passed review without being
+  required, tasks that failed review and were left incomplete, and reviews
+  skipped because a reviewer died.
+- Each distinct actionable item becomes one issue that references the source PR
+  and issue, labeled bug, enhancement, or tech-debt. The merge agent checks for
+  existing duplicates first, so a resumed run does not re-file.
+- Only merged issues file follow-ups. A failed or halted issue gets a halt
+  comment instead, and the deferred work stays visible in its trail.
+- Created issue numbers come back in the per-issue results, so the run report
+  lists what got filed.
+
 ## Overlapping batches
 
 Two maintainers can start batches on different machines with overlapping issue
