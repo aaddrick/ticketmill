@@ -137,6 +137,28 @@ test('computeLanes: two independent single-path edges combining into one lane wi
   assert.deepStrictEqual(Array.from(lanes[0].unitIndices), [0, 1, 2])
 })
 
+test('computeLanes: a magnet-only rider touching one member of a genuine 2-path cluster does NOT ride along into that cluster\'s lane (scoped cohesion, not whole-component)', function () {
+  const context = bootLanes()
+  // 0 and 1 share only magnet.php with 2 and each other (single-path, weak) — 2
+  // also shares impl.js + impl.test.js with 3 (a genuine 2-path cluster). The
+  // whole trial component {0,1,2,3} would wrongly read as cohesive (3 distinct
+  // paths in aggregate) if cohesion were computed over the whole component
+  // instead of per weak-edge-only chain: units 0 and 1 must stay singleton
+  // (race) while 2 and 3 serialize on their own genuine overlap.
+  const units = [
+    unit(1, ['magnet.php']),
+    unit(2, ['magnet.php']),
+    unit(3, ['magnet.php', 'impl.js', 'impl.test.js']),
+    unit(4, ['impl.js', 'impl.test.js'])
+  ]
+  const lanes = context.computeLanes(units, [])
+  assert.strictEqual(lanes.length, 3, 'expected {0},{1},{2,3} — not one merged lane of all four')
+  const sizes = Array.from(lanes).map(function (l) { return l.unitIndices.length }).sort()
+  assert.deepStrictEqual(sizes, [1, 1, 2])
+  const merged = lanes.find(function (l) { return l.unitIndices.length === 2 })
+  assert.deepStrictEqual(Array.from(merged.unitIndices), [2, 3], 'the genuine 2-path cluster (units 3,4) must be the one that survives')
+})
+
 // ---- basename fallback ----
 
 test('computeLanes: a shared basename with no full-path overlap forms a heuristic edge, but is dissolved absent reinforcing full-path cohesion', function () {

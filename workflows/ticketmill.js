@@ -821,17 +821,23 @@ function deriveUnits(reconciledMap, livePreflights) {
 //     directories).
 //
 // Cohesion-aware collapse guard (NOT size-keyed — a lane's fate never depends on
-// how many units or edges it has, only on overlap structure): heuristic edges are
-// trial-unioned on top of the trusted graph to see what lane they would form; a
-// resulting lane is kept for real only if its units co-predict (i.e. >=2 distinct
-// units carry the exact same normalized path) at least 2 distinct full paths.
-// A lane that reduces to exactly one (or zero) co-predicted path is a single-path
-// promiscuous connector — the shape a magnet file produces (many otherwise
-// unrelated units all touching one popular path) — and is dissolved back to
-// trusted-only, i.e. those units race instead of serializing. A lane sharing >=2
-// paths (e.g. an implementation file plus its test) is a genuine cluster and is
-// kept intact even if it spans most of the batch. Trusted edges are never
-// touched by this guard.
+// how many units or edges it has, only on overlap structure): every heuristic
+// edge is graded by what the SPECIFIC PAIR it connects directly co-predicts —
+// STRONG (that pair alone shares >=2 distinct paths/basenames — e.g. an
+// implementation file plus its test) is self-sufficient and always survives.
+// WEAK (that pair shares exactly one) only survives as part of a WEAK-EDGE-ONLY
+// chain whose edges collectively touch >=2 DISTINCT keys, counted strictly from
+// the weak edges' own shared keys — never inherited from a neighboring strong
+// cluster's unrelated paths. That scoping is what stops a single popular path
+// (a magnet) from dragging a unit that touches only it into a lane that is
+// cohesive for entirely unrelated reasons: a unit sharing only a magnet path
+// with one member of a genuine 2-path cluster must not serialize with the whole
+// cluster just because that cluster happens to pass the >=2 bar on its own.
+// A weak chain that never reaches 2 distinct keys is a single-path promiscuous
+// connector — the shape a magnet file produces (many otherwise unrelated units
+// all touching one popular path) — and dissolves back to trusted-only, i.e.
+// those units race instead of serializing. Trusted edges are never touched by
+// this guard.
 //
 // DF (document-frequency) signal: advisory/metric-only, logged when a predicted
 // path is matched by more than half the batch (min 3 units) — surfaced for human
@@ -911,46 +917,38 @@ function computeLanes(units, serializeGlobs) {
     for (let j = i + 1; j < n; j++) {
       let shared = Object.keys(predictedSets[i]).filter(function (p) { return predictedSets[j][p] })
       if (!shared.length) shared = Object.keys(basenameSets[i]).filter(function (b) { return basenameSets[j][b] })
-      if (shared.length) heuristicEdges.push({ i: i, j: j })
+      if (shared.length) heuristicEdges.push({ i: i, j: j, shared: shared })
     }
   }
 
-  // ---- cohesion-aware collapse guard ----
-  const trial = parent.slice()
-  for (const e of heuristicEdges) union(trial, e.i, e.j)
+  // ---- cohesion-aware collapse guard: strong edges are self-sufficient; weak
+  // edges only survive as a weak-only chain that reaches 2 distinct keys on its
+  // own (see docstring above) ----
+  const strongEdges = heuristicEdges.filter(function (e) { return e.shared.length >= 2 })
+  const weakEdges = heuristicEdges.filter(function (e) { return e.shared.length === 1 })
 
-  const laneMembers = {} // trial root -> unit indices
-  for (let i = 0; i < n; i++) {
-    const r = find(trial, i)
-    if (!laneMembers[r]) laneMembers[r] = []
-    laneMembers[r].push(i)
+  for (const e of strongEdges) union(parent, e.i, e.j)
+
+  const weakParent = []
+  for (let i = 0; i < n; i++) weakParent[i] = i
+  for (const e of weakEdges) union(weakParent, e.i, e.j)
+
+  const weakKeysByRoot = {} // weak-only root -> set of distinct shared keys among its weak edges
+  for (const e of weakEdges) {
+    const r = find(weakParent, e.i)
+    if (!weakKeysByRoot[r]) weakKeysByRoot[r] = {}
+    weakKeysByRoot[r][e.shared[0]] = true
   }
-  const cohesionCount = {} // trial root -> count of distinct FULL paths co-predicted by >=2 units in that lane
-  Object.keys(laneMembers).forEach(function (r) {
-    const pathHolders = {}
-    for (const idx of laneMembers[r]) {
-      for (const p of Object.keys(predictedSets[idx])) pathHolders[p] = (pathHolders[p] || 0) + 1
-    }
-    let count = 0
-    for (const p of Object.keys(pathHolders)) { if (pathHolders[p] >= 2) count++ }
-    cohesionCount[r] = count
-  })
 
-  // roots actually touched by >=1 heuristic edge, so the dissolve log below never
-  // flags a root that only got its members via trusted edges (depends_on /
-  // serialize_globs) — those are never touched by this guard and stay unified.
-  const heuristicRoots = {}
-  for (const e of heuristicEdges) heuristicRoots[find(trial, e.i)] = true
-
-  for (const e of heuristicEdges) {
-    const r = find(trial, e.i)
-    if (cohesionCount[r] >= 2) union(parent, e.i, e.j) // exempt: cohesive cluster, never dissolved
+  for (const e of weakEdges) {
+    const r = find(weakParent, e.i)
+    if (Object.keys(weakKeysByRoot[r]).length >= 2) union(parent, e.i, e.j) // exempt: weak chain reaches 2 distinct keys on its own
     // else: single-path promiscuous connector — left dissolved, those units race
   }
 
-  const dissolvedLanes = Object.keys(laneMembers).filter(function (r) { return heuristicRoots[r] && laneMembers[r].length >= 2 && cohesionCount[r] < 2 })
-  if (dissolvedLanes.length) {
-    log('computeLanes: collapse guard dissolved ' + dissolvedLanes.length +
+  const dissolvedRoots = Object.keys(weakKeysByRoot).filter(function (r) { return Object.keys(weakKeysByRoot[r]).length < 2 })
+  if (dissolvedRoots.length) {
+    log('computeLanes: collapse guard dissolved ' + dissolvedRoots.length +
       ' heuristic lane(s) — single-path promiscuous connector(s) with < 2 co-predicted paths; racing instead of serializing')
   }
 
