@@ -684,8 +684,7 @@ function aggregateTokens(results, spent, concurrency) {
   let sumDeltas = 0
   let anyTracked = false
 
-  for (let i = 0; i < list.length; i++) {
-    const r = list[i]
+  for (const r of list) {
     const t = r && r.tokens
     if (t && t.tracked) {
       anyTracked = true
@@ -737,21 +736,18 @@ function aggregateTokens(results, spent, concurrency) {
     const header = ['Issue'].concat(models).concat(['Subtotal'])
     lines.push('| ' + header.join(' | ') + ' |')
     lines.push('|' + header.map(function () { return ' --- ' }).join('|') + '|')
-    for (let i = 0; i < byIssue.length; i++) {
-      const row = byIssue[i]
-      const cells = ['#' + row.issue]
-      for (let m = 0; m < models.length; m++) cells.push(row.tracked ? String(row.byModel[models[m]] || 0) : 'not tracked')
+    for (const row of byIssue) {
+      const cells = ['#' + row.issue].concat(models.map(function (m) {
+        return row.tracked ? String(row.byModel[m] || 0) : 'not tracked'
+      }))
       cells.push(row.tracked ? String(row.total) : 'not tracked')
       lines.push('| ' + cells.join(' | ') + ' |')
     }
     if (reconciles) {
-      const remCells = ['orchestration/unattributed']
-      for (let m = 0; m < models.length; m++) remCells.push('')
-      remCells.push(String(remainder))
+      const remCells = ['orchestration/unattributed'].concat(models.map(function () { return '' })).concat([String(remainder)])
       lines.push('| ' + remCells.join(' | ') + ' |')
     }
-    const totalCells = ['**Total**']
-    for (let m = 0; m < models.length; m++) totalCells.push('**' + byModel[models[m]] + '**')
+    const totalCells = ['**Total**'].concat(models.map(function (m) { return '**' + byModel[m] + '**' }))
     totalCells.push('**' + (reconciles ? spent : sumDeltas) + '**')
     lines.push('| ' + totalCells.join(' | ') + ' |')
   }
