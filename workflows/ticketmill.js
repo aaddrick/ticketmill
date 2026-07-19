@@ -467,6 +467,20 @@ function tripStop(reason) {
   if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; log('STOP: ' + reason) }
 }
 
+// Guarded wrapper over the runtime's budget.spent() (cumulative output tokens
+// for the whole run, monotonic). Never throws; returns a finite Number or null
+// when the runtime hook is unavailable or reports something non-numeric, so
+// callers can render "not tracked" instead of a false zero.
+function spentTokens() {
+  try {
+    if (typeof budget === 'undefined' || !budget || typeof budget.spent !== 'function') return null
+    const v = budget.spent()
+    return (typeof v === 'number' && isFinite(v)) ? v : null
+  } catch (e) {
+    return null
+  }
+}
+
 // stage(): one agent call with retry, journal-unique prompts, death accounting.
 // Returns the validated object, or null after STAGE_TRIES attempts.
 // Every prompt carries a scope guard: at concurrency N, agents from different
@@ -492,27 +506,48 @@ function scopeGuard(ctx) {
 async function stage(ctx, key, prompt, opts, schema, tries) {
   const n = tries || STAGE_TRIES
   const guarded = scopeGuard(ctx) + '\n\n' + prompt
-  for (let attempt = 1; attempt <= n; attempt++) {
-    if (STOP.tripped) return null
-    const p = attempt === 1 ? guarded : guarded +
-      '\n\n(RETRY attempt ' + attempt + ': a previous attempt failed or died mid-flight. ' +
-      'Re-check current state before acting — work may be partially done. Make every action idempotent.)'
-    let r = null
-    try {
-      r = await agent(p, Object.assign({ label: ctx.issue + ':' + key, phase: 'Issue #' + ctx.issue, schema: schema }, opts))
-    } catch (e) {
-      const msg = String((e && e.message) || e)
-      if (/budget|token target|ceiling/i.test(msg)) { tripStop('token budget exhausted (' + msg + ')'); return null }
-      log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' threw: ' + msg)
+  const tokensBefore = spentTokens()
+  try {
+    for (let attempt = 1; attempt <= n; attempt++) {
+      if (STOP.tripped) return null
+      const p = attempt === 1 ? guarded : guarded +
+        '\n\n(RETRY attempt ' + attempt + ': a previous attempt failed or died mid-flight. ' +
+        'Re-check current state before acting — work may be partially done. Make every action idempotent.)'
+      let r = null
+      try {
+        r = await agent(p, Object.assign({ label: ctx.issue + ':' + key, phase: 'Issue #' + ctx.issue, schema: schema }, opts))
+      } catch (e) {
+        const msg = String((e && e.message) || e)
+        if (/budget|token target|ceiling/i.test(msg)) { tripStop('token budget exhausted (' + msg + ')'); return null }
+        log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' threw: ' + msg)
+      }
+      if (r) { BATCH.consecutiveDeaths = 0; return r }
+      log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' returned null' + (attempt < n ? ' — retrying' : ''))
     }
-    if (r) { BATCH.consecutiveDeaths = 0; return r }
-    log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' returned null' + (attempt < n ? ' — retrying' : ''))
+    BATCH.consecutiveDeaths++
+    if (BATCH.consecutiveDeaths >= MAX_CONSECUTIVE_AGENT_DEATHS) {
+      tripStop(MAX_CONSECUTIVE_AGENT_DEATHS + ' consecutive agent deaths — likely usage limit or API outage. Resume later with the same args (preflight will skip finished work) or resumeFromRunId.')
+    }
+    return null
+  } finally {
+    // Token attribution is instrumentation only — isolated in its own try/catch so
+    // a tracking failure (e.g. budget.spent() misbehaving) can never alter the
+    // STOP/retry/return control flow above. Sampled around the whole retry loop
+    // (not per-attempt) so retries and STOP/budget-exhaust early returns all
+    // accumulate into one delta; opts.model is stable across attempts.
+    try {
+      const tokensAfter = spentTokens()
+      if (typeof tokensBefore === 'number' && isFinite(tokensBefore) && typeof tokensAfter === 'number' && isFinite(tokensAfter) && ctx && ctx.tokens) {
+        const delta = Math.max(0, tokensAfter - tokensBefore)
+        ctx.tokens.total += delta
+        const model = opts && opts.model
+        if (model) ctx.tokens.byModel[model] = (ctx.tokens.byModel[model] || 0) + delta
+        ctx.tokens.tracked = true
+      }
+    } catch (e) {
+      // never let tracking failures affect stage() control flow
+    }
   }
-  BATCH.consecutiveDeaths++
-  if (BATCH.consecutiveDeaths >= MAX_CONSECUTIVE_AGENT_DEATHS) {
-    tripStop(MAX_CONSECUTIVE_AGENT_DEATHS + ' consecutive agent deaths — likely usage limit or API outage. Resume later with the same args (preflight will skip finished work) or resumeFromRunId.')
-  }
-  return null
 }
 
 // ----- decision chain -----
@@ -637,7 +672,7 @@ async function fail(ctx, status, stageKey, error) {
   await postNote(ctx, stageKey, status, error)
   BATCH.failures++
   if (BATCH.failures >= MAX_BATCH_FAILURES) tripStop('circuit breaker: ' + BATCH.failures + ' issues failed')
-  return { issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice() }
+  return { issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice() }
 }
 
 // =============================================================================
@@ -1656,7 +1691,7 @@ async function reviewAndMerge(ctx) {
   if (merge.status !== 'merged') return fail(ctx, 'needs_human', 'merge', merge.error || 'merge blocked (' + merge.status + ') — PR #' + ctx.pr + ' left open')
 
   log('#' + ctx.issue + ' merged PR #' + ctx.pr + (merge.follow_up_issues && merge.follow_up_issues.length ? ' (follow-ups: ' + merge.follow_up_issues.join(', ') + ')' : ''))
-  return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, timeline: timeline(ctx), handoff_notes: ctx.notes.slice() }
+  return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice() }
 }
 
 // =============================================================================
@@ -1671,6 +1706,7 @@ async function processIssue(pre) {
     unresolved: [], // critical/major findings carried past a contrarian iteration cap
     approach: '',   // evaluate's approach one-liner, threaded into fix/test prompts
     metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0 },
+    tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
   }
   if (pre.resume_point === 'skip') {
     log('#' + ctx.issue + ' skipped: ' + pre.reason)
