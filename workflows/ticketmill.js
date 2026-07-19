@@ -601,6 +601,20 @@ function stableGroupId(memberIssueNumbers) {
   return Math.min.apply(null, memberIssueNumbers)
 }
 
+// pickPrimary: choose a group's primary — the proposed primary if it's still a
+// live member, otherwise the stable (lowest-numbered) member, so a primary that
+// dropped out of the group (excluded by reconcileGroups, or trimmed by a
+// contrarian revision) always re-anchors onto a member that's actually still
+// there. Shared by reconcileGroups(), proposeConsolidation()'s proposal
+// filtering, and challengeConsolidationGroup()'s revision-acceptance path — all
+// three re-derive a primary the same way. `members` may be empty only at the
+// proposal-filtering call site (before its own >= 2 filter runs); that case
+// falls back to proposedPrimary itself, since stableGroupId([]) is undefined.
+function pickPrimary(members, proposedPrimary) {
+  if (members.indexOf(proposedPrimary) !== -1) return proposedPrimary
+  return members.length ? stableGroupId(members) : proposedPrimary
+}
+
 // toGroupEntry: build one out.set() value in the shape healGroups()/reconcileGroups()
 // share (groupId, primary, members, subsystem, rationale, +extra) — shared by
 // proposeConsolidation()'s DRY_RUN-preview and post-challenge acceptance paths so
@@ -676,9 +690,7 @@ function reconcileGroups(map, livePreflights) {
   map.forEach(function (g, groupId) {
     const live = g.members.filter(function (n) { return resumeByIssue[n] === 'implement' })
     if (live.length < 2) return // dissolved
-    let primary = g.primary
-    if (live.indexOf(primary) === -1) primary = stableGroupId(live)
-    out.set(groupId, { groupId: groupId, primary: primary, members: live, subsystem: g.subsystem, rationale: g.rationale })
+    out.set(groupId, { groupId: groupId, primary: pickPrimary(live, g.primary), members: live, subsystem: g.subsystem, rationale: g.rationale })
   })
   return out
 }
@@ -1667,8 +1679,7 @@ async function challengeConsolidationGroup(group, settledCarrier) {
       log('consolidation group ' + groupId + ' DISSOLVED — revision shrank below a group')
       return null
     }
-    const revisedPrimary = revisedMembers.indexOf(rg.primary) !== -1 ? rg.primary : stableGroupId(revisedMembers)
-    current = { primary: revisedPrimary, members: revisedMembers, subsystem: rg.subsystem || current.subsystem, shared_surface: rg.shared_surface, dependency: rg.dependency, rationale: rg.rationale || current.rationale }
+    current = { primary: pickPrimary(revisedMembers, rg.primary), members: revisedMembers, subsystem: rg.subsystem || current.subsystem, shared_surface: rg.shared_surface, dependency: rg.dependency, rationale: rg.rationale || current.rationale }
   }
   return null // defensive; every loop iteration above returns before falling off the end
 }
@@ -1719,7 +1730,7 @@ async function proposeConsolidation(candidates) {
   const rawGroups = proposal.groups
     .map(function (g) {
       const members = (g.members || []).filter(function (n) { return residual.some(function (c) { return c.issue === n }) })
-      return Object.assign({}, g, { members: members, primary: members.indexOf(g.primary) !== -1 ? g.primary : stableGroupId(members.length ? members : [g.primary]) })
+      return Object.assign({}, g, { members: members, primary: pickPrimary(members, g.primary) })
     })
     .filter(function (g) { return g.members.length >= 2 })
 
