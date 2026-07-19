@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.25 (2026-07-19)
+
+- Docs (#3, task 4 of 4): closed out the engine-owned path guardrail with doc
+  notes in `skills/mill/SKILL.md` and `skills/mill-init/SKILL.md`. `mill` now
+  explains why a config-changing issue needs a clean root tree before launch:
+  the engine only sees committed state per worktree, so an uncommitted
+  root-tree edit under an engine-owned path can get silently clobbered by a
+  stale committed version. `mill-init` documents the
+  `lockstep_installed_paths` profile field, the escape hatch that keeps this
+  repo's own self-hosted `.claude/workflows/ticketmill.js` copy out of the
+  post-implement hard-revert gate. No engine code changed; lockstep copy and
+  full `test_command` suite reverified clean.
+
 ## 0.1.24 (2026-07-19)
 
 - Fix (#3, task 3 quality fix): resolved a prompt self-contradiction flagged
