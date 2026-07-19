@@ -592,6 +592,17 @@ function stableGroupId(memberIssueNumbers) {
   return Math.min.apply(null, memberIssueNumbers)
 }
 
+// toGroupEntry: build one out.set() value in the shape healGroups()/reconcileGroups()
+// share (groupId, primary, members, subsystem, rationale, +extra) — shared by
+// proposeConsolidation()'s DRY_RUN-preview and post-challenge acceptance paths so
+// the two nearly-identical object literals can't drift out of sync.
+function toGroupEntry(g, extra) {
+  return Object.assign({
+    groupId: stableGroupId(g.members), primary: g.primary, members: g.members.slice(),
+    subsystem: g.subsystem || '', rationale: g.rationale || '',
+  }, extra)
+}
+
 // consolidationEnabled: profile.consolidation defaults to true (the gate runs for any
 // run with >1 'implement' candidate); an explicit false disables the gate entirely —
 // free, with no gate agent call at all. A single-issue run skips it for free too,
@@ -698,6 +709,26 @@ function tripStop(reason) {
   if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; log('STOP: ' + reason) }
 }
 
+// isBudgetExhaustedError: budget/ceiling errors are fatal for the whole run
+// (tripStop), not a per-attempt death — shared by stage() and
+// consolidationAgent() so the two call sites can't drift on what counts as one.
+function isBudgetExhaustedError(msg) {
+  if (!/budget|token target|ceiling/i.test(msg)) return false
+  tripStop('token budget exhausted (' + msg + ')')
+  return true
+}
+
+// recordAgentDeath: shared BATCH.consecutiveDeaths bookkeeping for stage() and
+// consolidationAgent() — trips STOP after MAX_CONSECUTIVE_AGENT_DEATHS in a row,
+// on the theory that repeated deaths mean a usage limit or API outage rather
+// than a one-off flake.
+function recordAgentDeath() {
+  BATCH.consecutiveDeaths++
+  if (BATCH.consecutiveDeaths >= MAX_CONSECUTIVE_AGENT_DEATHS) {
+    tripStop(MAX_CONSECUTIVE_AGENT_DEATHS + ' consecutive agent deaths — likely usage limit or API outage. Resume later with the same args (preflight will skip finished work) or resumeFromRunId.')
+  }
+}
+
 // True only for values safe to do arithmetic on (excludes NaN/Infinity/non-numbers).
 function isFiniteNumber(v) {
   return typeof v === 'number' && isFinite(v)
@@ -754,16 +785,13 @@ async function stage(ctx, key, prompt, opts, schema, tries) {
         r = await agent(p, Object.assign({ label: ctx.issue + ':' + key, phase: 'Issue #' + ctx.issue, schema: schema }, opts))
       } catch (e) {
         const msg = String((e && e.message) || e)
-        if (/budget|token target|ceiling/i.test(msg)) { tripStop('token budget exhausted (' + msg + ')'); return null }
+        if (isBudgetExhaustedError(msg)) return null
         log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' threw: ' + msg)
       }
       if (r) { BATCH.consecutiveDeaths = 0; return r }
       log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' returned null' + (attempt < n ? ' — retrying' : ''))
     }
-    BATCH.consecutiveDeaths++
-    if (BATCH.consecutiveDeaths >= MAX_CONSECUTIVE_AGENT_DEATHS) {
-      tripStop(MAX_CONSECUTIVE_AGENT_DEATHS + ' consecutive agent deaths — likely usage limit or API outage. Resume later with the same args (preflight will skip finished work) or resumeFromRunId.')
-    }
+    recordAgentDeath()
     return null
   } finally {
     // Token attribution is instrumentation only — isolated in its own try/catch so
@@ -1520,14 +1548,11 @@ async function consolidationAgent(issueNumbers, label, promptText, opts, schema)
     r = await agent(guarded, Object.assign({ label: label, phase: 'Select', schema: schema }, opts))
   } catch (e) {
     const msg = String((e && e.message) || e)
-    if (/budget|token target|ceiling/i.test(msg)) { tripStop('token budget exhausted (' + msg + ')'); return null }
+    if (isBudgetExhaustedError(msg)) return null
     log('consolidation ' + label + ' threw: ' + msg)
   }
   if (r) { BATCH.consecutiveDeaths = 0; return r }
-  BATCH.consecutiveDeaths++
-  if (BATCH.consecutiveDeaths >= MAX_CONSECUTIVE_AGENT_DEATHS) {
-    tripStop(MAX_CONSECUTIVE_AGENT_DEATHS + ' consecutive agent deaths — likely usage limit or API outage. Resume later with the same args (preflight will skip finished work) or resumeFromRunId.')
-  }
+  recordAgentDeath()
   return null
 }
 
@@ -1688,10 +1713,7 @@ async function proposeConsolidation(candidates) {
   if (DRY_RUN) {
     // DRY_RUN previews the RAW, PRE-CHALLENGE proposal — the contrarian challenge
     // posts trail comments, so it never runs under DRY_RUN (see module comment).
-    for (const g of rawGroups) {
-      const groupId = stableGroupId(g.members)
-      out.set(groupId, { groupId: groupId, primary: g.primary, members: g.members.slice(), subsystem: g.subsystem || '', rationale: g.rationale || '', dry_run_preview: true })
-    }
+    for (const g of rawGroups) out.set(stableGroupId(g.members), toGroupEntry(g, { dry_run_preview: true }))
     return out
   }
 
@@ -1700,8 +1722,7 @@ async function proposeConsolidation(candidates) {
   for (const g of rawGroups) {
     const accepted = await challengeConsolidationGroup(g, consSettled)
     if (!accepted) continue // dissolved — members fall through to the caller's ordinary singleton path
-    const groupId = stableGroupId(accepted.members)
-    out.set(groupId, { groupId: groupId, primary: accepted.primary, members: accepted.members.slice(), subsystem: accepted.subsystem || '', rationale: accepted.rationale || '' })
+    out.set(stableGroupId(accepted.members), toGroupEntry(accepted))
   }
   return out
 }
