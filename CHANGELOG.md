@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.22 (2026-07-19)
+
+- Engine-owned path guardrail, select-phase skip (#3, task 2 of 4): the
+  preflight probe now also reads each issue's `body` and runs
+  `git -C ROOT status --porcelain` against the literalized engine-owned
+  pathspec (`buildEngineOwnedPathspec`, computed once after the profile
+  loads), returning any dirty paths as a new `root_dirty_engine_paths` field
+  (both added to `PREFLIGHT_SCHEMA`). A JS pass right after the probe returns
+  computes `engineOwnedIntentional` per issue (`engineOwnedHit` over
+  title+body) and attaches it; `deriveUnits` OR-folds the flag across a
+  group's live members (`memberRefs.some`) instead of inheriting only the
+  primary's own flag, since `pickPrimary` picks a primary for group-identity
+  reasons unrelated to intent. A deterministic pass between the preflight log
+  and the consolidation gate — regime (a) of the three-regime model — flips
+  `resume_point` to `skip` for any issue where `engineOwnedIntentional` is
+  true AND `root_dirty_engine_paths` is non-empty, naming the dirty paths and
+  the safe path in the reason; the existing skip branch, claim filter, and
+  `reconcileGroups`/`deriveUnits` member-drop handle it from there with no
+  new plumbing. Added `tests/engine-owned.test.js` coverage for
+  `attachEngineOwnedIntentional` and `applyEngineOwnedRootDirtySkip` (all
+  three regimes) plus an end-to-end test proving a flagged issue is excluded
+  from both consolidation candidacy and the claim filter, and
+  `tests/consolidation.test.js` coverage proving a group's
+  `engineOwnedIntentional` is true even when the deliberate-engine member
+  isn't the primary. Regime (b) (deliberate engine work, clean root — e.g.
+  issue #3 itself) and the post-implement hard-revert gate (regime (c)) are
+  task 3.
+
 ## 0.1.21 (2026-07-19)
 
 - Engine-owned path guardrail, foundation (#3, task 1 of 4): added

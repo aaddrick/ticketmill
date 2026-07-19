@@ -539,3 +539,56 @@ test('reconcileGroups: a mix of process_pr and skip members excludes only the sk
   assert.strictEqual(reconciled.size, 1)
   assert.deepStrictEqual(reconciled.get(20).members.slice(), [20, 21])
 })
+
+// ---- deriveUnits: engineOwnedIntentional OR-fold (issue #3 test (ii)) — a
+// deliberate-engine member's flag must survive onto the group unit even when
+// it is NOT the primary. Object.assign({}, primaryRef, ...) alone would carry
+// only the primary's own flag; pickPrimary chooses a primary for group-identity
+// reasons (proposed primary, else lowest issue number) entirely orthogonal to
+// intent, so this is a real, not merely theoretical, mis-flag risk. ----
+
+test('deriveUnits: a group whose deliberate-engine member is NOT the primary still yields unit.engineOwnedIntentional === true', function () {
+  const context = bootConsolidation()
+  const map = new Map()
+  // primary is #30 (an ordinary application-code fix); #31, the non-primary
+  // member, is the one whose own prose targets an engine-owned path.
+  map.set(30, { groupId: 30, primary: 30, members: [30, 31], subsystem: 's', rationale: 'r' })
+  const live = [
+    { issue: 30, resume_point: 'implement', engineOwnedIntentional: false },
+    { issue: 31, resume_point: 'implement', engineOwnedIntentional: true },
+  ]
+
+  const reconciled = context.reconcileGroups(map, live)
+  assert.strictEqual(reconciled.get(30).primary, 30) // confirm #30 IS the primary, not #31
+
+  const units = context.deriveUnits(reconciled, live)
+
+  assert.strictEqual(units.length, 1)
+  assert.strictEqual(units[0].issue, 30) // primary-shaped unit
+  assert.strictEqual(units[0].engineOwnedIntentional, true) // OR-folded from member #31, not inherited from #30 alone
+})
+
+test('deriveUnits: a group where NO member targets an engine-owned path yields unit.engineOwnedIntentional === false', function () {
+  const context = bootConsolidation()
+  const map = new Map()
+  map.set(40, { groupId: 40, primary: 40, members: [40, 41], subsystem: 's', rationale: 'r' })
+  const live = [
+    { issue: 40, resume_point: 'implement', engineOwnedIntentional: false },
+    { issue: 41, resume_point: 'implement', engineOwnedIntentional: false },
+  ]
+
+  const units = context.deriveUnits(context.reconcileGroups(map, live), live)
+
+  assert.strictEqual(units[0].engineOwnedIntentional, false)
+})
+
+test('deriveUnits: a singleton unit carries its OWN engineOwnedIntentional flag straight through (no group to fold)', function () {
+  const context = bootConsolidation()
+  const live = [{ issue: 50, resume_point: 'implement', engineOwnedIntentional: true }]
+
+  const units = context.deriveUnits(new Map(), live)
+
+  assert.strictEqual(units.length, 1)
+  assert.strictEqual(units[0].groupId, null)
+  assert.strictEqual(units[0].engineOwnedIntentional, true)
+})

@@ -328,6 +328,10 @@ const PREFLIGHT_SCHEMA = {
   type: 'object', required: ['issue', 'resume_point', 'reason'],
   properties: {
     issue: { type: 'integer' }, title: { type: 'string' },
+    // body (issue #3): the issue's full body text, added so the Select-phase
+    // JS pass can compute engineOwnedIntentional (engineOwnedHit over
+    // title+body) without a second probe round-trip.
+    body: { type: 'string' },
     issue_state: { enum: ['open', 'closed', 'unknown'] },
     pr_number: { type: ['integer', 'null'] },
     pr_state: { enum: ['open', 'merged', 'closed', 'none'] },
@@ -335,6 +339,11 @@ const PREFLIGHT_SCHEMA = {
     commits_ahead: { type: ['integer', 'null'] },
     resume_point: { enum: ['skip', 'process_pr', 'implement'] },
     reason: { type: 'string' },
+    // root_dirty_engine_paths (issue #3): engine-owned paths (per the
+    // literalized pathspec interpolated into the probe prompt) that `git -C
+    // ROOT status --porcelain` reports dirty right now — the regime (a)
+    // root-dirty read applyEngineOwnedRootDirtySkip() acts on. [] when clean.
+    root_dirty_engine_paths: { type: 'array', items: { type: 'string' } },
   },
 }
 const SETUP_SCHEMA = {
@@ -800,6 +809,14 @@ function reconcileGroups(map, livePreflights) {
 // live preflight becomes an ordinary singleton unit (members: [self], groupId: null)
 // — the exact shape processIssue()'s ctx init below defaults to, so a no-group run
 // produces units identical to today's preflights array.
+// engineOwnedIntentional (issue #3) is OR-folded across a group's live memberRefs
+// (.some), not just inherited from the primary — Object.assign({}, primaryRef, ...)
+// below would otherwise silently carry ONLY the primary's own flag, and pickPrimary
+// picks a primary for group-identity reasons entirely orthogonal to intent (lowest
+// issue number / proposed primary), so a deliberate-engine member that isn't the
+// primary would be invisible to any consumer reading it off the unit. A singleton
+// unit needs no such fold: Object.assign({}, p, {...}) below already spreads p's
+// OWN engineOwnedIntentional through untouched.
 function deriveUnits(reconciledMap, livePreflights) {
   const byIssue = {}
   for (const p of livePreflights || []) byIssue[p.issue] = p
@@ -810,7 +827,8 @@ function deriveUnits(reconciledMap, livePreflights) {
     if (memberRefs.length < 2) return // a member vanished from livePreflights entirely; treat as dissolved
     const primaryRef = byIssue[g.primary] || memberRefs[0]
     memberRefs.forEach(function (m) { consumed[m.issue] = true })
-    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale }))
+    const engineOwnedIntentional = memberRefs.some(function (m) { return m.engineOwnedIntentional })
+    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale, engineOwnedIntentional: engineOwnedIntentional }))
   })
   for (const p of (livePreflights || [])) {
     if (consumed[p.issue]) continue
@@ -1356,6 +1374,52 @@ function buildEngineOwnedPathspec(globs) {
 // without special-casing it.
 function isHardRevertPath(file, engineGlobs, lockstepPaths) {
   return matchesGlobs(file, engineGlobs) && !matchesGlobs(file, lockstepPaths)
+}
+
+// attachEngineOwnedIntentional: per-preflight regime classifier (issue #3) —
+// does THIS issue's own title+body plainly target an engine-owned path
+// (engineOwnedHit)? Computed once, right after the preflight probe returns,
+// from title+body ALONE (never from root_dirty_engine_paths or resume_point)
+// so it stays a pure "did the prose name the set" signal that deriveUnits can
+// later OR-fold across every live member of a consolidation group, regardless
+// of which member ends up as the group's primary ref. Pure and side-effect-free:
+// returns a NEW array (does not mutate `preflights`) so a probe-died fallback
+// entry (no live body) flows through identically to every other preflight —
+// engineOwnedHit('' , globs) is always null, so it lands false, never throws.
+function attachEngineOwnedIntentional(preflights, globs) {
+  return (preflights || []).map(function (p) {
+    return Object.assign({}, p, { engineOwnedIntentional: !!engineOwnedHit((p.title || '') + '\n' + (p.body || ''), globs) })
+  })
+}
+
+// applyEngineOwnedRootDirtySkip: regime (a) of the three-regime model (issue
+// #3, ENGINE_OWNED_GLOBS module comment) — an issue whose OWN prose plainly
+// targets an engine-owned path (engineOwnedIntentional), probed while the
+// ROOT working tree is ALREADY dirty under that same set, is routed to
+// select-skip instead of being implemented mid-run: the state actually
+// driving this run lives only uncommitted at ROOT, so any worktree checkout
+// this run builds is stale relative to it (the #77 hazard) — implementing
+// from it risks silently reconciling/clobbering the newer uncommitted state.
+// Regime (b) (prose targets the set, root clean — deliberate engine work,
+// e.g. issue #3 itself) and regime (c) (root dirty for unrelated reasons, or
+// prose doesn't target the set) are both left untouched here; only the (a)
+// intersection flips resume_point.
+// Pure: returns { preflights: <NEW array>, flagged: [issueNumbers] } rather
+// than mutating in place, so the Select-phase caller can both use the updated
+// preflights AND log the root-dirty condition exactly once (not once per
+// flagged issue) — see the caller for that single log line.
+function applyEngineOwnedRootDirtySkip(preflights) {
+  const flagged = []
+  const out = (preflights || []).map(function (p) {
+    const dirty = Array.isArray(p.root_dirty_engine_paths) ? p.root_dirty_engine_paths : []
+    if (!p.engineOwnedIntentional || !dirty.length) return p
+    flagged.push(p.issue)
+    return Object.assign({}, p, {
+      resume_point: 'skip',
+      reason: 'engine-owned path targeted by this issue, and the root working tree is already dirty under it (' + dirty.join(', ') + ') — run this issue solo outside a batch, or after the run completes',
+    })
+  })
+  return { preflights: out, flagged: flagged }
 }
 
 async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
@@ -3217,31 +3281,57 @@ const learnPromise = agent([
   .catch(function (e) { log('learnings digest failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
 
 // ---- Select: preflight probe (the GitHub-state healing layer) ----
-const preflights = (await Promise.all(issueList.map(function (it) {
+// enginePathspec (issue #3): the literalized engine-owned pathspec, computed
+// ONCE here (ENGINE_OWNED is already populated — profile is loaded) using the
+// same literalization buildEngineOwnedPathspec shares with engineOwnedHit, and
+// interpolated into every probe below so `git status --porcelain` gets plain
+// literal paths, never the raw '**' globs it doesn't interpret.
+const enginePathspec = buildEngineOwnedPathspec(ENGINE_OWNED)
+let preflights = (await Promise.all(issueList.map(function (it) {
   return agent([
     'Probe the current state of GitHub issue #' + it.number + ' in ' + REPO + ' (READ-ONLY: gh + git inspection, no changes).',
     '',
-    '1. gh issue view ' + it.number + ' --repo ' + REPO + ' --json state,title',
+    '1. gh issue view ' + it.number + ' --repo ' + REPO + ' --json state,title,body',
     '2. Related PRs: gh pr list --repo ' + REPO + ' --state all --search "' + it.number + '" --json number,state,headRefName,mergedAt',
     '   A PR is related if its head branch starts with "issue-' + it.number + '-" or its body references #' + it.number + '.',
     '   Prefer: merged > open > closed-unmerged. Report its number and state.',
     '3. Local: does ' + WORKTREES + '/issue-' + it.number + ' exist, and on what branch? Commits ahead:',
     '   git -C ' + ROOT + ' rev-list --count origin/' + TARGET + '..<branch> 2>/dev/null (0/none if no branch).',
+    '4. Engine-owned guardrail (issue #3): is the ROOT working tree dirty under any engine-owned path right now?',
+    '   git -C ' + ROOT + ' status --porcelain -- ' + enginePathspec.join(' '),
+    '   Return every dirty path under that pathspec as root_dirty_engine_paths (empty array if the pathspec is clean).',
     '',
     'Decide resume_point:',
     '- "skip": issue is closed OR a related PR is already merged',
     '- "process_pr": a related PR is OPEN (implementation exists; it needs review + merge)',
     '- "implement": otherwise (fresh, or partial branch/worktree — implementation will continue from existing commits)',
-    'Return issue, title, issue_state, pr_number, pr_state, branch, worktree_exists, commits_ahead, resume_point, reason (one line).',
+    'Return issue, title, body, issue_state, pr_number, pr_state, branch, worktree_exists, commits_ahead, resume_point, reason (one line), root_dirty_engine_paths.',
   ].join('\n'), { label: it.number + ':preflight', phase: 'Select', schema: PREFLIGHT_SCHEMA, model: M.probe.model, effort: M.probe.effort })
     .then(function (r) {
       if (r) { if (!r.title && it.title) r.title = it.title; return r }
       // probe died -> assume full implement; the pipeline stages are individually idempotent
-      return { issue: it.number, title: it.title || '', issue_state: 'unknown', pr_number: null, pr_state: 'none', branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)' }
+      return { issue: it.number, title: it.title || '', body: '', issue_state: 'unknown', pr_number: null, pr_state: 'none', branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)', root_dirty_engine_paths: [] }
     })
 }))).filter(Boolean)
 
+// engineOwnedIntentional (issue #3): computed once per preflight, right after
+// the probe returns, from THIS issue's own title+body — see the module
+// comment above ENGINE_OWNED_GLOBS for the three-regime model this feeds, and
+// deriveUnits()'s OR-fold for how it threads onto a consolidation-group unit.
+preflights = attachEngineOwnedIntentional(preflights, ENGINE_OWNED)
+
 for (const p of preflights) log('#' + p.issue + ' preflight: ' + p.resume_point + ' — ' + p.reason)
+
+// ---- Select: engine-owned root-dirty skip — regime (a) of the three-regime
+// model (ENGINE_OWNED_GLOBS module comment): this issue's own prose targets an
+// engine-owned path AND the root working tree is already dirty under that set
+// (the #77 hazard). Deterministic JS, run BEFORE the consolidation gate below
+// so a flagged issue is neither offered to proposeConsolidation() (its residual
+// filter only admits resume_point === 'implement') nor claimed (toClaim filters
+// resume_point !== 'skip') — both existing gates, no new plumbing needed.
+const engineSkip = applyEngineOwnedRootDirtySkip(preflights)
+preflights = engineSkip.preflights
+if (engineSkip.flagged.length) log('engine-owned guardrail: root working tree dirty under an engine-owned path targeted by issue(s) ' + engineSkip.flagged.join(', ') + ' — routed to select-skip (regime a)')
 
 const learnR = await learnPromise
 if (learnR && learnR.found) {

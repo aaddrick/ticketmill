@@ -14,6 +14,16 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const harness = require('./harness')
 
+// bootConsolidation: same helper tests/consolidation.test.js uses — seeds a
+// non-null PROFILE so consolidationEnabled(PROFILE) is true (proposeConsolidation
+// free-disables its opus PROPOSE step, though never its HEAL, when PROFILE is
+// null/falsy), needed by the end-to-end regime-(a) test below.
+function bootConsolidation(overrides) {
+  const context = harness.boot()
+  context.__seed(Object.assign({ PROFILE: {} }, overrides))
+  return context
+}
+
 // ---- ENGINE_OWNED_GLOBS / mergeEngineOwnedGlobs ----
 
 test('ENGINE_OWNED_GLOBS: default set is exactly the four paths named in issue #3', function () {
@@ -135,4 +145,153 @@ test('isHardRevertPath: a lockstep path nested under a directory glob is exempte
 
   assert.equal(context.isHardRevertPath('.claude/agents/pinned.md', globs, lockstep), false)
   assert.equal(context.isHardRevertPath('.claude/agents/other.md', globs, lockstep), true)
+})
+
+// ---- attachEngineOwnedIntentional (Select-phase regime classifier) ----
+
+test('attachEngineOwnedIntentional: true when the issue title names an engine-owned path', function () {
+  const context = harness.boot()
+  const globs = harness.readGlobal(context, 'ENGINE_OWNED_GLOBS')
+  const out = context.attachEngineOwnedIntentional([
+    { issue: 1, title: 'Update .claude/ticketmill.json to add a field', body: '' },
+  ], globs)
+
+  assert.equal(out[0].engineOwnedIntentional, true)
+})
+
+test('attachEngineOwnedIntentional: true when only the BODY names an engine-owned path (title alone would miss it)', function () {
+  const context = harness.boot()
+  const globs = harness.readGlobal(context, 'ENGINE_OWNED_GLOBS')
+  const out = context.attachEngineOwnedIntentional([
+    { issue: 1, title: 'Fix the roster', body: 'This touches .claude/agents/foo.md directly.' },
+  ], globs)
+
+  assert.equal(out[0].engineOwnedIntentional, true)
+})
+
+test('attachEngineOwnedIntentional: false for ordinary application-code prose, and a missing body never throws', function () {
+  const context = harness.boot()
+  const globs = harness.readGlobal(context, 'ENGINE_OWNED_GLOBS')
+  const out = context.attachEngineOwnedIntentional([
+    { issue: 1, title: 'Fix the null-pointer bug in src/parser.js' }, // no body field at all
+  ], globs)
+
+  assert.equal(out[0].engineOwnedIntentional, false)
+})
+
+test('attachEngineOwnedIntentional: returns a NEW array, does not mutate the input preflights', function () {
+  const context = harness.boot()
+  const globs = harness.readGlobal(context, 'ENGINE_OWNED_GLOBS')
+  const input = [{ issue: 1, title: 'Update .claude/ticketmill.json', body: '' }]
+
+  const out = context.attachEngineOwnedIntentional(input, globs)
+
+  assert.equal('engineOwnedIntentional' in input[0], false)
+  assert.equal(out[0].engineOwnedIntentional, true)
+  assert.notStrictEqual(out[0], input[0])
+})
+
+// ---- applyEngineOwnedRootDirtySkip (regime (a): prose targets the set AND
+// root is dirty under it -> select-skip; issue #3's #77 hazard) ----
+
+test('applyEngineOwnedRootDirtySkip: regime (a) — intentional AND root-dirty flips resume_point to skip with a reason naming the dirty paths', function () {
+  const context = harness.boot()
+  const preflights = [
+    { issue: 1, resume_point: 'implement', reason: 'fresh', engineOwnedIntentional: true, root_dirty_engine_paths: ['.claude/agents/foo.md'] },
+  ]
+
+  const result = context.applyEngineOwnedRootDirtySkip(preflights)
+
+  assert.deepEqual(Array.from(result.flagged), [1])
+  assert.strictEqual(result.preflights[0].resume_point, 'skip')
+  assert.ok(result.preflights[0].reason.indexOf('.claude/agents/foo.md') !== -1, 'reason should name the dirty path')
+  assert.ok(/run this issue solo/.test(result.preflights[0].reason), 'reason should name the safe path')
+})
+
+test('applyEngineOwnedRootDirtySkip: regime (b) — intentional but root CLEAN is left untouched (deliberate engine work, e.g. issue #3 itself)', function () {
+  const context = harness.boot()
+  const preflights = [
+    { issue: 3, resume_point: 'implement', reason: 'fresh', engineOwnedIntentional: true, root_dirty_engine_paths: [] },
+  ]
+
+  const result = context.applyEngineOwnedRootDirtySkip(preflights)
+
+  assert.deepEqual(Array.from(result.flagged), [])
+  assert.strictEqual(result.preflights[0].resume_point, 'implement')
+  assert.strictEqual(result.preflights[0], preflights[0]) // untouched entry is the SAME reference
+})
+
+test('applyEngineOwnedRootDirtySkip: regime (c) — root dirty but prose does NOT target the set is left untouched (not this gate\'s job)', function () {
+  const context = harness.boot()
+  const preflights = [
+    { issue: 5, resume_point: 'implement', reason: 'fresh', engineOwnedIntentional: false, root_dirty_engine_paths: ['.claude/ticketmill.json'] },
+  ]
+
+  const result = context.applyEngineOwnedRootDirtySkip(preflights)
+
+  assert.deepEqual(Array.from(result.flagged), [])
+  assert.strictEqual(result.preflights[0].resume_point, 'implement')
+})
+
+test('applyEngineOwnedRootDirtySkip: a mixed batch flags only the (a) issue, leaves the rest of the array untouched by reference', function () {
+  const context = harness.boot()
+  const preflights = [
+    { issue: 1, resume_point: 'implement', reason: 'fresh', engineOwnedIntentional: true, root_dirty_engine_paths: ['.claude/agents/x.md'] },
+    { issue: 2, resume_point: 'implement', reason: 'fresh', engineOwnedIntentional: false, root_dirty_engine_paths: [] },
+    { issue: 3, resume_point: 'process_pr', reason: 'has PR', engineOwnedIntentional: true, root_dirty_engine_paths: [] },
+  ]
+
+  const result = context.applyEngineOwnedRootDirtySkip(preflights)
+
+  assert.deepEqual(Array.from(result.flagged), [1])
+  assert.strictEqual(result.preflights[0].resume_point, 'skip')
+  assert.strictEqual(result.preflights[1], preflights[1])
+  assert.strictEqual(result.preflights[2], preflights[2])
+})
+
+// ---- End-to-end (i): a skipped engine-owned issue is neither proposed for
+// consolidation nor claimed. proposeConsolidation()'s own residual filter only
+// admits resume_point === 'implement' into a brand-new opus-gate grouping, and
+// the real Select-phase claim filter (workflows/ticketmill.js, `toClaim =
+// preflights.filter(p => p.resume_point !== 'skip')`) is mirrored here — both
+// existing gates key off the SAME resume_point field applyEngineOwnedRootDirtySkip
+// flips, so proving the flip is enough to prove both downstream exclusions. ----
+
+test('regime (a) end-to-end: a root-dirty engine-owned issue is select-skipped, so it is excluded from BOTH consolidation candidacy and the claim filter', async function () {
+  const context = bootConsolidation()
+  const globs = harness.readGlobal(context, 'ENGINE_OWNED_GLOBS')
+
+  let rawPreflights = [
+    { issue: 1, title: 'Fix .claude/agents/ticketmill-implementer.md', body: '', resume_point: 'implement', reason: 'fresh', root_dirty_engine_paths: ['.claude/agents/ticketmill-implementer.md'] },
+    { issue: 2, title: 'Fix an unrelated bug', body: '', resume_point: 'implement', reason: 'fresh', root_dirty_engine_paths: [] },
+  ]
+  rawPreflights = context.attachEngineOwnedIntentional(rawPreflights, globs)
+  const gate = context.applyEngineOwnedRootDirtySkip(rawPreflights)
+  const preflights = gate.preflights
+
+  assert.deepEqual(Array.from(gate.flagged), [1])
+  assert.strictEqual(preflights[0].resume_point, 'skip')
+
+  // not proposed for consolidation: proposeConsolidation's opus gate must never
+  // even see issue #1 on its menu (only #2 is a fresh 'implement' candidate).
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label === 'consolidation:marker-probe') return { markers: [] }
+    if (label === 'consolidation:propose') {
+      assert.ok(!prompt.includes('#1'), 'the select-skipped engine-owned issue must not be offered to the consolidation gate')
+      return { groups: [], ungrouped: [2] }
+    }
+    throw new Error('unexpected consolidation call: ' + label)
+  })
+  const map = await context.proposeConsolidation(preflights)
+  assert.strictEqual(map.size, 0)
+
+  const units = context.deriveUnits(context.reconcileGroups(map, preflights), preflights)
+  assert.strictEqual(units.length, 2)
+  const u1 = units.find(function (u) { return u.issue === 1 })
+  assert.strictEqual(u1.resume_point, 'skip') // processIssue()'s existing skip branch takes it from here
+
+  // not claimed: mirrors the real toClaim filter (resume_point !== 'skip').
+  const toClaim = preflights.filter(function (p) { return p.resume_point !== 'skip' })
+  assert.deepEqual(Array.from(toClaim.map(function (p) { return p.issue })), [2])
 })
