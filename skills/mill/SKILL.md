@@ -36,6 +36,24 @@ base branch itself.
 
    If neither exists, stop and direct the user to `/ticketmill:mill-init`.
 
+## Engine-owned paths need a clean root tree
+
+If an issue's fix touches the ticketmill profile (`.claude/ticketmill.json`), the
+agent roster (`.claude/agents/**`), or the engine copy (`.claude/workflows/ticketmill.js`,
+`.claude/scripts/ticketmill/**`), check the root working tree before you launch. The
+engine works from each issue's own worktree, and that worktree only sees committed
+state. Uncommitted edits sitting in the root tree, like a freshly forged agent or a
+profile field you just added, are invisible to it.
+
+That gap turns dangerous when the issue's own fix targets the same path. The engine
+can "reconcile" by restoring the old committed version from git history. A later
+batch merge then overwrites your uncommitted work without ever raising a conflict.
+The engine's Select-phase preflight catches this when it can: an issue whose title or
+body plainly names an engine-owned path gets routed to skip if the root tree is dirty
+under that path. But the preflight only sees what git tracks. Commit or stash
+root-tree changes to those paths first, or hold the issue back and run it solo once
+the batch finishes.
+
 ## Gather run parameters
 
 From the user's request (ask only if genuinely ambiguous):

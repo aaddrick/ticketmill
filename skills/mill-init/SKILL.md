@@ -55,6 +55,14 @@ Field rules:
 - `browser`: OPT-IN. Only propose it for projects with a servable UI AND if the user
   wants live browser verification: `{ "serve_command": "... --port={port}",
   "build_command": null, "ui_globs": [...], "port_base": 8100, "notes": "..." }`.
+- `lockstep_installed_paths`: only needed when the repo being onboarded keeps an
+  installed copy of an engine-owned file in lockstep with a source-of-truth file
+  elsewhere in the same repo, kept in sync by the repo's own tooling. List those
+  installed paths so the engine's post-implement guardrail exempts them from a hard
+  revert instead of undoing genuine engine work. Ticketmill's own profile (this repo,
+  self-hosted) sets `lockstep_installed_paths: [".claude/workflows/ticketmill.js"]`,
+  since `scripts/lint-engine.js` keeps that installed copy byte-identical to
+  `workflows/ticketmill.js`. Leave it empty for every other repo.
 - `serialize_globs`: OPTIONAL, default `[]`. Lane scheduling (issue #1) already
   predicts likely file overlap per issue and serializes those issues instead of
   racing them — this field is only for files that heuristic alone can't be

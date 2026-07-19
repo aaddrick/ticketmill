@@ -60,6 +60,18 @@ export const meta = {
 //     "logs_dir": "logs/ticketmill",
 //     "claim_label": "ticketmill",
 //     "verify_notes": ["tests need the pgvector container: podman start ncl_test"],
+//     "engine_owned_globs": [],          // extends the built-in engine-owned set
+//                                        // (.claude/ticketmill.json, .claude/agents/**,
+//                                        // .claude/workflows/ticketmill.js,
+//                                        // .claude/scripts/ticketmill/**) — read-only
+//                                        // during a run; see ENGINE_OWNED_GLOBS.
+//     "lockstep_installed_paths": [],    // engine-owned paths that are a deliberate
+//                                        // installed copy of a source-of-truth file
+//                                        // elsewhere in THIS repo, kept in lockstep by
+//                                        // its own tooling — exempted from the
+//                                        // post-implement hard-revert gate; see
+//                                        // isHardRevertPath. This repo sets
+//                                        // [".claude/workflows/ticketmill.js"].
 //     "browser": null,                   // OPT-IN browser verification:
 //     // { "serve_command": "php artisan serve --port={port}", "build_command": null,
 //     //   "ui_globs": ["resources/views/**"], "port_base": 8100, "notes": "..." }
@@ -265,6 +277,12 @@ let LOGS = null                 // ROOT + '/' + profile.logs_dir
 let CLAIM_LABEL = 'ticketmill'
 let BROWSER = null              // profile.browser or null
 let VERIFY_SKIPS = []           // human-visible verification gaps -> batch PR body
+// ENGINE_OWNED / LOCKSTEP_INSTALLED_PATHS (issue #3): populated at Select from
+// ENGINE_OWNED_GLOBS (~line 1244, declared after this point — assigned via
+// mergeEngineOwnedGlobs, not referenced eagerly here) merged with
+// PROFILE.engine_owned_globs, and PROFILE.lockstep_installed_paths respectively.
+let ENGINE_OWNED = []
+let LOCKSTEP_INSTALLED_PATHS = []
 
 function stageOpts(key) {
   const base = M[key] || { model: 'sonnet' }
@@ -306,7 +324,19 @@ const BOOT_SCHEMA = {
 }
 const PROFILE_SCHEMA = {
   type: 'object', required: ['found'],
-  properties: { found: { type: 'boolean' }, raw: { type: 'string' } },
+  // found/raw describe the probe's own response shape (does the profile file
+  // exist, and its raw text). engine_owned_globs/lockstep_installed_paths
+  // document — for readers of this schema — the two optional array fields
+  // issue #3 added to the parsed .claude/ticketmill.json profile itself (read
+  // via PROFILE.engine_owned_globs / PROFILE.lockstep_installed_paths at
+  // Select, see mergeEngineOwnedGlobs); they are not part of the probe
+  // response and additionalProperties is unset, so listing them here is
+  // documentation only, not enforcement.
+  properties: {
+    found: { type: 'boolean' }, raw: { type: 'string' },
+    engine_owned_globs: { type: 'array', items: { type: 'string' } },
+    lockstep_installed_paths: { type: 'array', items: { type: 'string' } },
+  },
 }
 const AGENTS_SCHEMA = {
   type: 'object', required: ['agents'],
@@ -320,6 +350,10 @@ const PREFLIGHT_SCHEMA = {
   type: 'object', required: ['issue', 'resume_point', 'reason'],
   properties: {
     issue: { type: 'integer' }, title: { type: 'string' },
+    // body (issue #3): the issue's full body text, added so the Select-phase
+    // JS pass can compute engineOwnedIntentional (engineOwnedHit over
+    // title+body) without a second probe round-trip.
+    body: { type: 'string' },
     issue_state: { enum: ['open', 'closed', 'unknown'] },
     pr_number: { type: ['integer', 'null'] },
     pr_state: { enum: ['open', 'merged', 'closed', 'none'] },
@@ -327,6 +361,11 @@ const PREFLIGHT_SCHEMA = {
     commits_ahead: { type: ['integer', 'null'] },
     resume_point: { enum: ['skip', 'process_pr', 'implement'] },
     reason: { type: 'string' },
+    // root_dirty_engine_paths (issue #3): engine-owned paths (per the
+    // literalized pathspec interpolated into the probe prompt) that `git -C
+    // ROOT status --porcelain` reports dirty right now — the regime (a)
+    // root-dirty read applyEngineOwnedRootDirtySkip() acts on. [] when clean.
+    root_dirty_engine_paths: { type: 'array', items: { type: 'string' } },
     // OPTIONAL lane-scheduling prediction (issue #1): real repo-relative paths
     // resolved against origin/TARGET (never guessed), and in-batch issue refs
     // parsed from body text. Both fail open to [] — see the probe prompt below
@@ -350,6 +389,14 @@ const TARGET_FETCH_SCHEMA = {
 const UI_PROBE_SCHEMA = {
   type: 'object', required: ['ui_files'],
   properties: { ui_files: { type: 'array', items: { type: 'string' } } },
+}
+// DIFF_PROBE_SCHEMA: the post-implement engine-owned gate's own read-only
+// diff probe (runEngineOwnedGate) — same shape as UI_PROBE_SCHEMA's ui_files
+// idea, generalized to "every changed file" since the JS side (not the
+// agent) does the ENGINE_OWNED filtering.
+const DIFF_PROBE_SCHEMA = {
+  type: 'object', required: ['changed_files'],
+  properties: { changed_files: { type: 'array', items: { type: 'string' } } },
 }
 const CLAIM_SCHEMA = {
   type: 'object', required: ['issue', 'claimed'],
@@ -827,6 +874,14 @@ function unionField(memberRefs, field) {
 // live preflight becomes an ordinary singleton unit (members: [self], groupId: null)
 // — the exact shape processIssue()'s ctx init below defaults to, so a no-group run
 // produces units identical to today's preflights array.
+// engineOwnedIntentional (issue #3) is OR-folded across a group's live memberRefs
+// (.some), not just inherited from the primary — Object.assign({}, primaryRef, ...)
+// below would otherwise silently carry ONLY the primary's own flag, and pickPrimary
+// picks a primary for group-identity reasons entirely orthogonal to intent (lowest
+// issue number / proposed primary), so a deliberate-engine member that isn't the
+// primary would be invisible to any consumer reading it off the unit. A singleton
+// unit needs no such fold: Object.assign({}, p, {...}) below already spreads p's
+// OWN engineOwnedIntentional through untouched.
 //
 // predicted_files/depends_on (issue #1, lane scheduling): every preflight carries
 // these two OPTIONAL arrays (normalized to [] by the probe's .then() above). A
@@ -847,11 +902,12 @@ function deriveUnits(reconciledMap, livePreflights) {
     if (memberRefs.length < 2) return // a member vanished from livePreflights entirely; treat as dissolved
     const primaryRef = byIssue[g.primary] || memberRefs[0]
     memberRefs.forEach(function (m) { consumed[m.issue] = true })
+    const engineOwnedIntentional = memberRefs.some(function (m) { return m.engineOwnedIntentional })
     const memberIssueSet = {}
     memberRefs.forEach(function (m) { memberIssueSet[m.issue] = true })
     const predictedFiles = unionField(memberRefs, 'predicted_files')
     const dependsOn = unionField(memberRefs, 'depends_on').filter(function (n) { return !memberIssueSet[n] })
-    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale, predicted_files: predictedFiles, depends_on: dependsOn }))
+    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale, engineOwnedIntentional: engineOwnedIntentional, predicted_files: predictedFiles, depends_on: dependsOn }))
   })
   for (const p of (livePreflights || [])) {
     if (consumed[p.issue]) continue
@@ -1220,6 +1276,19 @@ function scopeGuard(ctx) {
     lines.push('The shared verification browser is lock-guarded (' + BW_LOCK + '): only use it if your prompt includes the')
     lines.push('"live browser feedback" protocol block — without that block, do NOT open the browser.')
   }
+  // Engine-owned advisory clause (issue #3): a deterministic post-implement
+  // gate (runEngineOwnedGate, before the test loop) is the real backstop —
+  // this is only defense-in-depth, so it is unconditional (prepended to
+  // EVERY stage prompt, not gated on isGroup/BROWSER) and stays generic
+  // rather than naming ctx.engineOwnedIntentional: an agent mid-stage has no
+  // reliable way to know which regime it is in, so the instruction must hold
+  // for both — never touch these paths without being told to.
+  if (ENGINE_OWNED.length) {
+    lines.push('Engine-owned paths (' + ENGINE_OWNED.join(', ') + ') are OUT OF SCOPE unless this issue explicitly targets one of')
+    lines.push('them: do not stage, commit, or restore them from git history for any other reason (including "reconciling" a')
+    lines.push('diff or an apparently stale file) — leave them exactly as you found them and surface the discrepancy as a')
+    lines.push('deferred note instead.')
+  }
   return lines.join('\n')
 }
 async function stage(ctx, key, prompt, opts, schema, tries) {
@@ -1585,6 +1654,138 @@ function matchesGlobs(file, globs) {
   return false
 }
 
+// =============================================================================
+// ENGINE-OWNED PATHS (issue #3): the ticketmill profile, agent roster, and the
+// engine's own installed copy are read-only artifacts of THIS run's tooling —
+// not the target repo's application code. A worktree's committed state of
+// these paths can be stale relative to the root working tree driving the run
+// (nonconvexlabs-com #77): an implementer that "reconciles" a stale diff here
+// silently clobbers newer state that exists only uncommitted at ROOT.
+// ENGINE_OWNED_GLOBS is the default set; a profile may extend it via
+// PROFILE.engine_owned_globs (mergeEngineOwnedGlobs). Some engine-owned paths
+// are legitimately installed/lockstepped alongside a source-of-truth copy
+// elsewhere in the repo (this repo's own .claude/workflows/ticketmill.js,
+// kept byte-identical to workflows/ticketmill.js by scripts/lint-engine.js) —
+// PROFILE.lockstep_installed_paths (default []) names those so a hard-revert
+// gate can exempt them (isHardRevertPath).
+// =============================================================================
+const ENGINE_OWNED_GLOBS = [
+  '.claude/ticketmill.json',
+  '.claude/agents/**',
+  '.claude/workflows/ticketmill.js',
+  '.claude/scripts/ticketmill/**',
+]
+
+// mergeEngineOwnedGlobs: the module default plus an optional profile
+// extension (PROFILE.engine_owned_globs). Pure so tests can exercise it
+// without seeding module state.
+function mergeEngineOwnedGlobs(profile) {
+  const extra = profile && Array.isArray(profile.engine_owned_globs) ? profile.engine_owned_globs.map(String) : []
+  return ENGINE_OWNED_GLOBS.concat(extra)
+}
+
+// literalizeGlob: strips a trailing run of '*' characters (covers '/**',
+// '/*', and a bare trailing '*' uniformly) down to the fixed prefix before
+// it, e.g. '.claude/agents/**' -> '.claude/agents/'. An exact-file glob with
+// no trailing star (e.g. '.claude/ticketmill.json') is returned unchanged.
+// Shared by engineOwnedHit's prose substring match and
+// buildEngineOwnedPathspec's git pathspec.
+function literalizeGlob(g) {
+  return String(g).replace(/\*+$/, '')
+}
+
+// engineOwnedHit: case-sensitive substring scan of free text (an issue title
+// + body) for any literalized engine-owned prefix. Returns the literalized
+// prefix that hit (a truthy string a caller can name in a reason/log line),
+// or null when nothing matched. Deliberately dumb — substring, not path
+// parsing — because the callers need a cheap, deterministic proxy for "does
+// this issue's prose plainly target an engine-owned path", not a parser.
+function engineOwnedHit(text, globs) {
+  const s = String(text || '')
+  const list = Array.isArray(globs) ? globs : []
+  for (const g of list) {
+    const prefix = literalizeGlob(g)
+    if (prefix && s.indexOf(prefix) !== -1) return prefix
+  }
+  return null
+}
+
+// buildEngineOwnedPathspec: the same literalization as engineOwnedHit,
+// applied to build a `git ... -- <pathspec>` argument list. Trailing '*'
+// characters are already stripped, so every entry is a plain literal path
+// git can match directly — a directory prefix (e.g. '.claude/agents/')
+// matches everything under it, an exact file path matches only itself; no
+// pathspec magic (':(literal)' etc) is needed since no glob metacharacters
+// remain. Deduplicates in case a profile's engine_owned_globs re-lists a
+// default entry.
+function buildEngineOwnedPathspec(globs) {
+  const list = Array.isArray(globs) ? globs : []
+  const out = []
+  for (const g of list) {
+    const p = literalizeGlob(g)
+    if (p && out.indexOf(p) === -1) out.push(p)
+  }
+  return out
+}
+
+// isHardRevertPath: file-level predicate for the post-implement hard-revert
+// gate — true when `file` falls under the engine-owned set AND is NOT one of
+// the profile's lockstep-installed exceptions. Built on matchesGlobs (full
+// glob matching, file-match time) rather than a glob-STRING set difference:
+// a glob-string diff can't express "this lockstep file sits nested under
+// that engine-owned directory glob" (e.g. '.claude/agents/pinned.md' vs
+// '.claude/agents/**') — matching at the file level gets nesting right
+// without special-casing it.
+function isHardRevertPath(file, engineGlobs, lockstepPaths) {
+  return matchesGlobs(file, engineGlobs) && !matchesGlobs(file, lockstepPaths)
+}
+
+// attachEngineOwnedIntentional: per-preflight regime classifier (issue #3) —
+// does THIS issue's own title+body plainly target an engine-owned path
+// (engineOwnedHit)? Computed once, right after the preflight probe returns,
+// from title+body ALONE (never from root_dirty_engine_paths or resume_point)
+// so it stays a pure "did the prose name the set" signal that deriveUnits can
+// later OR-fold across every live member of a consolidation group, regardless
+// of which member ends up as the group's primary ref. Pure and side-effect-free:
+// returns a NEW array (does not mutate `preflights`) so a probe-died fallback
+// entry (no live body) flows through identically to every other preflight —
+// engineOwnedHit('' , globs) is always null, so it lands false, never throws.
+function attachEngineOwnedIntentional(preflights, globs) {
+  return (preflights || []).map(function (p) {
+    return Object.assign({}, p, { engineOwnedIntentional: !!engineOwnedHit((p.title || '') + '\n' + (p.body || ''), globs) })
+  })
+}
+
+// applyEngineOwnedRootDirtySkip: regime (a) of the three-regime model (issue
+// #3, ENGINE_OWNED_GLOBS module comment) — an issue whose OWN prose plainly
+// targets an engine-owned path (engineOwnedIntentional), probed while the
+// ROOT working tree is ALREADY dirty under that same set, is routed to
+// select-skip instead of being implemented mid-run: the state actually
+// driving this run lives only uncommitted at ROOT, so any worktree checkout
+// this run builds is stale relative to it (the #77 hazard) — implementing
+// from it risks silently reconciling/clobbering the newer uncommitted state.
+// Regime (b) (prose targets the set, root clean — deliberate engine work,
+// e.g. issue #3 itself) and regime (c) (root dirty for unrelated reasons, or
+// prose doesn't target the set) are both left untouched here; only the (a)
+// intersection flips resume_point.
+// Pure: returns { preflights: <NEW array>, flagged: [issueNumbers] } rather
+// than mutating in place, so the Select-phase caller can both use the updated
+// preflights AND log the root-dirty condition exactly once (not once per
+// flagged issue) — see the caller for that single log line.
+function applyEngineOwnedRootDirtySkip(preflights) {
+  const flagged = []
+  const out = (preflights || []).map(function (p) {
+    const dirty = Array.isArray(p.root_dirty_engine_paths) ? p.root_dirty_engine_paths : []
+    if (!p.engineOwnedIntentional || !dirty.length) return p
+    flagged.push(p.issue)
+    return Object.assign({}, p, {
+      resume_point: 'skip',
+      reason: 'engine-owned path targeted by this issue, and the root working tree is already dirty under it (' + dirty.join(', ') + ') — run this issue solo outside a batch, or after the run completes',
+    })
+  })
+  return { preflights: out, flagged: flagged }
+}
+
 async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
   const simplifyGlobs = PROFILE.simplify_globs || null
   const inScope = function (f) { return matchesGlobs(f, simplifyGlobs) }
@@ -1846,6 +2047,99 @@ async function runBrowserCheck(ctx, where) {
     collectNotes(ctx, 'browser-fix', fix)
   }
   return { ok: false, error: 'browser verification still failing after ' + MAX_BROWSER_ITERATIONS + ' iterations (' + where + ')' }
+}
+
+// =============================================================================
+// ENGINE-OWNED GATE (issue #3, regimes b/c) — the deterministic post-implement
+// backstop. scopeGuard()'s engine-owned clause (above) is advisory layer 1; this
+// is layer 2. Modeled on runBrowserCheck immediately above: a READ-ONLY probe
+// runs `git diff --name-only` against the batch baseline and returns every
+// changed file; JS (never the agent) filters that list via matchesGlobs against
+// ENGINE_OWNED, then routes on ctx.engineOwnedIntentional — computed once at
+// Select from THIS issue's own prose (engineOwnedHit) and OR-folded across a
+// consolidation group's live members (deriveUnits) — per the three-regime model
+// documented above ENGINE_OWNED_GLOBS:
+//   (b) intentional: this issue's own prose plainly targets the engine-owned
+//       set, so an engine-owned diff is expected, deliberate work (e.g. issue
+//       #3 itself). Leave the implementation exactly as committed — no revert.
+//   (c) NOT intentional, but engine-owned paths showed up in the diff anyway:
+//       the incidental/paraphrased silent-restore vector nonconvexlabs-com #77
+//       actually was. A single-purpose stage hard-reverts ONLY the paths where
+//       isHardRevertPath(f, ENGINE_OWNED, LOCKSTEP_INSTALLED_PATHS) is true —
+//       lockstep-installed paths (e.g. this repo's own
+//       .claude/workflows/ticketmill.js) are deliberately exempted so a
+//       source-of-truth edit's installed lockstep copy is never clobbered by
+//       this gate; any resulting divergence is left for the test loop's own
+//       lint-engine byte-compare to catch in-band — see isHardRevertPath's doc
+//       comment — to the batch baseline (origin/TARGET), commits, and pushes.
+// Placed BEFORE runTestLoop() in implementIssue() (not near runBrowserCheck,
+// which runs AFTER the test loop) so a revert this gate makes is re-validated
+// by the SAME run's test suite / lint-engine byte-compare, in-band, rather
+// than landing unverified.
+// Never halts the run on its own: a dead probe or a failed/dead revert stage
+// degrades to a recorded deferred follow-up (mirrors the anti-pattern rule —
+// a skipped verification must be recorded, never silently swallowed) so a
+// plumbing hiccup in this gate never blocks an otherwise-green issue.
+// Returns { ok: true } always.
+// =============================================================================
+async function runEngineOwnedGate(ctx) {
+  if (!ENGINE_OWNED.length) return { ok: true }
+  const probe = await stage(ctx, 'engine-owned-probe', [
+    'READ-ONLY probe for issue #' + ctx.issue + ': list every file this issue\'s implementation changed. Run exactly:',
+    'git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --name-only',
+    'Return changed_files (the output lines as an array; empty array if none).',
+  ].join('\n'), stageOpts('probe'), DIFF_PROBE_SCHEMA)
+  if (!probe) {
+    log('#' + ctx.issue + ' engine-owned gate: diff probe died — degrading (recorded), not blocking the issue')
+    ctx.deferred.push('Engine-owned guardrail: the post-implement diff probe died, so this pass could not check for incidental changes to ' + ENGINE_OWNED.join(', ') + ' — verify manually before merge.')
+    return { ok: true }
+  }
+  const engineFiles = (probe.changed_files || []).filter(function (f) { return matchesGlobs(f, ENGINE_OWNED) })
+  if (!engineFiles.length) return { ok: true }
+
+  if (ctx.engineOwnedIntentional) {
+    log('#' + ctx.issue + ' engine-owned gate: regime (b) deliberate engine work — leaving ' + engineFiles.length + ' engine-owned file(s) in place: ' + engineFiles.join(', '))
+    return { ok: true }
+  }
+
+  const revertFiles = engineFiles.filter(function (f) { return isHardRevertPath(f, ENGINE_OWNED, LOCKSTEP_INSTALLED_PATHS) })
+  const exemptFiles = engineFiles.filter(function (f) { return !isHardRevertPath(f, ENGINE_OWNED, LOCKSTEP_INSTALLED_PATHS) })
+  if (exemptFiles.length) {
+    log('#' + ctx.issue + ' engine-owned gate: ' + exemptFiles.length + ' lockstep-installed path(s) left in place (regime (c) exemption): ' + exemptFiles.join(', '))
+    ctx.deferred.push('Engine-owned guardrail: incidental change(s) to lockstep-installed path(s) — ' + exemptFiles.join(', ') + ' — were NOT reverted (lockstep exemption); verify the lockstep pair stayed in sync (lint-engine) before merge.')
+  }
+  if (!revertFiles.length) return { ok: true }
+
+  log('#' + ctx.issue + ' engine-owned gate: regime (c) incidental change — hard-reverting ' + revertFiles.join(', ') + ' to origin/' + TARGET)
+  const revert = await stage(ctx, 'engine-owned-revert', [
+    'The scope guard\'s OUT-OF-SCOPE clause above (engine-owned paths — do not stage, commit, or restore them) does NOT',
+    'apply to this stage: this stage IS the deterministic guardrail acting on your behalf. Carry out the steps below.',
+    '',
+    'Regime (c) engine-owned guardrail for issue #' + ctx.issue + ' in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ':',
+    'This issue\'s implementation incidentally changed engine-owned path(s) that this issue does NOT target (its title/body',
+    'never names them) — these are read-only tooling artifacts of the run itself (the ticketmill profile, agent roster, or',
+    'engine copy), not this issue\'s application code.',
+    '',
+    'Hard-revert EXACTLY these paths to the batch baseline, and touch NOTHING else:',
+    revertFiles.map(function (f) { return '- ' + f }).join('\n'),
+    '',
+    '1. git -C ' + ctx.worktree + ' checkout origin/' + TARGET + ' -- ' + revertFiles.map(function (f) { return '"' + f + '"' }).join(' '),
+    '2. Confirm the revert is exact: git -C ' + ctx.worktree + ' diff origin/' + TARGET + ' -- ' + revertFiles.map(function (f) { return '"' + f + '"' }).join(' ') + ' (must be empty)',
+    '3. git -C ' + ctx.worktree + ' commit -m "revert(engine): drop incidental engine-owned change(s) (#' + ctx.issue + ')"',
+    '4. git -C ' + ctx.worktree + ' push origin ' + ctx.branch,
+    '',
+    'Restore ONLY via that checkout from origin/' + TARGET + ' — never from git log/reflog/history on this branch, and never by',
+    're-authoring the file yourself. Stage and commit nothing outside the listed paths.',
+    'Return status, commit, files_changed, summary.',
+  ].join('\n'), stageOpts('fix'), FIX_SCHEMA, 1)
+  if (!revert || revert.status === 'error') {
+    log('#' + ctx.issue + ' engine-owned gate: revert stage failed/died — degrading (recorded), not blocking the issue')
+    ctx.deferred.push('Engine-owned guardrail: automatic revert of incidental engine-owned change(s) to ' + revertFiles.join(', ') + ' FAILED — a human must verify/revert these paths manually before merge.')
+    return { ok: true }
+  }
+  pushDecision(ctx, 'Engine-Owned Guardrail', 'Reverted incidental engine-owned change(s) to the batch baseline (origin/' + TARGET + '): ' + revertFiles.join(', ') + '. Commit: ' + (revert.commit || 'n/a') + '.')
+  ctx.deferred.push('Engine-owned guardrail: incidental change(s) to ' + revertFiles.join(', ') + ' were reverted to the batch baseline — if this was actually intentional engine work, redo it as its own dedicated issue that names the path(s) so it is recognized as deliberate.')
+  return { ok: true }
 }
 
 // =============================================================================
@@ -2969,6 +3263,10 @@ async function implementIssue(ctx) {
   if (tasksCompleted === 0) return fail(ctx, 'failed', 'implement', 'no tasks completed (' + failedTasks.length + ' failed)')
   if (failedTasks.length) ctx.deferred.push('Tasks that failed review and were NOT completed: ' + failedTasks.join(', '))
 
+  // ---- ENGINE-OWNED GATE (issue #3) — BEFORE the test loop so a hard-revert
+  // is re-validated by the same run's test suite / lint-engine in-band. ----
+  await runEngineOwnedGate(ctx)
+
   // ---- TEST LOOP ----
   const tl = await runTestLoop(ctx)
   if (!tl.ok) return fail(ctx, STOP.tripped ? 'halted' : 'failed', 'test-loop', tl.error)
@@ -3217,6 +3515,12 @@ async function processIssue(pre) {
     // unit-of-work abstraction must preserve.
     members: Array.isArray(pre.members) && pre.members.length ? pre.members : [pre],
     groupId: ('groupId' in pre && pre.groupId != null) ? pre.groupId : null, // stable consolidation-group id; null outside a group
+    // engineOwnedIntentional (issue #3): deriveUnits() OR-folds this across a
+    // group's live memberRefs (or spreads a singleton's own value through) —
+    // see the comment above deriveUnits(). runEngineOwnedGate() reads it off
+    // ctx (not pre) so every stage downstream of this init sees the same
+    // threaded value.
+    engineOwnedIntentional: !!pre.engineOwnedIntentional,
     metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0 },
     tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
   }
@@ -3396,6 +3700,8 @@ function __seed(o) {
   if ('TARGET' in o) TARGET = o.TARGET
   if ('REPO' in o) REPO = o.REPO
   if ('ROOT' in o) ROOT = o.ROOT
+  if ('ENGINE_OWNED' in o) ENGINE_OWNED = o.ENGINE_OWNED
+  if ('LOCKSTEP_INSTALLED_PATHS' in o) LOCKSTEP_INSTALLED_PATHS = o.LOCKSTEP_INSTALLED_PATHS
 }
 
 // ---- TICKETMILL-TEST-HARNESS-SPLIT: tests/harness.js truncates the source at this
@@ -3441,6 +3747,8 @@ LOGS = ROOT + '/' + String(PROFILE.logs_dir || 'logs/ticketmill').replace(/^\/+|
 CLAIM_LABEL = String(PROFILE.claim_label || 'ticketmill')
 BROWSER = PROFILE.browser || null
 if (BROWSER && !BROWSER.serve_command) throw new Error('profile.browser is set but has no serve_command — browser verification cannot boot the app')
+ENGINE_OWNED = mergeEngineOwnedGlobs(PROFILE)
+LOCKSTEP_INSTALLED_PATHS = Array.isArray(PROFILE.lockstep_installed_paths) ? PROFILE.lockstep_installed_paths.map(String) : []
 
 // ---- Select: resolve roles against the target repo's agent roster ----
 const R = PROFILE.roles || {}
@@ -3539,6 +3847,12 @@ const learnPromise = agent([
   .catch(function (e) { log('learnings digest failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
 
 // ---- Select: preflight probe (the GitHub-state healing layer) ----
+// enginePathspec (issue #3): the literalized engine-owned pathspec, computed
+// ONCE here (ENGINE_OWNED is already populated — profile is loaded) using the
+// same literalization buildEngineOwnedPathspec shares with engineOwnedHit, and
+// interpolated into every probe below so `git status --porcelain` gets plain
+// literal paths, never the raw '**' globs it doesn't interpret.
+const enginePathspec = buildEngineOwnedPathspec(ENGINE_OWNED)
 // One shared fetch of origin/TARGET before the per-issue Promise.all below —
 // each probe's predicted_files step reads this ref read-only. Fetching it once
 // here (rather than once per issue inside the unbounded Promise.all) avoids N
@@ -3556,7 +3870,7 @@ if (!targetFetch || targetFetch.status !== 'success') log('preflight: git fetch 
 // depends_on parsing — a body reference to an issue outside the batch is
 // dropped (there's no unit for computeLanes to point it at).
 const batchIssueNumbers = issueList.map(function (it) { return it.number })
-const preflights = (await Promise.all(issueList.map(function (it) {
+let preflights = (await Promise.all(issueList.map(function (it) {
   return agent([
     'Probe the current state of GitHub issue #' + it.number + ' in ' + REPO + ' (READ-ONLY: gh + git inspection, no changes).',
     '',
@@ -3566,6 +3880,9 @@ const preflights = (await Promise.all(issueList.map(function (it) {
     '   Prefer: merged > open > closed-unmerged. Report its number and state.',
     '3. Local: does ' + WORKTREES + '/issue-' + it.number + ' exist, and on what branch? Commits ahead:',
     '   git -C ' + ROOT + ' rev-list --count origin/' + TARGET + '..<branch> 2>/dev/null (0/none if no branch).',
+    '4. Engine-owned guardrail (issue #3): is the ROOT working tree dirty under any engine-owned path right now?',
+    '   git -C ' + ROOT + ' status --porcelain -- ' + enginePathspec.join(' '),
+    '   Return every dirty path under that pathspec as root_dirty_engine_paths (empty array if the pathspec is clean).',
     '',
     '4. predicted_files (best-effort lane-scheduling hint — fail open to [] on ANY doubt, never guess a path):',
     '   a. From the issue title + body, extract ONLY high-signal identifiers: backticked spans (`like this`),',
@@ -3594,7 +3911,7 @@ const preflights = (await Promise.all(issueList.map(function (it) {
     '- "skip": issue is closed OR a related PR is already merged',
     '- "process_pr": a related PR is OPEN (implementation exists; it needs review + merge)',
     '- "implement": otherwise (fresh, or partial branch/worktree — implementation will continue from existing commits)',
-    'Return issue, title, issue_state, pr_number, pr_state, branch, worktree_exists, commits_ahead, resume_point, reason (one line),',
+    'Return issue, title, body, issue_state, pr_number, pr_state, branch, worktree_exists, commits_ahead, resume_point, reason (one line), root_dirty_engine_paths,',
     'predicted_files (array of real repo-relative paths, [] if none/uncertain), depends_on (array of in-batch issue numbers, [] if none/uncertain).',
   ].join('\n'), { label: it.number + ':preflight', phase: 'Select', schema: PREFLIGHT_SCHEMA, model: M.probe.model, effort: M.probe.effort })
     .then(function (r) {
@@ -3608,11 +3925,28 @@ const preflights = (await Promise.all(issueList.map(function (it) {
         return r
       }
       // probe died -> assume full implement; the pipeline stages are individually idempotent
-      return { issue: it.number, title: it.title || '', issue_state: 'unknown', pr_number: null, pr_state: 'none', branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)', predicted_files: [], depends_on: [] }
+      return { issue: it.number, title: it.title || '', body: '', issue_state: 'unknown', pr_number: null, pr_state: 'none', branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)', root_dirty_engine_paths: [], predicted_files: [], depends_on: [] }
     })
 }))).filter(Boolean)
 
+// engineOwnedIntentional (issue #3): computed once per preflight, right after
+// the probe returns, from THIS issue's own title+body — see the module
+// comment above ENGINE_OWNED_GLOBS for the three-regime model this feeds, and
+// deriveUnits()'s OR-fold for how it threads onto a consolidation-group unit.
+preflights = attachEngineOwnedIntentional(preflights, ENGINE_OWNED)
+
 for (const p of preflights) log('#' + p.issue + ' preflight: ' + p.resume_point + ' — ' + p.reason)
+
+// ---- Select: engine-owned root-dirty skip — regime (a) of the three-regime
+// model (ENGINE_OWNED_GLOBS module comment): this issue's own prose targets an
+// engine-owned path AND the root working tree is already dirty under that set
+// (the #77 hazard). Deterministic JS, run BEFORE the consolidation gate below
+// so a flagged issue is neither offered to proposeConsolidation() (its residual
+// filter only admits resume_point === 'implement') nor claimed (toClaim filters
+// resume_point !== 'skip') — both existing gates, no new plumbing needed.
+const engineSkip = applyEngineOwnedRootDirtySkip(preflights)
+preflights = engineSkip.preflights
+if (engineSkip.flagged.length) log('engine-owned guardrail: root working tree dirty under an engine-owned path targeted by issue(s) ' + engineSkip.flagged.join(', ') + ' — routed to select-skip (regime a)')
 
 const learnR = await learnPromise
 if (learnR && learnR.found) {

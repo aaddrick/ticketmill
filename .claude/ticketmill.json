@@ -19,6 +19,7 @@
     "Node >= 22 required."
   ],
   "browser": null,
+  "lockstep_installed_paths": [".claude/workflows/ticketmill.js"],
   "models": {},
   "roles": {
     "implementers": ["ticketmill-implementer"],

@@ -1,5 +1,131 @@
 # Changelog
 
+## 0.1.26 (2026-07-19)
+
+- Docs (#3, tech-docs stage): added an "Engine-owned path guardrail: three
+  regimes" section to `docs/ARCHITECTURE.md`, covering the select-phase skip
+  (regime a), deliberate engine work with a clean root (regime b), and the
+  post-implement hard-revert gate for incidental changes (regime c), plus
+  `scopeGuard()`'s advisory clause and the revert stage's override. Names the
+  incident (nonconvexlabs-com#77) and the `profile.engine_owned_globs` /
+  `profile.lockstep_installed_paths` fields. `skills/mill/SKILL.md` and
+  `skills/mill-init/SKILL.md` already covered the user-facing side (task 4);
+  this closes the design-decision record in ARCHITECTURE.md, which had no
+  entry for the new machinery. No engine code changed.
+
+## 0.1.25 (2026-07-19)
+
+- Docs (#3, task 4 of 4): closed out the engine-owned path guardrail with doc
+  notes in `skills/mill/SKILL.md` and `skills/mill-init/SKILL.md`. `mill` now
+  explains why a config-changing issue needs a clean root tree before launch:
+  the engine only sees committed state per worktree, so an uncommitted
+  root-tree edit under an engine-owned path can get silently clobbered by a
+  stale committed version. `mill-init` documents the
+  `lockstep_installed_paths` profile field, the escape hatch that keeps this
+  repo's own self-hosted `.claude/workflows/ticketmill.js` copy out of the
+  post-implement hard-revert gate. No engine code changed; lockstep copy and
+  full `test_command` suite reverified clean.
+
+## 0.1.24 (2026-07-19)
+
+- Fix (#3, task 3 quality fix): resolved a prompt self-contradiction flagged
+  in quality review. `scopeGuard()`'s engine-owned advisory clause is
+  prepended to EVERY stage prompt, including `runEngineOwnedGate`'s own
+  `engine-owned-revert` stage — so the agent carrying out a regime (c)
+  revert was told, one paragraph earlier in the same prompt, never to stage,
+  commit, or restore those exact paths. The revert stage's prompt now opens
+  with an explicit override line stating the guard clause does not apply to
+  it ("this stage IS the deterministic guardrail acting on your behalf"),
+  ahead of the checkout/commit/push instructions it excuses. Added a
+  dedicated `tests/engine-owned.test.js` case asserting both the guard
+  clause and the override are present, and that the override precedes the
+  checkout instruction.
+
+## 0.1.23 (2026-07-19)
+
+- Engine-owned path guardrail, task-time backstop (#3, task 3 of 4): two
+  layers now enforce regimes (b)/(c) of the three-regime model during
+  implementation, on top of task 2's select-phase regime (a) skip.
+  Layer 1 (advisory): `scopeGuard()` — prepended to EVERY stage prompt,
+  unconditionally, not just at concurrency > 1 — appends a clause naming
+  `ENGINE_OWNED` and instructing agents never to stage, commit, or restore
+  those paths from git history for any reason, surfacing a discrepancy as a
+  deferred note instead. Layer 2 (deterministic backstop): a new
+  `runEngineOwnedGate(ctx)`, modeled on `runBrowserCheck`, runs right after
+  the task/quality loop and BEFORE `runTestLoop` (so a revert this gate makes
+  is re-validated by the SAME run's test suite / `lint-engine` byte-compare,
+  in-band). A read-only probe lists this issue's changed files against the
+  batch baseline; JS (never the agent) filters via `matchesGlobs` against
+  `ENGINE_OWNED`, then routes on `ctx.engineOwnedIntentional` (now threaded
+  onto `ctx` at `processIssue()` init from the `deriveUnits()`-shaped unit):
+  regime (b) — this issue's own prose targets the set — leaves the
+  implementation exactly as committed, no revert; regime (c) — it doesn't,
+  but engine-owned paths showed up anyway — a single-purpose stage hard
+  reverts ONLY the paths where `isHardRevertPath(f, ENGINE_OWNED,
+  LOCKSTEP_INSTALLED_PATHS)` is true to the batch baseline, commits, and
+  pushes, while lockstep-installed paths (e.g. this repo's own
+  `.claude/workflows/ticketmill.js`) are left in place for the test loop's
+  own lint-engine byte-compare to catch any divergence in-band. The gate
+  never halts the run on its own — a dead probe or a failed/dead revert
+  degrades to a recorded `ctx.deferred` follow-up instead of blocking an
+  otherwise-green issue. Added `tests/engine-owned.test.js` coverage for
+  `runEngineOwnedGate` across every regime and edge case, including a
+  group-threaded non-primary deliberate member correctly NOT being reverted,
+  and a lockstep path nested under an engine-owned directory glob being left
+  in place alongside an exact-file lockstep path while sibling engine-owned
+  paths still revert; extended `tests/scope-guard.test.js` for the new
+  advisory clause. Task 4 (doc notes in `skills/mill/SKILL.md` and
+  `skills/mill-init/SKILL.md`) remains.
+
+## 0.1.22 (2026-07-19)
+
+- Engine-owned path guardrail, select-phase skip (#3, task 2 of 4): the
+  preflight probe now also reads each issue's `body` and runs
+  `git -C ROOT status --porcelain` against the literalized engine-owned
+  pathspec (`buildEngineOwnedPathspec`, computed once after the profile
+  loads), returning any dirty paths as a new `root_dirty_engine_paths` field
+  (both added to `PREFLIGHT_SCHEMA`). A JS pass right after the probe returns
+  computes `engineOwnedIntentional` per issue (`engineOwnedHit` over
+  title+body) and attaches it; `deriveUnits` OR-folds the flag across a
+  group's live members (`memberRefs.some`) instead of inheriting only the
+  primary's own flag, since `pickPrimary` picks a primary for group-identity
+  reasons unrelated to intent. A deterministic pass between the preflight log
+  and the consolidation gate — regime (a) of the three-regime model — flips
+  `resume_point` to `skip` for any issue where `engineOwnedIntentional` is
+  true AND `root_dirty_engine_paths` is non-empty, naming the dirty paths and
+  the safe path in the reason; the existing skip branch, claim filter, and
+  `reconcileGroups`/`deriveUnits` member-drop handle it from there with no
+  new plumbing. Added `tests/engine-owned.test.js` coverage for
+  `attachEngineOwnedIntentional` and `applyEngineOwnedRootDirtySkip` (all
+  three regimes) plus an end-to-end test proving a flagged issue is excluded
+  from both consolidation candidacy and the claim filter, and
+  `tests/consolidation.test.js` coverage proving a group's
+  `engineOwnedIntentional` is true even when the deliberate-engine member
+  isn't the primary. Regime (b) (deliberate engine work, clean root — e.g.
+  issue #3 itself) and the post-implement hard-revert gate (regime (c)) are
+  task 3.
+
+## 0.1.21 (2026-07-19)
+
+- Engine-owned path guardrail, foundation (#3, task 1 of 4): added
+  `ENGINE_OWNED_GLOBS` (`.claude/ticketmill.json`, `.claude/agents/**`,
+  `.claude/workflows/ticketmill.js`, `.claude/scripts/ticketmill/**`) — paths
+  a run must treat as read-only, extensible via a new optional
+  `profile.engine_owned_globs` (`mergeEngineOwnedGlobs`). Added a new optional
+  `profile.lockstep_installed_paths` (default `[]`) naming engine-owned paths
+  that are a deliberate installed copy of a source-of-truth file elsewhere in
+  the repo; this repo sets `[".claude/workflows/ticketmill.js"]`. Three pure
+  helpers, unit-tested via `tests/engine-owned.test.js`:
+  `engineOwnedHit(text, globs)` (case-sensitive substring hit against a
+  literalized prefix, for detecting when an issue's prose plainly targets an
+  engine-owned path), `buildEngineOwnedPathspec(globs)` (the same
+  literalization built into a `git ... --` pathspec), and
+  `isHardRevertPath(file, engineGlobs, lockstepPaths)` (file-level predicate
+  built on the existing `matchesGlobs`, not a glob-string set difference, so a
+  lockstep path nested under a directory glob is correctly exempted). Neither
+  helper is wired into a gate yet — that's tasks 2 (select-phase skip) and 3
+  (post-implement hard-revert) of #3.
+
 ## 0.1.20 (2026-07-19)
 
 - Test quality fix for the merge auto-resolve harness coverage (#2): closed a

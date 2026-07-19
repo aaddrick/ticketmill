@@ -182,6 +182,10 @@ function readGlobal(context, expr) {
  *               defaults to a self-reference singleton [{issue: <this ctx's issue>}],
  *               matching processIssue()'s own default for a no-group run.
  *   groupId   - number|null, stable consolidation-group id; null outside a group
+ *   engineOwnedIntentional - boolean, issue #3's three-regime flag threaded onto
+ *               ctx at processIssue() init (deriveUnits()'s OR-fold or a
+ *               singleton's own value); runEngineOwnedGate() reads it off ctx.
+ *               Defaults false, matching an ordinary application-code issue.
  *   metrics   - { approach_iters, plan_iters, tasks_done, tasks_failed,
  *                 task_review_attempts, quality_iters, quality_degrades,
  *                 test_iters, browser_iters, pr_review_iters } — all start at 0;
@@ -212,6 +216,7 @@ function makeCtx(overrides) {
       approach: '',
       members: [{ issue: issue }],
       groupId: null,
+      engineOwnedIntentional: false,
       metrics: freshMetrics(),
       tokens: freshTokens(),
     },

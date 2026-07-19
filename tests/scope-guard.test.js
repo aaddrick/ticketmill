@@ -73,3 +73,40 @@ test('scopeGuard: a group unit with a PR appends the PR number to both the ident
   assert.ok(guard.includes('consolidation group 1 of aaddrick/ticketmill-fixture (PR #20), covering member issues: #1, #4.'))
   assert.ok(guard.includes('MUST target one of these member issues (#1, #4) or PR #20 exactly'))
 })
+
+// ---- engine-owned advisory clause (issue #3, defense-in-depth layer 1) ----
+
+test('scopeGuard: appends the engine-owned advisory clause, naming every path, when ENGINE_OWNED is populated', function () {
+  const context = harness.boot()
+  context.__seed({ REPO: 'aaddrick/ticketmill-fixture', ENGINE_OWNED: ['.claude/ticketmill.json', '.claude/agents/**'] })
+  const ctx = harness.makeCtx({ issue: 4, pr: null })
+
+  const guard = context.scopeGuard(ctx)
+
+  assert.ok(guard.includes('Engine-owned paths (.claude/ticketmill.json, .claude/agents/**) are OUT OF SCOPE'))
+  assert.ok(guard.includes('do not stage, commit, or restore them from git history'))
+  assert.ok(guard.includes('surface the discrepancy as a'))
+})
+
+test('scopeGuard: omits the engine-owned clause entirely when ENGINE_OWNED is empty (unseeded default)', function () {
+  const context = harness.boot()
+  context.__seed({ REPO: 'aaddrick/ticketmill-fixture' })
+  const ctx = harness.makeCtx({ issue: 4, pr: null })
+
+  const guard = context.scopeGuard(ctx)
+
+  assert.ok(!guard.includes('Engine-owned paths'))
+})
+
+test('scopeGuard: the engine-owned clause is unconditional — present for a group unit too, not just singletons', function () {
+  const context = harness.boot()
+  context.__seed({ REPO: 'aaddrick/ticketmill-fixture', ENGINE_OWNED: ['.claude/workflows/ticketmill.js'] })
+  const ctx = harness.makeCtx({
+    issue: 1, pr: null, groupId: 1,
+    members: [{ issue: 1 }, { issue: 2 }],
+  })
+
+  const guard = context.scopeGuard(ctx)
+
+  assert.ok(guard.includes('Engine-owned paths (.claude/workflows/ticketmill.js) are OUT OF SCOPE'))
+})
