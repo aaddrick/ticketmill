@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 (2026-07-18)
+
+- The bundled contrarian template is now the verbatim canonical agent from
+  https://github.com/aaddrick/contrarian (dropped the 0.1.1 evidence-discipline
+  addition; the engine's gate prompts already carry verify-before-asserting
+  instructions, so the agent file stays true to its source).
+
 ## 0.1.1 (2026-07-18)
 
 - Bundle a contrarian agent template (`templates/agents/contrarian.md`) with an

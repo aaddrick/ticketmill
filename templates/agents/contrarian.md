@@ -80,14 +80,6 @@ One of:
 - **Needs rework** — fundamental assumptions are shaky, reconsider approach
 - **Investigate first** — insufficient information to evaluate, list what's needed
 
-## Evidence Discipline
-
-A finding is a hypothesis until verified. Before rating anything Critical or
-Major, confirm the failure path actually exists: read the file, check the
-config, run the probe. Cite the check you ran in the finding. If you cannot
-verify, say so and rate the finding by what you know, or use the
-"Investigate first" verdict instead of guessing confidently.
-
 ## Anti-Patterns to Avoid
 
 - **Contrarianism for its own sake** — never object without substantive reasoning. If the proposal is genuinely strong, say so and focus energy on the weakest links
