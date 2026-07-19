@@ -1130,6 +1130,50 @@ function aggregateTokens(results, spent, concurrency) {
   }
 }
 
+// aggregateMergeAutoResolve: JS-computed run-level rollup of runMergeAutoResolve
+// activity (see that function) — no LLM math, injected verbatim below, same
+// pattern as aggregateTokens above. Reads ctx.metrics.merge_auto_resolved /
+// merge_thrash off EVERY result (fail() carries ctx.metrics through too, so a
+// thrash-escalated needs_human result is counted here even though it never
+// reached 'completed'). resolved_count only ever reflects issues that actually
+// MERGED after auto-resolve (see runMergeAutoResolve's own doc comment on why
+// the metric bumps post-merge, not post-rebase) — thrash_count is a distinct,
+// non-overlapping bucket: an issue that thrashed escalated to needs_human and
+// therefore never also incremented merge_auto_resolved.
+function aggregateMergeAutoResolve(results) {
+  const list = results || []
+  const resolvedIssues = []
+  const thrashIssues = []
+  for (const r of list) {
+    const m = r && r.metrics
+    if (m && m.merge_auto_resolved) resolvedIssues.push(r.issue)
+    if (m && m.merge_thrash) thrashIssues.push(r.issue)
+  }
+  const lines = []
+  lines.push('## Merge Auto-Resolution')
+  lines.push('')
+  if (!resolvedIssues.length && !thrashIssues.length) {
+    lines.push('No CONFLICTING PRs this run — nothing to auto-resolve.')
+  } else {
+    lines.push(resolvedIssues.length
+      ? resolvedIssues.length + ' issue(s) auto-resolved: CONFLICTING after review, rebased onto the batch branch, ' +
+        're-tested green, force-pushed, then merged — ' + fmtIssues(resolvedIssues) + '.'
+      : '0 issue(s) auto-resolved this run.')
+    if (thrashIssues.length) {
+      lines.push('')
+      lines.push(thrashIssues.length + ' issue(s) hit the thrash guard (batch branch moved again while the mandatory ' +
+        're-test ran) and escalated to needs_human instead of a silent re-rebase — ' + fmtIssues(thrashIssues) + '.')
+    }
+  }
+  return {
+    resolved_count: resolvedIssues.length,
+    resolved_issues: resolvedIssues,
+    thrash_count: thrashIssues.length,
+    thrash_issues: thrashIssues,
+    markdown: lines.join('\n'),
+  }
+}
+
 // Best-effort halt note on the issue so humans can triage from GitHub alone. For a
 // consolidation group (ctx.members.length > 1), the SAME halt fires the same note
 // on EVERY member issue — not just the primary — naming the group so a human
@@ -3252,6 +3296,9 @@ if (HELD_CLAIMS.length) {
 // ---- Token usage: JS-computed aggregation (no LLM math), injected verbatim below ----
 const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY)
 
+// ---- Merge auto-resolution: JS-computed run-level rollup, injected verbatim below ----
+const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
+
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
 const completedIssues = results.filter(function (r) { return r && r.status === 'completed' })
@@ -3288,6 +3335,8 @@ if (completedIssues.length) {
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
     '   - a note that per-issue PRs were squash-merged into ' + TARGET + ' with full review trails on each issue.',
+    '   - this "## Merge Auto-Resolution" section, injected VERBATIM (already computed in JS — do not recompute,',
+    '     re-sum, or add commentary beyond copying it in):\n' + MERGE_RESOLVE_AGG.markdown,
     '   - this "## Token Usage" section, injected VERBATIM (already computed in JS — do not recompute, re-sum,',
     '     or add commentary beyond copying it in):\n' + TOKEN_AGG.markdown,
     '3. If one exists: update its body to the current results (gh pr edit) and comment that the run refreshed it.',
@@ -3305,6 +3354,7 @@ const resultsJson = JSON.stringify({
   state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts,
   verification_gaps: VERIFY_SKIPS, tokens_spent: budget.spent(),
   tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
+  merge_auto_resolve: { resolved_count: MERGE_RESOLVE_AGG.resolved_count, resolved_issues: MERGE_RESOLVE_AGG.resolved_issues, thrash_count: MERGE_RESOLVE_AGG.thrash_count, thrash_issues: MERGE_RESOLVE_AGG.thrash_issues },
   consolidation_groups: finalGroups,
   results: results,
 }, null, 2)
@@ -3321,7 +3371,10 @@ const report = await agent([
   '   so list them explicitly here rather than only showing the primary\'s row in the results table), a',
   '   "Verification Gaps" section if verification_gaps is non-empty, a failures section with halt stages, and —',
   '   if state is not "completed" — a "Resume" section: re-run ticketmill with the same args (preflight skips',
-  '   finished work) or resume via resumeFromRunId. Include this "## Token Usage" section VERBATIM (already',
+  '   finished work) or resume via resumeFromRunId. Include this "## Merge Auto-Resolution" section VERBATIM',
+  '   (already computed in JS — do not recompute, re-sum, or add commentary beyond copying it in):',
+  MERGE_RESOLVE_AGG.markdown,
+  '   Include this "## Token Usage" section VERBATIM (already',
   '   computed in JS — do not recompute, re-sum, or add commentary beyond copying it in):',
   TOKEN_AGG.markdown,
   '4. Include the current timestamp from: date -Iseconds',
@@ -3363,6 +3416,8 @@ return {
   batch_pr: batchPr,
   counts: counts,
   verification_gaps: VERIFY_SKIPS,
+  merge_auto_resolved_count: MERGE_RESOLVE_AGG.resolved_count,
+  merge_thrash_count: MERGE_RESOLVE_AGG.thrash_count,
   results: results,
   report: report ? report.report_path : null,
   summary_table: report ? report.markdown_summary : null,
