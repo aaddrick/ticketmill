@@ -90,6 +90,24 @@ test('computeLanes: depends_on resolves against ANY live member\'s issue number,
   assert.strictEqual(lanes.length, 1)
 })
 
+test('computeLanes: a depends_on-only lane with < 2 co-predicted paths is correctly serialized AND never logs a spurious collapse-guard dissolve (the guard only touches heuristic edges)', function () {
+  const context = bootLanes()
+  const units = [unit(1, ['a.js'], { depends_on: [2] }), unit(2, ['b.js'])]
+  const lanes = context.computeLanes(units, [])
+  assert.strictEqual(lanes.length, 1, 'depends_on unites the pair into one lane regardless of path cohesion')
+  assert.deepStrictEqual(Array.from(lanes[0].unitIndices), [0, 1])
+  assert.ok(!context.logs.some(function (l) { return /collapse guard dissolved/.test(l) }),
+    'a trusted-only lane (no heuristic edge involved) must never be reported as dissolved — it was never touched by the guard')
+})
+
+test('computeLanes: serialize_globs-only lane with < 2 co-predicted paths never logs a spurious collapse-guard dissolve', function () {
+  const context = bootLanes()
+  const units = [unit(1, ['migrations/001.sql']), unit(2, ['migrations/002.sql'])]
+  context.computeLanes(units, ['migrations/**'])
+  assert.ok(!context.logs.some(function (l) { return /collapse guard dissolved/.test(l) }),
+    'a trusted-only lane (serialize_globs, no heuristic edge) must never be reported as dissolved')
+})
+
 // ---- cohesion-aware collapse guard ----
 
 test('computeLanes: a heuristic lane sharing exactly ONE co-predicted path is a single-path promiscuous connector and is dissolved (races)', function () {

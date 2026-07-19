@@ -936,13 +936,19 @@ function computeLanes(units, serializeGlobs) {
     cohesionCount[r] = count
   })
 
+  // roots actually touched by >=1 heuristic edge, so the dissolve log below never
+  // flags a root that only got its members via trusted edges (depends_on /
+  // serialize_globs) — those are never touched by this guard and stay unified.
+  const heuristicRoots = {}
+  for (const e of heuristicEdges) heuristicRoots[find(trial, e.i)] = true
+
   for (const e of heuristicEdges) {
     const r = find(trial, e.i)
     if (cohesionCount[r] >= 2) union(parent, e.i, e.j) // exempt: cohesive cluster, never dissolved
     // else: single-path promiscuous connector — left dissolved, those units race
   }
 
-  const dissolvedLanes = Object.keys(laneMembers).filter(function (r) { return laneMembers[r].length >= 2 && cohesionCount[r] < 2 })
+  const dissolvedLanes = Object.keys(laneMembers).filter(function (r) { return heuristicRoots[r] && laneMembers[r].length >= 2 && cohesionCount[r] < 2 })
   if (dissolvedLanes.length) {
     log('computeLanes: collapse guard dissolved ' + dissolvedLanes.length +
       ' heuristic lane(s) — single-path promiscuous connector(s) with < 2 co-predicted paths; racing instead of serializing')
