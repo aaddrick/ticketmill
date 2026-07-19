@@ -2,8 +2,8 @@
 
 ## 0.1.18 (2026-07-19)
 
-- Added a consolidation gate to Select (#14): an opus-tier judgment call —
-  conservative by design, shared files alone are never sufficient reason — that
+- Added a consolidation gate to Select (#14). It's an opus-tier judgment call,
+  deliberately conservative: shared files alone are never sufficient reason. It
   proposes folding selected issues sharing a subsystem and acceptance surface
   (or an explicit dependency) into one worktree/branch/research/plan/PR. The
   proposal runs the same capped contrarian challenge pattern as the

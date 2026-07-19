@@ -200,8 +200,8 @@ Select can propose folding several selected issues into ONE worktree, branch,
 research/plan pass, and PR when they share a subsystem and acceptance surface
 (or an explicit dependency) closely enough that solving them separately would
 duplicate work. This is a judgment call, not a heuristic: `proposeConsolidation()`
-is an opus-tier gate, prompted with a deliberately conservative bar — grouping
-is the exception, and shared files alone are never sufficient reason, only a
+is an opus-tier gate, prompted with a deliberately conservative bar. Grouping
+is the exception. Shared files alone are never sufficient reason, only a
 hint. The proposal then runs the same capped contrarian challenge pattern as
 the approach/plan gates before it can take effect, reusing `CHALLENGE_SCHEMA`
 and the settled-decisions ledger.
@@ -216,8 +216,8 @@ trail while absorbed members get a "consolidated into #X" marker comment; the
 group PR carries one `Closes #N` per member.
 
 **Stable group id, not the mutable primary.** A group's physical identity
-(worktree path, branch name, PR head) is bound to a `stableGroupId()` — the
-lowest issue number ever in the group — rather than to whichever issue is
+(worktree path, branch name, PR head) is bound to a `stableGroupId()`: the
+lowest issue number ever in the group, rather than to whichever issue is
 currently "primary." The two need to differ: claims settle after the proposal
 is judged, so a proposed primary can turn out to be already claimed or to flip
 to `skip` before materialization, forcing a re-anchor onto another live
@@ -239,44 +239,45 @@ still-contested grouping decision. Conservatism costs nothing here: dissolving
 only forgoes an efficiency, it never blocks progress.
 
 **Profile flag.** `profile.consolidation` (boolean, default `true`) disables
-the gate entirely when set to `false` — no proposal, no contrarian challenge,
-though a resumed run still heals any group a prior run already committed to
-via its comment markers, so turning the flag off mid-run can't strand a group
-that already exists on GitHub. Runs with at most one candidate issue (any
-resume_point) skip the gate for free (there is nothing to group). Only fresh
-`implement`-bound candidates are ever offered to the opus PROPOSE step for a
-brand-new grouping decision; the marker HEAL step runs over every candidate
-regardless of resume_point (see below).
+the gate entirely when set to `false`. No proposal runs and no contrarian
+challenge runs, though a resumed run still heals any group a prior run already
+committed to via its comment markers, so turning the flag off mid-run can't
+strand a group that already exists on GitHub. Runs with at most one candidate
+issue (any resume_point) skip the gate for free: there is nothing to group.
+Only fresh `implement`-bound candidates are ever offered to the opus PROPOSE
+step for a brand-new grouping decision; the marker HEAL step runs over every
+candidate regardless of resume_point (see below).
 
 **Billing anchor.** A group's tokens book under the primary issue, not spread
 across members: `aggregateTokens()`'s per-issue breakdown keys off each
-result's `issue` field, which for a group unit is `ctx.issue` — the
-(possibly re-anchored) primary — so the run report's Token Usage table shows
+result's `issue` field, which for a group unit is `ctx.issue`. That's the
+(possibly re-anchored) primary, so the run report's Token Usage table shows
 one row for the whole group and absorbed members show no row of their own.
 
-**Resumed groups stay grouped across every live resume_point.** `proposeConsolidation()`
-is handed EVERY selected issue's preflight, not just `implement`-bound ones, so its
-HEAL step can recognize a group whose members have since flipped to `process_pr`
-(the shared PR already exists — a prior run created it but crashed or failed
-before merging, in `reviewAndMerge`, which covers spec review, code review, and
-merge) or `skip` (one member resolved independently). `reconcileGroups()` keeps a
-member live — and IN the group — when its resume_point is `implement` OR
-`process_pr`; only `skip` excludes it. That is what keeps a post-PR-crash resume
-routing the whole group through ONE `process_pr` unit (one worktree, one
-`reviewAndMerge` call on the shared PR) instead of splintering into one
-independent `process_pr` singleton per member, each attempting to review/merge
-the SAME PR.
+**Resumed groups stay grouped across every live resume_point.**
+`proposeConsolidation()` is handed EVERY selected issue's preflight, not just
+`implement`-bound ones, so its HEAL step can recognize a group whose members
+have since flipped to `process_pr` (the shared PR already exists: a prior run
+created it but crashed or failed before merging, in `reviewAndMerge`, which
+covers spec review, code review, and merge) or `skip` (one member resolved
+independently). `reconcileGroups()` keeps a member live, and IN the group,
+when its resume_point is `implement` OR `process_pr`; only `skip` excludes it.
+That is what keeps a post-PR-crash resume routing the whole group through ONE
+`process_pr` unit (one worktree, one `reviewAndMerge` call on the shared PR)
+instead of splintering into one independent `process_pr` singleton per
+member, each attempting to review/merge the SAME PR.
 
-**Known gap — partial-branch members aren't excluded.** A member issue that
+**Known gap: partial-branch members aren't excluded.** A member issue that
 already has unmerged work sitting on its own `issue-<N>` branch
 (`commits_ahead > 0` on its preflight) is not currently filtered out of
 consolidation: neither `consolidationCandidates` nor `reconcileGroups()` checks
 `commits_ahead`. If such an issue is folded into a group, `setup-worktree.sh`
-runs against the group's `worktreeAnchor()` instead of the member's own branch,
-so those pre-existing commits are not carried forward — they are effectively
-orphaned rather than merged. This is a known caveat, not yet a mechanical
-exclusion; treat an `implement`-bound issue with nonzero `commits_ahead` as a
-poor consolidation candidate until `reconcileGroups` is extended to drop it.
+runs against the group's `worktreeAnchor()` instead of the member's own
+branch, so those pre-existing commits are not carried forward. They are
+effectively orphaned rather than merged. This is a known caveat, not yet a
+mechanical exclusion; treat an `implement`-bound issue with nonzero
+`commits_ahead` as a poor consolidation candidate until `reconcileGroups` is
+extended to drop it.
 
 ## Failure semantics
 
