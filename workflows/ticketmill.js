@@ -702,7 +702,10 @@ function aggregateTokens(results, spent, concurrency) {
   }
 
   const hasSpent = isFiniteNumber(spent)
-  const runTotal = hasSpent ? spent : (anyTracked ? sumDeltas : null)
+  // run_total must agree with the markdown's "Run total" line, which only ever
+  // renders the guarded budget.spent() figure or "not tracked" — never a
+  // sumDeltas fallback (see CHANGELOG for the Quality Review finding this fixes).
+  const runTotal = hasSpent ? spent : null
   const tracked = anyTracked || hasSpent
   const reconciles = concurrency === 1 && hasSpent && anyTracked
   const remainder = reconciles ? Math.max(0, spent - sumDeltas) : null

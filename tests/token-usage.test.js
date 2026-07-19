@@ -137,6 +137,22 @@ test('aggregateTokens: a result with tokens.tracked===false (ctx existed but no 
   ))
 })
 
+test('aggregateTokens: run_total agrees with the markdown\'s "not tracked" line even when stage deltas WERE tracked but budget.spent() was not', function () {
+  const context = harness.boot()
+  // Quality Review (task 3, iteration 1) regression: budget.spent() unavailable
+  // (hasSpent=false) but a stage delta was still tracked (anyTracked=true). Before
+  // the fix, run_total silently fell back to sumDeltas (a real number) while the
+  // markdown unconditionally said "not tracked" for this same case — a
+  // machine-readable-vs-prose mismatch. run_total must now be null, matching prose.
+  const results = [
+    { issue: 1, tokens: { total: 100, byModel: { sonnet: 100 }, tracked: true } },
+  ]
+  const agg = context.aggregateTokens(results, null, 1)
+
+  assert.strictEqual(agg.run_total, null)
+  assert.ok(agg.markdown.includes('Run total: not tracked (budget.spent() unavailable this run)'))
+})
+
 test('aggregateTokens: empty results array degrades cleanly (no throw, "not tracked" everywhere)', function () {
   const context = harness.boot()
   const agg = context.aggregateTokens([], null, 1)

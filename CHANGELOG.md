@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.16 (2026-07-19)
+
+- Fixed `aggregateTokens()` (#11 quality review) so `resultsJson.tokens.run_total`
+  never disagrees with the "## Token Usage" markdown it ships alongside. When
+  `budget.spent()` is unavailable but a stage delta was still tracked,
+  `run_total` used to fall back to the summed deltas — a real number — while
+  the markdown unconditionally said "Run total: not tracked". `run_total` is
+  now `null` in that case too, matching the prose. Added a regression test in
+  `tests/token-usage.test.js`.
+
 ## 0.1.15 (2026-07-19)
 
 - Added per-run token tracking (#11). `stage()` samples the runtime's guarded
