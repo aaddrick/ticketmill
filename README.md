@@ -90,8 +90,10 @@ registry, so a freshly generated agent works in the very next run, and behavior 
 identical before and after a session restart. Unfilled roles fall back to built-in
 charters and are reported as such.
 
-Missing an agent for a role? `/ticketmill:forge-agent` generates one grounded in
-domain research plus your actual codebase conventions.
+Missing an agent for a role? The contrarian role ships with a bundled template
+that mill-init copies into your repo (preferring a `~/.claude/agents/contrarian.md`
+of your own if one exists). For other gaps, `/ticketmill:forge-agent` generates an
+agent grounded in domain research plus your actual codebase conventions.
 
 ## Profile reference
 
@@ -115,6 +117,7 @@ load-bearing fields:
 .claude-plugin/    plugin.json + marketplace.json (this repo is its own marketplace)
 workflows/         ticketmill.js, the engine (invoked via Workflow scriptPath)
 skills/            mill (launch), mill-init (onboarding), forge-agent (agent generation)
+templates/         agents/contrarian.md, copied into repos that lack one
 scripts/           setup-worktree.sh, deterministic worktree creation
 docs/              ARCHITECTURE.md
 ```

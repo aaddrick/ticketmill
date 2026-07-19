@@ -65,7 +65,18 @@ Field rules:
 3. Map by what each agent's description says it does — do NOT force-fit (a UX
    reviewer is not a code reviewer). Leave a role `null` when nothing fits; the
    engine has a built-in charter for every role.
-4. Show the map with the gaps, and for each gap offer:
+4. **Contrarian resolution** (do this before offering forge for it). The plugin
+   bundles a contrarian template so this role never starts from scratch:
+   1. `<ROOT>/.claude/agents/contrarian.md` exists -> use it as-is.
+   2. Else `~/.claude/agents/contrarian.md` exists -> copy it into
+      `<ROOT>/.claude/agents/contrarian.md` (the engine only reads the project
+      roster; user-level agents are invisible to it).
+   3. Else copy the bundled template:
+      `${CLAUDE_PLUGIN_ROOT}/templates/agents/contrarian.md` ->
+      `<ROOT>/.claude/agents/contrarian.md`.
+   Either copy is immediately usable. Offer forge-agent afterward as an optional
+   upgrade that grounds the copy in this repo's specific failure modes.
+5. Show the map with the remaining gaps, and for each gap offer:
    - leave it on the built-in charter (fine for v1), or
    - generate a project-specific agent now via the `forge-agent` skill
      (`/ticketmill:forge-agent`). Generated agents land in `<ROOT>/.claude/agents/`
