@@ -526,6 +526,12 @@ const CONSOLIDATION_MARKER_PROBE_SCHEMA = {
 const CONSOLIDATION_MEMBER_TITLE = '## Consolidated'       // posted on an absorbed member's own issue
 const CONSOLIDATION_GROUP_TITLE = '## Consolidation Group' // posted on the group's primary issue
 
+// fmtIssues: render a list of issue numbers as "#1, #2, #3" — the shared rendering
+// used by every consolidation marker/prompt that lists member issues below.
+function fmtIssues(nums) {
+  return (nums || []).map(function (n) { return '#' + n }).join(', ')
+}
+
 // buildConsolidatedMemberComment: the comment left on an absorbed member's issue.
 // Names the CURRENT primary for humans reading the trail, and the STABLE groupId
 // (never the primary, which can move — see reconcileGroups) for the machine heal
@@ -546,7 +552,7 @@ function buildConsolidationGroupComment(repo, primaryIssue, groupId, members, su
   return [
     CONSOLIDATION_GROUP_TITLE,
     'group: ' + groupId,
-    'members: ' + members.map(function (m) { return '#' + m }).join(', '),
+    'members: ' + fmtIssues(members),
     'subsystem: ' + subsystem,
     rationale ? 'rationale: ' + rationale : '',
     '<!-- ticketmill ' + repo + '#' + primaryIssue + ' -->',
@@ -1490,7 +1496,7 @@ function sanitizeTasks(ctx, raw) {
 function consolidationScopeGuard(issueNumbers) {
   return [
     '## Scope guard (ticketmill consolidation gate)',
-    'You are evaluating ONLY these candidate issues of ' + REPO + ': ' + issueNumbers.map(function (n) { return '#' + n }).join(', ') + '.',
+    'You are evaluating ONLY these candidate issues of ' + REPO + ': ' + fmtIssues(issueNumbers) + '.',
     'Any gh issue view/comment/edit command MUST target one of exactly these numbers — re-read the number before',
     'running it. Other issue/PR numbers appearing anywhere in context belong to concurrent pipelines; NEVER act on them.',
     'If you post a comment, end it with the marker line "<!-- ticketmill ' + REPO + '#<issue> -->", naming the',
@@ -1510,7 +1516,7 @@ async function fetchConsolidationMarkers(issueNumbers) {
     'gh issue view <n> --repo ' + REPO + ' --json comments',
     'Return markers: [{issue, body}] — ONLY for issues carrying such a comment (its exact full body; if more than',
     'one exists on an issue, the MOST RECENT). Omit issues with none entirely.',
-  ].join('\n'), { label: 'consolidation:marker-probe', phase: 'Select', schema: CONSOLIDATION_MARKER_PROBE_SCHEMA, model: stageOpts('probe').model, effort: stageOpts('probe').effort })
+  ].join('\n'), Object.assign({ label: 'consolidation:marker-probe', phase: 'Select', schema: CONSOLIDATION_MARKER_PROBE_SCHEMA }, stageOpts('probe')))
   return (r && r.markers) || []
 }
 
@@ -1528,7 +1534,7 @@ async function challengeConsolidationGroup(group, settledCarrier) {
       roleBlock('contrarian'),
       '',
       'Stress-test a PROPOSED ISSUE CONSOLIDATION for ' + REPO + ' (challenge iteration ' + iter + ').',
-      'Proposed group: primary #' + current.primary + ', members ' + current.members.map(function (n) { return '#' + n }).join(', ') + '.',
+      'Proposed group: primary #' + current.primary + ', members ' + fmtIssues(current.members) + '.',
       'Subsystem: ' + (current.subsystem || '(none given)'),
       current.shared_surface ? 'Shared acceptance surface: ' + current.shared_surface : '',
       current.dependency ? 'Dependency: ' + current.dependency : '',
@@ -1546,7 +1552,7 @@ async function challengeConsolidationGroup(group, settledCarrier) {
       'Post an issue comment on #' + current.primary + ' titled "## Contrarian: Consolidation Challenge (Group ' + groupId + ', Iteration ' + iter + ')" with your verdict and findings.',
       'STRUCTURED OUTPUT CONTRACT: verdict must be EXACTLY one of sound_with_caveats | needs_rework | investigate_first.',
       'Every concern goes in the findings ARRAY (severity, summary, recommendation), never only in prose.',
-    ].filter(Boolean).join('\n'), { label: 'consolidation:challenge-g' + groupId + '-i' + iter, phase: 'Select', schema: CHALLENGE_SCHEMA, model: stageOpts('contrarian').model, effort: stageOpts('contrarian').effort })
+    ].filter(Boolean).join('\n'), Object.assign({ label: 'consolidation:challenge-g' + groupId + '-i' + iter, phase: 'Select', schema: CHALLENGE_SCHEMA }, stageOpts('contrarian')))
 
     if (!ch) {
       log('consolidation group ' + groupId + ' DISSOLVED — challenge agent died (fails conservatively, not open)')
@@ -1565,11 +1571,11 @@ async function challengeConsolidationGroup(group, settledCarrier) {
         consolidationScopeGuard(current.members),
         'Post a GitHub comment on issue #' + current.primary + ' in ' + REPO + ' (gh issue comment).',
         'Title line: "## Consolidation Dissolved After Contrarian Cap"',
-        'Body: a proposed consolidation of ' + current.members.map(function (n) { return '#' + n }).join(', ') +
+        'Body: a proposed consolidation of ' + fmtIssues(current.members) +
           ' did not survive ' + MAX_CONTRARIAN_ITERATIONS + ' contrarian challenge iterations; each issue will be',
         'processed independently instead. Last challenge summary: ' + String(ch.summary || '').slice(0, 900),
         'Return posted=true/false.',
-      ].join('\n'), { label: 'consolidation:dissolve-note-g' + groupId, phase: 'Select', schema: NOTE_SCHEMA, model: stageOpts('probe').model, effort: stageOpts('probe').effort })
+      ].join('\n'), Object.assign({ label: 'consolidation:dissolve-note-g' + groupId, phase: 'Select', schema: NOTE_SCHEMA }, stageOpts('probe')))
         .catch(function () { return null })
       return null
     }
@@ -1582,15 +1588,15 @@ async function challengeConsolidationGroup(group, settledCarrier) {
       consolidationScopeGuard(current.members),
       '',
       'Revise a proposed issue consolidation for ' + REPO + ' based on contrarian feedback (verdict: ' + ch.verdict + ').',
-      'Current group: primary #' + current.primary + ', members ' + current.members.map(function (n) { return '#' + n }).join(', ') + '.',
+      'Current group: primary #' + current.primary + ', members ' + fmtIssues(current.members) + '.',
       'Findings to address:',
       (ch.findings || []).map(function (f) { return '- [' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || '') }).join('\n'),
       'A challenger finding is a HYPOTHESIS, not a directive — verify each against the actual issues first. If, after',
       'verifying, these issues genuinely should NOT be grouped, return groups: [] and list every member issue in',
       'ungrouped instead (this ends the review — do not keep defending a grouping the evidence does not support).',
       'Otherwise return EXACTLY ONE revised group (same schema as the original gate) addressing the CONFIRMED concerns.',
-      'Only consider these candidates — never introduce an issue number outside this exact set: ' + group.members.map(function (n) { return '#' + n }).join(', ') + '.',
-    ].join('\n'), { label: 'consolidation:revise-g' + groupId + '-i' + iter, phase: 'Select', schema: CONSOLIDATION_SCHEMA, model: stageOpts('consolidation').model, effort: stageOpts('consolidation').effort })
+      'Only consider these candidates — never introduce an issue number outside this exact set: ' + fmtIssues(group.members) + '.',
+    ].join('\n'), Object.assign({ label: 'consolidation:revise-g' + groupId + '-i' + iter, phase: 'Select', schema: CONSOLIDATION_SCHEMA }, stageOpts('consolidation')))
 
     if (!re || !Array.isArray(re.groups) || !re.groups.length) {
       log('consolidation group ' + groupId + ' DISSOLVED — revision concluded no grouping (or agent died)')
@@ -1649,7 +1655,7 @@ async function proposeConsolidation(candidates) {
     'rationale (1-3 concrete sentences).',
     'Every candidate issue number listed above MUST appear in EXACTLY ONE of: some group\'s members, or ungrouped.',
     'Return groups (possibly empty — that is the expected common case) and ungrouped.',
-  ].join('\n'), { label: 'consolidation:propose', phase: 'Select', schema: CONSOLIDATION_SCHEMA, model: stageOpts('consolidation').model, effort: stageOpts('consolidation').effort })
+  ].join('\n'), Object.assign({ label: 'consolidation:propose', phase: 'Select', schema: CONSOLIDATION_SCHEMA }, stageOpts('consolidation')))
 
   if (!proposal || !Array.isArray(proposal.groups) || !proposal.groups.length) return out // agent died, or found nothing to propose
 
