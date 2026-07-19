@@ -13,7 +13,7 @@ flowchart TD
         P["Load profile<br/>.claude/ticketmill.json"] --> D["Resolve roles vs<br/>.claude/agents roster"] --> B["Create batch branch<br/>Batch_ts from BASE"] --> I["Resolve issue list<br/>numbers or labels"] --> F["Preflight probe<br/>skip / review / implement"] --> C["Claim issues<br/>label + comment, advisory"]
     end
 
-    SEL --> POOL["Worker pool<br/>concurrency 1-5<br/>circuit breakers"]
+    SEL --> POOL["Worker pool<br/>concurrency 1-5<br/>lane-serial groups<br/>circuit breakers"]
     POOL --> PLAN
 
     subgraph PLAN["Per issue: plan"]
@@ -344,6 +344,93 @@ effectively orphaned rather than merged. This is a known caveat, not yet a
 mechanical exclusion; treat an `implement`-bound issue with nonzero
 `commits_ahead` as a poor consolidation candidate until `reconcileGroups` is
 extended to drop it.
+
+### Lane scheduling: serializing issues with predicted file conflicts
+
+Concurrent issues that touch the same file race by default: two implementers
+land conflicting edits, and review has to reconcile a diff nobody expected.
+Lane scheduling groups issues likely to overlap into one lane, and a single
+worker drains that lane serially instead of racing every unit against the
+whole pool.
+
+**Predictions come from preflight, not a title heuristic.** Each preflight
+probe resolves real repo-relative paths against `origin/TARGET` (fetched once
+up front, shared read-only across every issue's probe rather than refetched
+per issue) and reads `depends_on #N` / `follow-up to #N` references out of
+the issue body. Both fields fail open to `[]` on any doubt. A wrong guess
+would wrongly serialize two unrelated issues; an empty prediction only costs
+the batch today's ordinary racing behavior.
+
+**`computeLanes()` is a union-find over predicted-file overlap, with two edge
+tiers.** Trusted edges, a `serialize_globs` pattern hit or a `depends_on`
+reference, always unite their units and are never dissolved. Heuristic
+edges, a shared predicted path or (only when no path matches) a shared
+basename, unite units too, but only survive a cohesion-aware collapse guard.
+A pair sharing two or more distinct paths is a genuine cluster, an
+implementation file plus its test, say, and always stands. A pair sharing
+exactly one path only survives as part of a weak-edge-only chain that
+reaches two distinct shared keys entirely on its own, never inherited from a
+neighboring strong cluster. A single popular path touched by many otherwise
+unrelated units, a magnet config or a central router, can't drag them into
+one lane by itself. That's the failure mode the guard exists to catch: one
+file everyone happens to touch is not evidence that any two of them conflict.
+
+**Document frequency is advisory, never a filter.** A path matched by more
+than half the batch (minimum 3 units) gets logged as a magnet signal, for
+visibility in run logs and the DRY_RUN preview. It never drops an
+intersection key or suppresses an edge; only the collapse guard does that.
+
+**A second, coarser guard runs immediately before the real drain.**
+`computeLanes()` guards each weak-edge chain locally, but a long run of
+pairwise-weak edges, each sharing a different path with its neighbor, can
+clear that local two-distinct-keys bar in aggregate without the lane, taken
+as a whole, actually cohering around anything. `applyRealRunCollapseGuard()`
+only recomputes when the batch is large enough to want the concurrency
+(`unitCount >= concurrency`) and the lanes produced are running noticeably
+narrower than a flat pool would (`collapse_ratio < 0.5`). A lane whose exact
+membership also comes out of `computeLanes({ trustedOnly: true })` is
+trusted and always kept. Everything else is re-checked whole-lane, fresh,
+for at least two paths shared across its own units, and dissolved back to
+one singleton lane per unit if it doesn't clear that bar.
+
+**`runPool()` steals whole lanes, not items.** A worker grabs the next
+unclaimed lane and drains every unit in it one at a time, in `depends_on`
+topological order, before stealing another lane. No `lanes` argument, or
+every lane a singleton (what `computeLanes()` returns when nothing
+overlaps), degenerates byte-for-byte to the pre-lane pool: one lane per item,
+drained in original order, `min(limit, items.length)` workers. STOP is still
+checked per unit, and a thrown error is still isolated to the one unit that
+threw, so lane draining changes nothing about failure isolation or
+resumability.
+
+**DRY_RUN previews the same lane graph, read-only.** The claim loop never
+runs during a preview, so a preview's lanes can still diverge from a real
+run's if a claim race flips a `resume_point` between the two. The preview
+reports each lane's issues, predicted files, and provenance (`trusted`,
+`heuristic`, or `none` for an unconnected singleton), plus `collapse_ratio`,
+`prediction_coverage`, any DF-flagged magnet paths, and whether the shared
+`origin/TARGET` fetch failed, which would mean every prediction in the
+preview is grounded against a stale ref.
+
+**The retrospective measures its own accuracy.** For each completed unit
+that predicted files and produced a merged PR, the retro agent diffs the
+PR's actual changed files against `predicted_files` and appends one
+coverage/precision row to a new "## Lane Prediction Accuracy" section in
+`process-retrospective.md`. That closes the loop: the same memory file a
+human reads to judge whether the prediction step is worth trusting, or needs
+a `serialize_globs` hint for a repo's actual magnet files.
+
+**Bounds are read-only aids, not correctness inputs.** A lane's merged
+`predicted_files` list caps at `MAX_LANE_PREDICTED_FILES` (60); the retro's
+predicted-vs-actual sample caps at `MAX_LANE_ACCURACY_SAMPLES` (40). Both
+only limit what a human or a prompt sees, never what `computeLanes()` unions
+or what `runPool()` drains.
+
+**Profile flag.** `serialize_globs` (optional, default `[]`) names patterns
+worth trusting even when predicted-file overlap alone wouldn't catch them: a
+shared schema, a central config, anything two issues could conflict on
+without their own predicted paths overlapping. Left unset, the engine still
+lanes on `depends_on` and predicted-file overlap alone.
 
 ## Failure semantics
 
