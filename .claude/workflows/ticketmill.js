@@ -545,6 +545,15 @@ function buildConsolidatedMemberComment(repo, memberIssue, primaryIssue, groupId
   ].filter(Boolean).join('\n')
 }
 
+// oneLine: collapse embedded newlines to spaces — parseConsolidationGroupComment's
+// per-field regexes are line-anchored (^field:\s*(.*)$), so a value written with a
+// literal newline would silently truncate to its first line on read-back. Every
+// free-text field written into a group marker comment must be passed through this
+// first.
+function oneLine(s) {
+  return String(s || '').replace(/\r?\n+/g, ' ').trim()
+}
+
 // buildConsolidationGroupComment: the comment left on the group's primary issue,
 // enumerating every live member so a resumed run's heal pass can reconstruct the
 // whole group even if it never fetches each member's own marker comment.
@@ -553,8 +562,8 @@ function buildConsolidationGroupComment(repo, primaryIssue, groupId, members, su
     CONSOLIDATION_GROUP_TITLE,
     'group: ' + groupId,
     'members: ' + fmtIssues(members),
-    'subsystem: ' + subsystem,
-    rationale ? 'rationale: ' + rationale : '',
+    'subsystem: ' + oneLine(subsystem),
+    rationale ? 'rationale: ' + oneLine(rationale) : '',
     '<!-- ticketmill ' + repo + '#' + primaryIssue + ' -->',
   ].filter(Boolean).join('\n')
 }
@@ -1540,6 +1549,12 @@ function consolidationScopeGuard(issueNumbers) {
 // consolidationScopeGuard() instead of scopeGuard(ctx). No retries (matches
 // this gate's pre-hardening call shape: a death here dissolves/falls through
 // to the ordinary per-issue path rather than being worth a retry budget).
+// Token attribution is INTENTIONALLY deferred here: stage()'s ctx.tokens sampling
+// (spentTokens() before/after, attributed to one issue's metrics) has no home at
+// this gate — there is no per-issue ctx, and a group spans several issues before
+// any of them has one. Consolidation-gate/challenge spend is real run spend (it
+// still counts against the shared budget), just not broken out per issue in the
+// batch PR's token totals; revisit if that visibility gap ever needs closing.
 async function consolidationAgent(issueNumbers, label, promptText, opts, schema) {
   if (STOP.tripped) return null
   const guarded = consolidationScopeGuard(issueNumbers) + '\n\n' + promptText
@@ -1710,16 +1725,36 @@ async function proposeConsolidation(candidates) {
 
   if (!rawGroups.length) return out
 
+  // ---- DEDUPE (mechanical invariant enforced in code, not just the prompt above):
+  // CONSOLIDATION_SCHEMA does not forbid the same issue number appearing in two
+  // groups[] entries, and only the prompt instructs the opus gate to keep every
+  // candidate in exactly one bucket. If it ever violates that, two Map entries would
+  // claim the same issue and downstream deriveUnits() would enter it into two
+  // units/branches/PRs at once. First-seen wins: a later group that shares ANY member
+  // with an earlier-claimed group is dropped whole (not trimmed — trimming could
+  // silently orphan its primary or shrink it below a group without another look).
+  const claimedIssues = {}
+  const dedupedGroups = []
+  for (const g of rawGroups) {
+    if (g.members.some(function (n) { return claimedIssues[n] })) {
+      log('consolidation: dropping proposed group ' + fmtIssues(g.members) + ' — overlaps an already-claimed issue')
+      continue
+    }
+    g.members.forEach(function (n) { claimedIssues[n] = true })
+    dedupedGroups.push(g)
+  }
+  if (!dedupedGroups.length) return out
+
   if (DRY_RUN) {
     // DRY_RUN previews the RAW, PRE-CHALLENGE proposal — the contrarian challenge
     // posts trail comments, so it never runs under DRY_RUN (see module comment).
-    for (const g of rawGroups) out.set(stableGroupId(g.members), toGroupEntry(g, { dry_run_preview: true }))
+    for (const g of dedupedGroups) out.set(stableGroupId(g.members), toGroupEntry(g, { dry_run_preview: true }))
     return out
   }
 
   // ---- CHALLENGE (capped; cap DISSOLVES — see module comment for the asymmetry) ----
   const consSettled = { settled: [] } // local carrier — reuses settleDecision()/settledBlock(); no per-issue ctx exists at this gate
-  for (const g of rawGroups) {
+  for (const g of dedupedGroups) {
     const accepted = await challengeConsolidationGroup(g, consSettled)
     if (!accepted) continue // dissolved — members fall through to the caller's ordinary singleton path
     out.set(stableGroupId(accepted.members), toGroupEntry(accepted))
