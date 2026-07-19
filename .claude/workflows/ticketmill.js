@@ -700,21 +700,28 @@ function healGroups(preflights, markers) {
 }
 
 // reconcileGroups: make LIVE claimed preflights authoritative over group membership.
-// A member whose live preflight resume_point isn't 'implement' (already merged,
-// closed, claimed by another concurrent run, ...) is excluded — it takes its own
-// ordinary path (skip singleton, or process_pr singleton) instead of blocking or
-// corrupting the group. If the excluded member was the group's primary, the group
-// re-anchors onto another live member (lowest issue number, for determinism) —
-// groupId, and therefore the group's worktree/branch/PR identity, never moves. A
-// group left with fewer than 2 live members dissolves entirely (returns no entry):
-// its one remaining member, if any, falls through to deriveUnits as an ordinary
+// A member whose live preflight resume_point is 'skip' (already merged, closed,
+// claimed by another concurrent run, ...) is excluded — it takes its own ordinary
+// path (a skip singleton) instead of blocking or corrupting the group. A member
+// resolved to 'implement' OR 'process_pr' stays live and IN the group: 'process_pr'
+// is exactly the state every member lands in when a PRIOR run created the group's
+// shared PR (one "Closes #N" per member) but crashed/failed before merging it — on
+// resume, the preflight probe matches that SAME PR for every member, so the whole
+// group must keep routing together as one unit (worktreeAnchor's stable groupId,
+// one reviewAndMerge call on the shared PR) instead of splintering into N
+// independent process_pr singletons that would each attempt to review/merge it.
+// If the excluded member was the group's primary, the group re-anchors onto
+// another live member (lowest issue number, for determinism) — groupId, and
+// therefore the group's worktree/branch/PR identity, never moves. A group left
+// with fewer than 2 live members dissolves entirely (returns no entry): its one
+// remaining member, if any, falls through to deriveUnits as an ordinary
 // singleton, same as if it had never been grouped.
 function reconcileGroups(map, livePreflights) {
   const resumeByIssue = {}
   for (const p of livePreflights || []) resumeByIssue[p.issue] = p.resume_point
   const out = new Map()
   map.forEach(function (g, groupId) {
-    const live = g.members.filter(function (n) { return resumeByIssue[n] === 'implement' })
+    const live = g.members.filter(function (n) { return resumeByIssue[n] === 'implement' || resumeByIssue[n] === 'process_pr' })
     if (live.length < 2) return // dissolved
     out.set(groupId, { groupId: groupId, primary: pickPrimary(live, g.primary), members: live, subsystem: g.subsystem, rationale: g.rationale })
   })
@@ -1558,8 +1565,14 @@ function sanitizeTasks(ctx, raw) {
 // =============================================================================
 // PROPOSECONSOLIDATION (Select-phase judgment gate; ABOVE the harness split like
 // implementIssue/reviewAndMerge, so tests/harness.js can drive it with a scripted
-// agent()). Proposes grouping CANDIDATE issues (preflight-shaped, resume_point
-// 'implement') into ONE worktree/branch/research/plan/PR unit when — and only
+// agent()). Takes EVERY live preflight, any resume_point — not just 'implement' —
+// because the HEAL phase below must recognize a group whose members have since
+// flipped to 'process_pr' (the shared PR already exists; a prior run crashed
+// after creating it) or 'skip' (one member resolved independently); filtering the
+// candidate set to 'implement' up front would hide those markers from healGroups()
+// entirely. Only the PROPOSE phase (brand-new opus-gate groupings) is restricted
+// to 'implement' candidates — see its own filter below. Proposes grouping
+// candidate issues into ONE worktree/branch/research/plan/PR unit when — and only
 // when — they share the same subsystem AND acceptance surface, or one explicitly
 // depends on another. Grouping is the EXCEPTION: the conservative-bar prompt below
 // treats "shared files touched" as a hint, never a reason, and an empty run
@@ -1760,20 +1773,30 @@ async function challengeConsolidationGroup(group, settledCarrier) {
 
 // proposeConsolidation: the Select-phase entry point (see the module comment
 // above for the full design). `candidates` are preflight-shaped objects
-// ({issue, title, ...}) — the caller is expected to have already filtered to
-// resume_point === 'implement' (see deriveUnits()'s comment: only live,
-// about-to-be-implemented issues are eligible to share a unit).
+// ({issue, title, resume_point, ...}) — the caller passes EVERY live preflight
+// (all resume_points), not just 'implement' ones, so HEAL below can recognize a
+// group whose members have since flipped to 'process_pr' or 'skip'.
 async function proposeConsolidation(candidates) {
   const list = (candidates || []).filter(function (c) { return c && c.issue })
   if (list.length <= 1) return new Map() // free-skip: nothing to group, no agent call at all
 
   // ---- HEAL (always runs — even with PROFILE.consolidation === false; turning the
-  // gate off mid-run must not un-heal a group a PRIOR run already committed to) ----
+  // gate off mid-run must not un-heal a group a PRIOR run already committed to.
+  // Runs over EVERY candidate regardless of resume_point: a group whose members
+  // now all resolve to 'process_pr' — the prior run created the shared PR but
+  // failed/crashed before merging it — must still be recognized here, or
+  // reconcileGroups()/deriveUnits() would never see it and each member would
+  // splinter into its own independent process_pr singleton, all targeting the
+  // SAME PR.) ----
   const markers = await fetchConsolidationMarkers(list.map(function (c) { return c.issue }))
   const healed = healGroups(list, markers)
   const healedIssues = {}
   healed.forEach(function (g) { for (const n of g.members) healedIssues[n] = true })
-  const residual = list.filter(function (c) { return !healedIssues[c.issue] })
+  // ---- PROPOSE eligibility: only FRESH 'implement' candidates can enter a brand-new
+  // opus-gate grouping — an issue already resolved to 'process_pr' or 'skip' has no
+  // grouping decision left to make; if it belongs to a group, HEAL above already
+  // found it via markers. ----
+  const residual = list.filter(function (c) { return !healedIssues[c.issue] && c.resume_point === 'implement' })
   const out = new Map(healed)
 
   if (!consolidationEnabled(PROFILE) || residual.length <= 1) return out
@@ -1862,9 +1885,9 @@ async function proposeConsolidation(candidates) {
 async function postConsolidationMarkers(units) {
   const groups = (units || []).filter(function (u) { return u && u.groupId != null && Array.isArray(u.members) && u.members.length >= 2 })
   for (const u of groups) {
-    const memberIssues = u.members.map(function (m) { return m.issue })
-    const groupBody = buildConsolidationGroupComment(REPO, u.issue, u.groupId, memberIssues, u.subsystem, u.rationale)
-    await consolidationAgent(memberIssues, 'consolidation:mark-primary-g' + u.groupId, [
+    const memberIssueNums = u.members.map(function (m) { return m.issue })
+    const groupBody = buildConsolidationGroupComment(REPO, u.issue, u.groupId, memberIssueNums, u.subsystem, u.rationale)
+    await consolidationAgent(memberIssueNums, 'consolidation:mark-primary-g' + u.groupId, [
       'Post the consolidation GROUP marker comment on issue #' + u.issue + ' of ' + REPO + '.',
       'FIRST check whether it already exists: gh issue view ' + u.issue + ' --repo ' + REPO + ' --json comments',
       '— SKIP posting if any comment\'s first line is exactly "' + CONSOLIDATION_GROUP_TITLE + '" and it contains',
@@ -2581,11 +2604,12 @@ async function processIssue(pre) {
   if (pre.resume_point === 'process_pr') {
     log('#' + ctx.issue + ' healing: open PR #' + ctx.pr + ' found — jumping to review/merge')
     // idempotent setup so review-fix stages have a worktree. Anchor on the stable
-    // groupId (see worktreeAnchor()) — reconcileGroups() only ever admits members
-    // whose OWN resume_point is 'implement', so a derived group unit never reaches
-    // this branch with today's reconciler, but a future healed-from-marker unit
-    // that arrives here already mid-review must still resolve the SAME worktree
-    // its implement phase created, not a fresh one keyed off a re-anchored primary.
+    // groupId (see worktreeAnchor()) — reconcileGroups() admits members whose live
+    // resume_point is 'implement' OR 'process_pr', so a healed-from-marker GROUP
+    // unit can and does arrive here already mid-review (every member flipped to
+    // 'process_pr' after a prior run created the shared PR but crashed/failed
+    // before merging it). It must resolve the SAME worktree its implement phase
+    // created, not a fresh one keyed off a re-anchored primary — hence the anchor.
     const anchor = worktreeAnchor(ctx)
     const envFiles = PROFILE.env_files || []
     const setup = await stage(ctx, 'setup-for-review', [
@@ -2829,17 +2853,25 @@ if (learnR && learnR.found) {
 }
 
 // ---- Select: consolidation gate (judgment call — see the PROPOSECONSOLIDATION
-// module comment above the harness split for the full design). Candidates are
-// preflights already resolved to resume_point 'implement' only: a 'process_pr' or
-// 'skip' issue heals individually, one at a time, on its own existing path.
-// proposeConsolidation() free-skips internally with NO agent call at all when
-// candidates.length <= 1, and skips the opus proposal (but still heals a group a
-// PRIOR run already committed to, via comment markers) when PROFILE.consolidation
-// is explicitly false — see its module comment on why the heal must survive a
-// mid-run flag flip. It is read-only and side-effect-free under DRY_RUN: the
-// marker-heal and opus proposal both run (gh reads only); the comment-posting
-// contrarian challenge is skipped entirely.
-const consolidationCandidates = preflights.filter(function (p) { return p.resume_point === 'implement' })
+// module comment above the harness split for the full design). EVERY preflight is
+// a candidate here, regardless of resume_point — NOT filtered to 'implement' —
+// because proposeConsolidation()'s HEAL phase must see 'process_pr'/'skip' members
+// too: a group whose members ALL flipped to 'process_pr' (a prior run created the
+// shared PR but crashed/failed before merging it — spec review, code review, and
+// merge all happen post-PR, in reviewAndMerge) still needs to be recognized as ONE
+// group so its whole unit routes together through processIssue's process_pr branch
+// (one setup + one reviewAndMerge on the shared PR), not as N independent
+// process_pr singletons that would each attempt to review/merge the SAME PR.
+// proposeConsolidation() itself restricts brand-new opus-gate proposals to
+// 'implement' candidates only (see its own filter) — only the HEAL step is
+// resume_point-agnostic. proposeConsolidation() free-skips internally with NO
+// agent call at all when candidates.length <= 1, and skips the opus proposal (but
+// still heals a group a PRIOR run already committed to, via comment markers) when
+// PROFILE.consolidation is explicitly false — see its module comment on why the
+// heal must survive a mid-run flag flip. It is read-only and side-effect-free
+// under DRY_RUN: the marker-heal and opus proposal both run (gh reads only); the
+// comment-posting contrarian challenge is skipped entirely.
+const consolidationCandidates = preflights
 const consolidationMap = await proposeConsolidation(consolidationCandidates)
 
 if (DRY_RUN) {

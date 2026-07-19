@@ -66,6 +66,42 @@ test('proposeConsolidation: a single candidate free-skips with no agent call at 
   assert.strictEqual(map.size, 0)
 })
 
+// ---- HEAL sees every resume_point; only fresh 'implement' candidates reach the
+// opus PROPOSE step (PR #18 review: process_pr/skip candidates must still be
+// probed for markers, but must never be offered to the opus gate for a brand-new
+// grouping decision they no longer have to make) ----
+
+test('proposeConsolidation: the marker probe covers every candidate regardless of resume_point, but the opus PROPOSE menu only offers fresh implement candidates', async function () {
+  const context = bootConsolidation()
+  const candidates = [
+    { issue: 1, title: 'Fresh A', resume_point: 'implement' },
+    { issue: 2, title: 'Fresh B', resume_point: 'implement' },
+    { issue: 3, title: 'Already has an open PR', resume_point: 'process_pr' },
+    { issue: 4, title: 'Already closed', resume_point: 'skip' },
+  ]
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label === 'consolidation:marker-probe') {
+      // fetchConsolidationMarkers() must be scoped to ALL four candidates, not
+      // just the 'implement' ones -- otherwise a group whose members already
+      // flipped to process_pr/skip could never be recognized by healGroups().
+      assert.ok(prompt.includes('#1') && prompt.includes('#2') && prompt.includes('#3') && prompt.includes('#4'))
+      return { markers: [] }
+    }
+    if (label === 'consolidation:propose') {
+      assert.ok(prompt.includes('#1') && prompt.includes('#2'))
+      assert.ok(!prompt.includes('#3'), 'a process_pr candidate must not be offered to a brand-new grouping proposal')
+      assert.ok(!prompt.includes('#4'), 'a skip candidate must not be offered to a brand-new grouping proposal')
+      return { groups: [], ungrouped: [1, 2] }
+    }
+    throw new Error('unexpected consolidation call: ' + label)
+  })
+
+  const map = await context.proposeConsolidation(candidates)
+  assert.strictEqual(map.size, 0)
+})
+
 // ---- group proposal accepted after a contrarian pass ----
 
 test('proposeConsolidation: a proposed group is accepted once the contrarian pass returns sound_with_caveats (after one needs_rework + revise round)', async function () {
@@ -449,7 +485,7 @@ test('reconcileGroups: fewer than 2 live members dissolves the group entirely', 
   map.set(1, { groupId: 1, primary: 1, members: [1, 2, 3], subsystem: 's', rationale: 'r' })
   const live = [
     { issue: 1, resume_point: 'skip' },
-    { issue: 2, resume_point: 'process_pr' },
+    { issue: 2, resume_point: 'skip' },
     { issue: 3, resume_point: 'implement' }, // only one survivor
   ]
 
@@ -457,4 +493,49 @@ test('reconcileGroups: fewer than 2 live members dissolves the group entirely', 
 
   assert.strictEqual(reconciled.size, 0)
   assert.strictEqual(reconciled.has(1), false)
+})
+
+// ---- reconcileGroups: 'process_pr' members stay live (the post-PR-crash resume
+// case — see PR #18 review) ----
+
+test('reconcileGroups: members that all flipped to process_pr (a prior run created the shared PR but crashed before merging it) stay live and the group survives as ONE unit', function () {
+  const context = bootConsolidation()
+  const map = new Map()
+  map.set(10, { groupId: 10, primary: 10, members: [10, 11, 12], subsystem: 's', rationale: 'r' })
+  const live = [
+    { issue: 10, resume_point: 'process_pr', pr_number: 99 },
+    { issue: 11, resume_point: 'process_pr', pr_number: 99 },
+    { issue: 12, resume_point: 'process_pr', pr_number: 99 },
+  ]
+
+  const reconciled = context.reconcileGroups(map, live)
+
+  assert.strictEqual(reconciled.size, 1)
+  const g = reconciled.get(10)
+  assert.strictEqual(g.primary, 10)
+  assert.deepStrictEqual(g.members.slice(), [10, 11, 12]) // all three stay IN the group
+
+  // deriveUnits then produces exactly ONE unit for the whole group (not three
+  // independent process_pr singletons that would each try to review/merge #99).
+  const units = context.deriveUnits(reconciled, live)
+  assert.strictEqual(units.length, 1)
+  assert.strictEqual(units[0].groupId, 10)
+  assert.strictEqual(units[0].resume_point, 'process_pr') // the primary's resume_point routes the whole unit
+  assert.deepStrictEqual(units[0].members.map(function (m) { return m.issue }), [10, 11, 12])
+})
+
+test('reconcileGroups: a mix of process_pr and skip members excludes only the skipped one, the process_pr members stay grouped', function () {
+  const context = bootConsolidation()
+  const map = new Map()
+  map.set(20, { groupId: 20, primary: 20, members: [20, 21, 22], subsystem: 's', rationale: 'r' })
+  const live = [
+    { issue: 20, resume_point: 'process_pr' },
+    { issue: 21, resume_point: 'process_pr' },
+    { issue: 22, resume_point: 'skip' }, // resolved independently since proposal
+  ]
+
+  const reconciled = context.reconcileGroups(map, live)
+
+  assert.strictEqual(reconciled.size, 1)
+  assert.deepStrictEqual(reconciled.get(20).members.slice(), [20, 21])
 })
