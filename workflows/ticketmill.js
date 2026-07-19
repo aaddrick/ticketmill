@@ -197,6 +197,7 @@ const M = {
   setup:        { model: 'haiku', effort: 'low' },
   research:     { model: 'sonnet' },
   evaluate:     { model: 'opus' },
+  consolidation: { model: 'opus', effort: 'high' }, // proposeConsolidation's propose/revise calls (Select-phase gate)
   contrarian:   { model: 'opus', effort: 'high' },
   plan:         { model: 'opus', effort: 'high' },
   implement:    { model: 'sonnet' },
@@ -378,6 +379,10 @@ const PLAN_SCHEMA = {
     status: { enum: ['success', 'error'] }, plan_path: { type: 'string' },
     tasks: { type: 'array', items: { type: 'object', required: ['id', 'description', 'agent'], properties: {
       id: { type: 'integer' }, description: { type: 'string' }, agent: { type: 'string' },
+      // origin_issue: only meaningful for a consolidated group unit — the member
+      // issue number whose requirement drives this task. Optional/absent for a
+      // singleton run; the plan-task sanitizer defaults it to ctx.issue either way.
+      origin_issue: { type: ['integer', 'null'] },
     } } },
     summary: { type: 'string' }, task_list_markdown: { type: 'string' }, error: { type: ['string', 'null'] },
   },
@@ -457,6 +462,297 @@ const LEARNINGS_SCHEMA = {
     performance: { type: 'string' }, error_patterns: { type: 'string' }, workflow: { type: 'string' },
   },
 }
+// CONSOLIDATION_SCHEMA: the opus-tier Select-phase gate that proposes grouping
+// selected issues into ONE worktree/branch/research/plan/PR unit. Conservative bar —
+// grouping is the exception, so groups[] is expected to be empty on most runs. Each
+// group names an explicit reason (subsystem + shared acceptance surface, OR an
+// explicit dependency) so shared files alone never qualify; the prompt that drives
+// this schema (added when the gate itself is wired in) enforces that at least one of
+// shared_surface/dependency is populated. ungrouped[] carries every candidate issue
+// the gate declined to group, so the caller can assert groups+ungrouped covers every
+// candidate.
+const CONSOLIDATION_SCHEMA = {
+  type: 'object', required: ['groups', 'ungrouped'],
+  properties: {
+    groups: { type: 'array', items: { type: 'object', required: ['primary', 'members', 'subsystem', 'rationale'], properties: {
+      primary: { type: 'integer' },              // issue number carrying the comment trail
+      members: { type: 'array', items: { type: 'integer' } }, // every issue in the group, primary included
+      subsystem: { type: 'string' },
+      shared_surface: { type: 'string' },        // the shared acceptance surface, if that's the reason
+      dependency: { type: 'string' },            // the explicit dependency, if that's the reason instead
+      rationale: { type: 'string' },
+    } } },
+    ungrouped: { type: 'array', items: { type: 'integer' } },
+  },
+}
+// CONSOLIDATION_MARKER_PROBE_SCHEMA: the read-only probe proposeConsolidation()
+// uses to fetch each candidate's existing consolidation-marker comment (if any),
+// feeding healGroups() so a prior decision is recognized before the opus gate runs.
+const CONSOLIDATION_MARKER_PROBE_SCHEMA = {
+  type: 'object', required: ['markers'],
+  properties: {
+    markers: { type: 'array', items: { type: 'object', required: ['issue', 'body'], properties: {
+      issue: { type: 'integer' }, body: { type: 'string' },
+    } } },
+  },
+}
+
+// =============================================================================
+// CONSOLIDATION (unit-of-work) FOUNDATIONS
+//
+// A "unit" is either a singleton (today's per-issue path, verbatim) or a group
+// (a primary issue + members[] processed as one worktree/branch/research/plan/PR).
+// With zero groups every unit is a singleton, so a no-overlap run behaves
+// byte-for-byte like today — that's the acceptance bar this whole abstraction is
+// built to preserve.
+//
+// Judgment (the opus gate + capped contrarian challenge that PROPOSES groups) is not
+// implemented here — this section only holds the pure, harness-testable plumbing it
+// will be built on: the schema above, the comment markers that let a resumed run
+// recognize a prior consolidation, and the reducers that turn "what the markers say"
+// plus "what's live right now" into the units runPool() actually processes.
+//
+// STABLE GROUP ID: a group's PHYSICAL identity (worktree issue-N, branch issue-N-*,
+// PR head — see scripts/setup-worktree.sh and the process_pr path) is bound to a
+// group id that is chosen once and never changes. The group's LOGICAL primary (the
+// issue carrying the comment trail) can move on re-anchor (e.g. the original primary
+// got skip-flipped by a resume), but the group id does not — mixing the two up is
+// exactly the contradiction the approach-gate contrarian caught. By convention the
+// group id is the lowest issue number that has EVER been a member (see
+// stableGroupId()); it is also the key healGroups()/reconcileGroups() index by.
+// =============================================================================
+
+// Comment titles (first line) that gate consolidation markers apart from ordinary
+// trail comments. Every marker comment still ends with the canonical scope-guard
+// line "<!-- ticketmill <repo>#<issue> -->" (see scopeGuard()) — these titles add a
+// second, group-specific line of machine-parseable content ABOVE that line; they
+// never replace or reshape the canonical marker itself.
+const CONSOLIDATION_MEMBER_TITLE = '## Consolidated'       // posted on an absorbed member's own issue
+const CONSOLIDATION_GROUP_TITLE = '## Consolidation Group' // posted on the group's primary issue
+
+// fmtIssues: render a list of issue numbers as "#1, #2, #3" — the shared rendering
+// used by every consolidation marker/prompt that lists member issues below.
+function fmtIssues(nums) {
+  return (nums || []).map(function (n) { return '#' + n }).join(', ')
+}
+
+// buildConsolidatedMemberComment: the comment left on an absorbed member's issue.
+// Names the CURRENT primary for humans reading the trail, and the STABLE groupId
+// (never the primary, which can move — see reconcileGroups) for the machine heal
+// pass to key off of.
+function buildConsolidatedMemberComment(repo, memberIssue, primaryIssue, groupId, rationale) {
+  return [
+    CONSOLIDATION_MEMBER_TITLE,
+    'Consolidated into #' + primaryIssue + ' (group ' + groupId + ') — implemented as one unit.',
+    rationale ? 'Rationale: ' + rationale : '',
+    '<!-- ticketmill ' + repo + '#' + memberIssue + ' -->',
+  ].filter(Boolean).join('\n')
+}
+
+// oneLine: collapse embedded newlines to spaces — parseConsolidationGroupComment's
+// per-field regexes are line-anchored (^field:\s*(.*)$), so a value written with a
+// literal newline would silently truncate to its first line on read-back. Every
+// free-text field written into a group marker comment must be passed through this
+// first.
+function oneLine(s) {
+  return String(s || '').replace(/\r?\n+/g, ' ').trim()
+}
+
+// buildConsolidationGroupComment: the comment left on the group's primary issue,
+// enumerating every live member so a resumed run's heal pass can reconstruct the
+// whole group even if it never fetches each member's own marker comment.
+function buildConsolidationGroupComment(repo, primaryIssue, groupId, members, subsystem, rationale) {
+  return [
+    CONSOLIDATION_GROUP_TITLE,
+    'group: ' + groupId,
+    'members: ' + fmtIssues(members),
+    'subsystem: ' + oneLine(subsystem),
+    rationale ? 'rationale: ' + oneLine(rationale) : '',
+    '<!-- ticketmill ' + repo + '#' + primaryIssue + ' -->',
+  ].filter(Boolean).join('\n')
+}
+
+// parseConsolidatedMemberComment: null unless body is a member marker (title-gated,
+// so an unrelated comment that merely mentions "consolidated" is never misread).
+// Returns { primary, groupId }.
+function parseConsolidatedMemberComment(body) {
+  if (!body || String(body).split('\n')[0].trim() !== CONSOLIDATION_MEMBER_TITLE) return null
+  const m = /Consolidated into #(\d+) \(group (\S+)\)/.exec(body)
+  if (!m) return null
+  return { primary: Number(m[1]), groupId: Number(m[2]) }
+}
+
+// parseConsolidationGroupComment: null unless body is a group marker (title-gated).
+// Returns { groupId, members: [issueNumbers], subsystem, rationale }.
+function parseConsolidationGroupComment(body) {
+  if (!body || String(body).split('\n')[0].trim() !== CONSOLIDATION_GROUP_TITLE) return null
+  const g = /^group:\s*(\S+)\s*$/m.exec(body)
+  const mem = /^members:\s*(.+)$/m.exec(body)
+  if (!g || !mem) return null
+  const members = mem[1].split(',')
+    .map(function (s) { return Number(s.trim().replace(/^#/, '')) })
+    .filter(function (n) { return n > 0 })
+  if (!members.length) return null
+  const sub = /^subsystem:\s*(.*)$/m.exec(body)
+  const rat = /^rationale:\s*(.*)$/m.exec(body)
+  return { groupId: Number(g[1]), members: members, subsystem: sub ? sub[1].trim() : '', rationale: rat ? rat[1].trim() : '' }
+}
+
+// stableGroupId: a group's immutable physical-identity anchor (see comment block
+// above) — the lowest issue number ever proposed as a member. Chosen once, at first
+// proposal; re-anchoring the logical primary (reconcileGroups) never changes it.
+function stableGroupId(memberIssueNumbers) {
+  return Math.min.apply(null, memberIssueNumbers)
+}
+
+// pickPrimary: choose a group's primary — the proposed primary if it's still a
+// live member, otherwise the stable (lowest-numbered) member, so a primary that
+// dropped out of the group (excluded by reconcileGroups, or trimmed by a
+// contrarian revision) always re-anchors onto a member that's actually still
+// there. Shared by reconcileGroups(), proposeConsolidation()'s proposal
+// filtering, and challengeConsolidationGroup()'s revision-acceptance path — all
+// three re-derive a primary the same way. `members` may be empty only at the
+// proposal-filtering call site (before its own >= 2 filter runs); that case
+// falls back to proposedPrimary itself, since stableGroupId([]) is undefined.
+function pickPrimary(members, proposedPrimary) {
+  if (members.indexOf(proposedPrimary) !== -1) return proposedPrimary
+  return members.length ? stableGroupId(members) : proposedPrimary
+}
+
+// memberIssues: ctx.members is an array of preflight-shaped refs (deriveUnits());
+// most call sites (research/plan/PR-body/merge prompts, result objects) only need
+// the bare issue numbers. Shared here so every one of those call sites derives the
+// list the same way. For a singleton, ctx.members === [self], so this is always
+// [ctx.issue] — the no-group case never sees anything new here.
+function memberIssues(ctx) {
+  return (ctx.members || []).map(function (m) { return m.issue })
+}
+
+// worktreeAnchor: the issue number passed to setup-worktree.sh as the physical
+// worktree/branch anchor. A group's worktree/branch/PR identity is bound to its
+// STABLE groupId (the lowest issue number ever proposed as a member — see
+// stableGroupId()), never to the mutable logical primary (ctx.issue), because
+// reconcileGroups() can re-anchor the primary onto a different live member across
+// a resumed run — using ctx.issue there would spawn a second, orphaned worktree.
+// groupId is itself always a real member issue number, so `gh issue view` against
+// it (setup-worktree.sh's title-slug lookup) resolves exactly like any other issue.
+// For a singleton, ctx.groupId is always null, so this is always ctx.issue.
+function worktreeAnchor(ctx) {
+  return ctx.groupId != null ? ctx.groupId : ctx.issue
+}
+
+// toGroupEntry: build one out.set() value in the shape healGroups()/reconcileGroups()
+// share (groupId, primary, members, subsystem, rationale, +extra) — shared by
+// proposeConsolidation()'s DRY_RUN-preview and post-challenge acceptance paths so
+// the two nearly-identical object literals can't drift out of sync.
+function toGroupEntry(g, extra) {
+  return Object.assign({
+    groupId: stableGroupId(g.members), primary: g.primary, members: g.members.slice(),
+    subsystem: g.subsystem || '', rationale: g.rationale || '',
+  }, extra)
+}
+
+// consolidationEnabled: profile.consolidation defaults to true (the gate runs for any
+// run with >1 'implement' candidate); an explicit false disables the gate entirely —
+// free, with no gate agent call at all. A single-issue run skips it for free too,
+// since the gate only ever has one candidate to look at.
+function consolidationEnabled(profile) {
+  return !!profile && profile.consolidation !== false
+}
+
+// healGroups: reconstruct prior consolidation decisions from GitHub comment markers
+// so a resumed run recognizes an existing group instead of reprocessing its members
+// individually. Keyed by the STABLE groupId (never the mutable primary) so a
+// re-anchor from a prior run is picked up as the same group, not treated as new.
+//   preflights: this run's live preflight probes — used only to know which issue
+//               numbers are in play right now; healGroups never mutates them.
+//   markers: [{ issue, body }] — the single most relevant consolidation-marker
+//            comment found on each candidate issue, if any (produced by the
+//            Select-phase marker-fetch pass this reducer is pure of). Both a group's
+//            own marker and its members' markers may appear; either alone is enough
+//            to reconstruct the group (the member markers act as a fallback in case
+//            the primary's own comment was never fetched or was deleted).
+// Returns Map<groupId, { groupId, primary, members: [issueNumbers], subsystem, rationale }>.
+function healGroups(preflights, markers) {
+  const known = {}
+  for (const p of preflights || []) known[p.issue] = true
+  const groups = new Map()
+  const memberOnly = []
+  for (const rec of markers || []) {
+    if (!rec || !known[rec.issue]) continue
+    const g = parseConsolidationGroupComment(rec.body)
+    if (g) {
+      groups.set(g.groupId, { groupId: g.groupId, primary: rec.issue, members: g.members.slice(), subsystem: g.subsystem, rationale: g.rationale })
+      continue
+    }
+    const m = parseConsolidatedMemberComment(rec.body)
+    if (m) memberOnly.push({ issue: rec.issue, primary: m.primary, groupId: m.groupId })
+  }
+  // Fallback: reconstruct (or extend) a group from member-side markers alone, for
+  // when the primary's own group-marker comment wasn't fetched or never landed.
+  for (const m of memberOnly) {
+    let g = groups.get(m.groupId)
+    if (!g) { g = { groupId: m.groupId, primary: m.primary, members: [], subsystem: '', rationale: '' }; groups.set(m.groupId, g) }
+    if (g.members.indexOf(m.issue) === -1) g.members.push(m.issue)
+    if (g.members.indexOf(g.primary) === -1) g.members.push(g.primary)
+  }
+  return groups
+}
+
+// reconcileGroups: make LIVE claimed preflights authoritative over group membership.
+// A member whose live preflight resume_point is 'skip' (already merged, closed,
+// claimed by another concurrent run, ...) is excluded — it takes its own ordinary
+// path (a skip singleton) instead of blocking or corrupting the group. A member
+// resolved to 'implement' OR 'process_pr' stays live and IN the group: 'process_pr'
+// is exactly the state every member lands in when a PRIOR run created the group's
+// shared PR (one "Closes #N" per member) but crashed/failed before merging it — on
+// resume, the preflight probe matches that SAME PR for every member, so the whole
+// group must keep routing together as one unit (worktreeAnchor's stable groupId,
+// one reviewAndMerge call on the shared PR) instead of splintering into N
+// independent process_pr singletons that would each attempt to review/merge it.
+// If the excluded member was the group's primary, the group re-anchors onto
+// another live member (lowest issue number, for determinism) — groupId, and
+// therefore the group's worktree/branch/PR identity, never moves. A group left
+// with fewer than 2 live members dissolves entirely (returns no entry): its one
+// remaining member, if any, falls through to deriveUnits as an ordinary
+// singleton, same as if it had never been grouped.
+function reconcileGroups(map, livePreflights) {
+  const resumeByIssue = {}
+  for (const p of livePreflights || []) resumeByIssue[p.issue] = p.resume_point
+  const out = new Map()
+  map.forEach(function (g, groupId) {
+    const live = g.members.filter(function (n) { return resumeByIssue[n] === 'implement' || resumeByIssue[n] === 'process_pr' })
+    if (live.length < 2) return // dissolved
+    out.set(groupId, { groupId: groupId, primary: pickPrimary(live, g.primary), members: live, subsystem: g.subsystem, rationale: g.rationale })
+  })
+  return out
+}
+
+// deriveUnits: the final translation from "reconciled groups" + "live preflights" to
+// the array runPool() actually iterates. Every reconciled group becomes ONE unit
+// (a live-preflight-shaped object for the primary, with members: the live preflight
+// refs of every group member, groupId, subsystem, rationale attached); every other
+// live preflight becomes an ordinary singleton unit (members: [self], groupId: null)
+// — the exact shape processIssue()'s ctx init below defaults to, so a no-group run
+// produces units identical to today's preflights array.
+function deriveUnits(reconciledMap, livePreflights) {
+  const byIssue = {}
+  for (const p of livePreflights || []) byIssue[p.issue] = p
+  const consumed = {}
+  const units = []
+  reconciledMap.forEach(function (g) {
+    const memberRefs = g.members.map(function (n) { return byIssue[n] }).filter(Boolean)
+    if (memberRefs.length < 2) return // a member vanished from livePreflights entirely; treat as dissolved
+    const primaryRef = byIssue[g.primary] || memberRefs[0]
+    memberRefs.forEach(function (m) { consumed[m.issue] = true })
+    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale }))
+  })
+  for (const p of (livePreflights || [])) {
+    if (consumed[p.issue]) continue
+    units.push(Object.assign({}, p, { members: [p], groupId: null }))
+  }
+  return units
+}
 
 // ----- batch state -----
 const STOP = { tripped: false, reason: '' }
@@ -465,6 +761,26 @@ let LEARN = null // category digests distilled from process-retrospective.md (Se
 
 function tripStop(reason) {
   if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; log('STOP: ' + reason) }
+}
+
+// isBudgetExhaustedError: budget/ceiling errors are fatal for the whole run
+// (tripStop), not a per-attempt death — shared by stage() and
+// consolidationAgent() so the two call sites can't drift on what counts as one.
+function isBudgetExhaustedError(msg) {
+  if (!/budget|token target|ceiling/i.test(msg)) return false
+  tripStop('token budget exhausted (' + msg + ')')
+  return true
+}
+
+// recordAgentDeath: shared BATCH.consecutiveDeaths bookkeeping for stage() and
+// consolidationAgent() — trips STOP after MAX_CONSECUTIVE_AGENT_DEATHS in a row,
+// on the theory that repeated deaths mean a usage limit or API outage rather
+// than a one-off flake.
+function recordAgentDeath() {
+  BATCH.consecutiveDeaths++
+  if (BATCH.consecutiveDeaths >= MAX_CONSECUTIVE_AGENT_DEATHS) {
+    tripStop(MAX_CONSECUTIVE_AGENT_DEATHS + ' consecutive agent deaths — likely usage limit or API outage. Resume later with the same args (preflight will skip finished work) or resumeFromRunId.')
+  }
 }
 
 // True only for values safe to do arithmetic on (excludes NaN/Infinity/non-numbers).
@@ -492,16 +808,36 @@ function spentTokens() {
 // per-issue pipelines run side by side; the guard pins gh targets to this ctx's
 // issue and stamps every posted comment with a machine-checkable marker that
 // the contrarian gates use to detect and delete misfiled comments.
+//
+// A consolidation GROUP unit's stages legitimately need to post to / edit every
+// member issue (postNote's per-member halt note, the merge stage's per-member
+// claim release, ...) — a single-issue guard would flatly forbid that ("NEVER
+// post to them") and contradict every group-aware prompt built above. So the
+// guard widens its in-scope set to every ctx.members issue for a group unit,
+// while keeping the singleton branch byte-for-byte identical to before.
 function scopeGuard(ctx) {
-  const lines = [
-    '## Scope guard (ticketmill)',
-    'You are working EXCLUSIVELY on issue #' + ctx.issue + ' of ' + REPO + (ctx.pr ? ' (PR #' + ctx.pr + ')' : '') + '.',
-    'Every gh issue comment / gh pr comment / gh issue edit command MUST target issue #' + ctx.issue +
-    (ctx.pr ? ' or PR #' + ctx.pr : '') + ' exactly — re-read the number in the command line before running it.',
-    'Other issue/PR numbers appearing in context, handoff notes, or learnings belong to concurrent pipelines;',
-    'NEVER post to them.',
-    'End every comment body you post with this exact marker line: <!-- ticketmill ' + REPO + '#' + ctx.issue + ' -->',
-  ]
+  const isGroup = ctx.members && ctx.members.length > 1
+  const memberNums = isGroup ? memberIssues(ctx) : [ctx.issue]
+  const lines = isGroup
+    ? [
+        '## Scope guard (ticketmill)',
+        'You are working EXCLUSIVELY on consolidation group ' + ctx.groupId + ' of ' + REPO + (ctx.pr ? ' (PR #' + ctx.pr + ')' : '') +
+        ', covering member issues: ' + fmtIssues(memberNums) + '.',
+        'Every gh issue comment / gh pr comment / gh issue edit command MUST target one of these member issues (' +
+        fmtIssues(memberNums) + ')' + (ctx.pr ? ' or PR #' + ctx.pr : '') + ' exactly — re-read the number in the command line before running it.',
+        'Other issue/PR numbers appearing in context, handoff notes, or learnings belong to concurrent pipelines;',
+        'NEVER post to them.',
+        'End every comment you post on a member issue with THAT issue\'s own marker line: <!-- ticketmill ' + REPO + '#<that member\'s number> -->.',
+      ]
+    : [
+        '## Scope guard (ticketmill)',
+        'You are working EXCLUSIVELY on issue #' + ctx.issue + ' of ' + REPO + (ctx.pr ? ' (PR #' + ctx.pr + ')' : '') + '.',
+        'Every gh issue comment / gh pr comment / gh issue edit command MUST target issue #' + ctx.issue +
+        (ctx.pr ? ' or PR #' + ctx.pr : '') + ' exactly — re-read the number in the command line before running it.',
+        'Other issue/PR numbers appearing in context, handoff notes, or learnings belong to concurrent pipelines;',
+        'NEVER post to them.',
+        'End every comment body you post with this exact marker line: <!-- ticketmill ' + REPO + '#' + ctx.issue + ' -->',
+      ]
   if (BROWSER) {
     lines.push('The shared verification browser is lock-guarded (' + BW_LOCK + '): only use it if your prompt includes the')
     lines.push('"live browser feedback" protocol block — without that block, do NOT open the browser.')
@@ -523,16 +859,13 @@ async function stage(ctx, key, prompt, opts, schema, tries) {
         r = await agent(p, Object.assign({ label: ctx.issue + ':' + key, phase: 'Issue #' + ctx.issue, schema: schema }, opts))
       } catch (e) {
         const msg = String((e && e.message) || e)
-        if (/budget|token target|ceiling/i.test(msg)) { tripStop('token budget exhausted (' + msg + ')'); return null }
+        if (isBudgetExhaustedError(msg)) return null
         log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' threw: ' + msg)
       }
       if (r) { BATCH.consecutiveDeaths = 0; return r }
       log('#' + ctx.issue + ' ' + key + ' attempt ' + attempt + ' returned null' + (attempt < n ? ' — retrying' : ''))
     }
-    BATCH.consecutiveDeaths++
-    if (BATCH.consecutiveDeaths >= MAX_CONSECUTIVE_AGENT_DEATHS) {
-      tripStop(MAX_CONSECUTIVE_AGENT_DEATHS + ' consecutive agent deaths — likely usage limit or API outage. Resume later with the same args (preflight will skip finished work) or resumeFromRunId.')
-    }
+    recordAgentDeath()
     return null
   } finally {
     // Token attribution is instrumentation only — isolated in its own try/catch so
@@ -762,28 +1095,50 @@ function aggregateTokens(results, spent, concurrency) {
   }
 }
 
-// Best-effort halt note on the issue so humans can triage from GitHub alone.
+// Best-effort halt note on the issue so humans can triage from GitHub alone. For a
+// consolidation group (ctx.members.length > 1), the SAME halt fires the same note
+// on EVERY member issue — not just the primary — naming the group so a human
+// reading any one member's trail knows the whole unit halted together, and
+// releases every member's claim so a resumed run can re-pick up the group. The
+// singleton branch below is byte-for-byte the original single-issue prompt.
 async function postNote(ctx, stageKey, status, error) {
   if (STOP.tripped) return
-  const noted = await stage(ctx, 'halt-note-' + stageKey, [
-    'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (use gh issue comment).',
+  const isGroup = ctx.members && ctx.members.length > 1
+  const memberNums = isGroup ? memberIssues(ctx) : [ctx.issue]
+  const groupLine = isGroup
+    ? 'This issue is part of consolidation group ' + ctx.groupId + ' (primary #' + ctx.issue + '; members: ' + fmtIssues(memberNums) + ') — the whole group halted together.'
+    : ''
+  const lines = [
+    isGroup
+      ? 'Post a GitHub comment on EACH of these member issues in ' + REPO + ' (use gh issue comment for every one): ' + fmtIssues(memberNums) + '.'
+      : 'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (use gh issue comment).',
     'Title line: "## Automated Processing Halted"',
     'Body: state that the ticketmill workflow halted at stage "' + stageKey + '" with status "' + status + '".',
+  ]
+  if (isGroup) lines.push(groupLine)
+  lines.push(
     'Error: ' + String(error || 'unknown').slice(0, 800),
     'Include: "Resume: re-run the ticketmill workflow with the same args — completed stages are detected from GitHub/git state and skipped."',
-    'Also release the claim so another run can pick this issue up:',
-    'gh issue edit ' + ctx.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true',
+    'Also release the claim so another run can pick this ' + (isGroup ? 'group' : 'issue') + ' up' + (isGroup ? ' — do this for EVERY member issue listed above' : '') + ':',
+    isGroup
+      ? memberNums.map(function (n) { return 'gh issue edit ' + n + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true' }).join('\n')
+      : 'gh issue edit ' + ctx.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true',
     'Return posted=true/false.',
-  ].join('\n'), stageOpts('probe'), NOTE_SCHEMA, 1)
+  )
+  const noted = await stage(ctx, 'halt-note-' + stageKey, lines.join('\n'), stageOpts('probe'), NOTE_SCHEMA, 1)
   if (!noted || !noted.posted) log('#' + ctx.issue + ' halt note (' + stageKey + ') did not post — status is recorded in the run results only')
 }
 
+// fail(): called exactly once per unit — every call site is a `return fail(...)`,
+// so this fires (and increments BATCH.failures) exactly ONCE per unit regardless
+// of how many members it covers. A failed GROUP is still one breaker increment,
+// not one per member; postNote() above is what fans the halt note out per member.
 async function fail(ctx, status, stageKey, error) {
   log('#' + ctx.issue + ' -> ' + status + ' at ' + stageKey + ': ' + String(error || '').slice(0, 200))
   await postNote(ctx, stageKey, status, error)
   BATCH.failures++
   if (BATCH.failures >= MAX_BATCH_FAILURES) tripStop('circuit breaker: ' + BATCH.failures + ' issues failed')
-  return { issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice() }
+  return { issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx) }
 }
 
 // =============================================================================
@@ -1185,11 +1540,17 @@ async function runTestLoop(ctx) {
 // Top-level (not closed over ctx) so tests can exercise the stub guard directly;
 // still closes over IMPLEMENTERS, DEFAULT_IMPLEMENTER, and log from module scope.
 function sanitizeTasks(ctx, raw) {
+  // origin_issue must name an actual member of THIS unit — a hallucinated or
+  // stale issue number falls back to the primary (ctx.issue), same as a
+  // singleton always does (its only valid origin is ctx.issue itself).
+  const validOrigins = memberIssues(ctx)
   return (raw || []).map(function (t, i) {
+    const origin = (typeof t.origin_issue === 'number' && validOrigins.indexOf(t.origin_issue) !== -1) ? t.origin_issue : ctx.issue
     return {
       id: typeof t.id === 'number' ? t.id : i + 1,
       description: String(t.description || '').trim(),
       agent: IMPLEMENTERS.indexOf(t.agent) !== -1 ? t.agent : DEFAULT_IMPLEMENTER,
+      origin_issue: origin,
     }
   }).filter(function (t) {
     // Stub guard: a real task description is a sentence, not a token. Dropping
@@ -1202,6 +1563,361 @@ function sanitizeTasks(ctx, raw) {
 }
 
 // =============================================================================
+// PROPOSECONSOLIDATION (Select-phase judgment gate; ABOVE the harness split like
+// implementIssue/reviewAndMerge, so tests/harness.js can drive it with a scripted
+// agent()). Takes EVERY live preflight, any resume_point — not just 'implement' —
+// because the HEAL phase below must recognize a group whose members have since
+// flipped to 'process_pr' (the shared PR already exists; a prior run crashed
+// after creating it) or 'skip' (one member resolved independently); filtering the
+// candidate set to 'implement' up front would hide those markers from healGroups()
+// entirely. Only the PROPOSE phase (brand-new opus-gate groupings) is restricted
+// to 'implement' candidates — see its own filter below. Proposes grouping
+// candidate issues into ONE worktree/branch/research/plan/PR unit when — and only
+// when — they share the same subsystem AND acceptance surface, or one explicitly
+// depends on another. Grouping is the EXCEPTION: the conservative-bar prompt below
+// treats "shared files touched" as a hint, never a reason, and an empty run
+// (0 or 1 candidates) short-circuits for free with no agent call at all.
+//
+// TWO-PHASE, LIKE THE APPROACH/PLAN GATES IN implementIssue() — WITH ONE
+// DELIBERATE ASYMMETRY:
+//   1. HEAL: fold in any group a PRIOR run already proposed and recorded via
+//      comment markers (buildConsolidationGroupComment/buildConsolidatedMemberComment,
+//      see the CONSOLIDATION FOUNDATIONS block above) — a resumed run recognizes an
+//      existing decision instead of re-litigating it. This runs even when
+//      PROFILE.consolidation === false: turning the gate off mid-run must not
+//      un-heal a group a PRIOR run already committed to.
+//   2. PROPOSE + CHALLENGE: only the residual, unmarked candidates go in front of
+//      the opus gate; each proposed group then runs a CAPPED contrarian challenge
+//      (reusing CHALLENGE_SCHEMA and the 'contrarian' role, exactly like the
+//      approach/plan gates). THE ASYMMETRY: where those gates proceed-with-caveats
+//      at the cap, a contested consolidation group instead DISSOLVES back into
+//      independent issues. Grouping entangles multiple issues' worktree/branch/PR
+//      into one unit — an unresolved "maybe these shouldn't be one unit" is not a
+//      caveat implementation can absorb the way "maybe this approach has a risk"
+//      is, and the safe fallback (process each issue independently) is always
+//      available — so the gate takes it instead of forcing a doubtful merge
+//      through. The same reasoning is why a DEAD challenger also dissolves rather
+//      than proceeding unchallenged (implementIssue's gates fail open there
+//      because the issue MUST be implemented regardless; this gate is a pure
+//      optimization it is always safe to skip).
+//
+// DRY_RUN: the marker heal and the opus PROPOSAL are read-only (gh issue view /
+// --json reads only — no writes) and run exactly the same under DRY_RUN as for
+// real. The CONTRARIAN CHALLENGE is skipped ENTIRELY under DRY_RUN (it posts
+// trail comments) — a dry run previews the raw, PRE-CHALLENGE proposal instead
+// (each such entry carries dry_run_preview: true so a caller never mistakes an
+// unchallenged preview group for a finalized one).
+//
+// MARKERS: posting the group/member consolidation-marker comments themselves is
+// deliberately NOT this function's job. Real membership is only settled after
+// claims (a member can be excluded by reconcileGroups() if its claim races or its
+// resume_point flips) — see reconcileGroups()/deriveUnits() above. Posting markers
+// here, before claims, could stamp a marker naming a member that never actually
+// joins the live unit; the post-claim materialization step (Select-phase wiring)
+// owns marker posting instead.
+//
+// RETURN: Map<groupId, {groupId, primary, members: [issueNumbers], subsystem,
+// rationale, dry_run_preview?}> — the SAME shape healGroups()/reconcileGroups()
+// return, so a caller can hand it straight to reconcileGroups(map, livePreflights)
+// after claims. Only ACCEPTED groups (healed, or opus-proposed + contrarian-
+// accepted) appear; dissolved/never-grouped candidates are simply absent — callers
+// fall them through to deriveUnits()'s ordinary singleton path, exactly like an
+// issue that was never a consolidation candidate at all.
+// =============================================================================
+
+// consolidationScopeGuard: scopeGuard(ctx) is single-issue by design (see its own
+// comment) — a consolidation judgment call spans MULTIPLE issues in one prompt, so
+// it needs its own guard pinning gh reads/writes to the exact candidate set
+// instead of pretending there is one ctx.issue.
+function consolidationScopeGuard(issueNumbers) {
+  return [
+    '## Scope guard (ticketmill consolidation gate)',
+    'You are evaluating ONLY these candidate issues of ' + REPO + ': ' + fmtIssues(issueNumbers) + '.',
+    'Any gh issue view/comment/edit command MUST target one of exactly these numbers — re-read the number before',
+    'running it. Other issue/PR numbers appearing anywhere in context belong to concurrent pipelines; NEVER act on them.',
+    'If you post a comment, end it with the marker line "<!-- ticketmill ' + REPO + '#<issue> -->", naming the',
+    'SPECIFIC issue you posted to (never a different number).',
+  ].join('\n')
+}
+
+// consolidationAgent: the same safety net stage() gives single-issue calls
+// (STOP.tripped short-circuit, budget/ceiling errors converted to tripStop()
+// instead of propagating, BATCH.consecutiveDeaths accounted on every death),
+// but for the multi-issue consolidation gate — which has no single ctx to hang
+// off of, so it guards on the candidate issueNumbers list via
+// consolidationScopeGuard() instead of scopeGuard(ctx). No retries (matches
+// this gate's pre-hardening call shape: a death here dissolves/falls through
+// to the ordinary per-issue path rather than being worth a retry budget).
+// Token attribution is INTENTIONALLY deferred here: stage()'s ctx.tokens sampling
+// (spentTokens() before/after, attributed to one issue's metrics) has no home at
+// this gate — there is no per-issue ctx, and a group spans several issues before
+// any of them has one. Consolidation-gate/challenge spend is real run spend (it
+// still counts against the shared budget), just not broken out per issue in the
+// batch PR's token totals; revisit if that visibility gap ever needs closing.
+async function consolidationAgent(issueNumbers, label, promptText, opts, schema) {
+  if (STOP.tripped) return null
+  const guarded = consolidationScopeGuard(issueNumbers) + '\n\n' + promptText
+  let r = null
+  try {
+    r = await agent(guarded, Object.assign({ label: label, phase: 'Select', schema: schema }, opts))
+  } catch (e) {
+    const msg = String((e && e.message) || e)
+    if (isBudgetExhaustedError(msg)) return null
+    log('consolidation ' + label + ' threw: ' + msg)
+  }
+  if (r) { BATCH.consecutiveDeaths = 0; return r }
+  recordAgentDeath()
+  return null
+}
+
+// fetchConsolidationMarkers: READ-ONLY (safe under DRY_RUN) — collects each
+// candidate's most recent consolidation-marker comment, if any, for healGroups().
+async function fetchConsolidationMarkers(issueNumbers) {
+  if (!issueNumbers.length) return []
+  const r = await consolidationAgent(issueNumbers, 'consolidation:marker-probe', [
+    'READ-ONLY: for each issue above, check whether it carries a prior ticketmill consolidation-marker comment —',
+    'one whose FIRST line is EXACTLY "' + CONSOLIDATION_MEMBER_TITLE + '" or "' + CONSOLIDATION_GROUP_TITLE + '".',
+    'gh issue view <n> --repo ' + REPO + ' --json comments',
+    'Return markers: [{issue, body}] — ONLY for issues carrying such a comment (its exact full body; if more than',
+    'one exists on an issue, the MOST RECENT). Omit issues with none entirely.',
+  ].join('\n'), stageOpts('probe'), CONSOLIDATION_MARKER_PROBE_SCHEMA)
+  return (r && r.markers) || []
+}
+
+// challengeConsolidationGroup: the capped contrarian loop for ONE proposed group.
+// Returns the (possibly revised) accepted group, or null if it DISSOLVED (cap
+// reached without acceptance, or a dead challenger/reviser — see the module
+// comment above for why this gate fails conservatively, not open).
+async function challengeConsolidationGroup(group, settledCarrier) {
+  let current = group
+  for (let iter = 1; iter <= MAX_CONTRARIAN_ITERATIONS; iter++) {
+    const groupId = stableGroupId(current.members)
+    const ch = await consolidationAgent(current.members, 'consolidation:challenge-g' + groupId + '-i' + iter, [
+      roleBlock('contrarian'),
+      '',
+      'Stress-test a PROPOSED ISSUE CONSOLIDATION for ' + REPO + ' (challenge iteration ' + iter + ').',
+      'Proposed group: primary #' + current.primary + ', members ' + fmtIssues(current.members) + '.',
+      'Subsystem: ' + (current.subsystem || '(none given)'),
+      current.shared_surface ? 'Shared acceptance surface: ' + current.shared_surface : '',
+      current.dependency ? 'Dependency: ' + current.dependency : '',
+      'Rationale: ' + (current.rationale || '(none given)'),
+      '',
+      settledBlock(settledCarrier),
+      '',
+      'Read every member issue (gh issue view <n> --repo ' + REPO + ' --json title,body,comments) before judging.',
+      'Apply the CONSERVATIVE bar: grouping is the EXCEPTION. A finding is MAJOR OR WORSE if the group fails the',
+      'bar — same subsystem AND a genuinely shared acceptance surface (the SAME tests/endpoints/UI verify every',
+      'member), OR an explicit dependency — or if "files happen to overlap" is the ONLY justification offered.',
+      'Verify claims against the actual issue text; do not accept the proposal\'s framing uncritically.',
+      'ACCEPTANCE: verdict "sound_with_caveats" means ZERO unresolved critical/major findings.',
+      iter > 1 ? 'This is iteration ' + iter + ': the group was revised per your prior findings — check whether they are addressed.' : '',
+      'Post an issue comment on #' + current.primary + ' titled "## Contrarian: Consolidation Challenge (Group ' + groupId + ', Iteration ' + iter + ')" with your verdict and findings.',
+      'STRUCTURED OUTPUT CONTRACT: verdict must be EXACTLY one of sound_with_caveats | needs_rework | investigate_first.',
+      'Every concern goes in the findings ARRAY (severity, summary, recommendation), never only in prose.',
+    ].filter(Boolean).join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
+
+    if (!ch) {
+      log('consolidation group ' + groupId + ' DISSOLVED — challenge agent died (fails conservatively, not open)')
+      return null
+    }
+    const criticalMajor = (ch.findings || []).filter(function (f) { return f.severity === 'critical' || f.severity === 'major' }).length
+    if (ch.verdict === 'sound_with_caveats' && criticalMajor === 0) {
+      settleDecision(settledCarrier, 'consolidation group ' + groupId, 'consolidation challenge i' + iter,
+        'group primary #' + current.primary + ' <- members ' + current.members.join(','), current.rationale, [])
+      return current
+    }
+    log('consolidation group ' + groupId + ' challenge i' + iter + ': ' + ch.verdict + ', ' + criticalMajor + ' critical/major')
+    if (iter === MAX_CONTRARIAN_ITERATIONS) {
+      log('consolidation group ' + groupId + ' DISSOLVED — contrarian cap (' + MAX_CONTRARIAN_ITERATIONS + ') reached without acceptance: ' + (ch.summary || ''))
+      await consolidationAgent(current.members, 'consolidation:dissolve-note-g' + groupId, [
+        'Post a GitHub comment on issue #' + current.primary + ' in ' + REPO + ' (gh issue comment).',
+        'Title line: "## Consolidation Dissolved After Contrarian Cap"',
+        'Body: a proposed consolidation of ' + fmtIssues(current.members) +
+          ' did not survive ' + MAX_CONTRARIAN_ITERATIONS + ' contrarian challenge iterations; each issue will be',
+        'processed independently instead. Last challenge summary: ' + String(ch.summary || '').slice(0, 900),
+        'Return posted=true/false.',
+      ].join('\n'), stageOpts('probe'), NOTE_SCHEMA)
+      return null
+    }
+    // Revise: give the opus gate one more look at just THIS group, with the
+    // challenge findings in hand. Reuses CONSOLIDATION_SCHEMA (a single-group
+    // response is just groups: [one] — or groups: [] if it now concludes the
+    // members should not be grouped at all, which dissolves immediately rather
+    // than spending remaining iterations defending an unsupported grouping).
+    const re = await consolidationAgent(current.members, 'consolidation:revise-g' + groupId + '-i' + iter, [
+      'Revise a proposed issue consolidation for ' + REPO + ' based on contrarian feedback (verdict: ' + ch.verdict + ').',
+      'Current group: primary #' + current.primary + ', members ' + fmtIssues(current.members) + '.',
+      'Findings to address:',
+      (ch.findings || []).map(function (f) { return '- [' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || '') }).join('\n'),
+      'A challenger finding is a HYPOTHESIS, not a directive — verify each against the actual issues first. If, after',
+      'verifying, these issues genuinely should NOT be grouped, return groups: [] and list every member issue in',
+      'ungrouped instead (this ends the review — do not keep defending a grouping the evidence does not support).',
+      'Otherwise return EXACTLY ONE revised group (same schema as the original gate) addressing the CONFIRMED concerns.',
+      'Only consider these candidates — never introduce an issue number outside this exact set: ' + fmtIssues(current.members) + '.',
+    ].join('\n'), stageOpts('consolidation'), CONSOLIDATION_SCHEMA)
+
+    if (!re || !Array.isArray(re.groups) || !re.groups.length) {
+      log('consolidation group ' + groupId + ' DISSOLVED — revision concluded no grouping (or agent died)')
+      return null
+    }
+    const rg = re.groups[0]
+    const revisedMembers = (rg.members || []).filter(function (n) { return current.members.indexOf(n) !== -1 })
+    if (revisedMembers.length < 2) {
+      log('consolidation group ' + groupId + ' DISSOLVED — revision shrank below a group')
+      return null
+    }
+    current = { primary: pickPrimary(revisedMembers, rg.primary), members: revisedMembers, subsystem: rg.subsystem || current.subsystem, shared_surface: rg.shared_surface, dependency: rg.dependency, rationale: rg.rationale || current.rationale }
+  }
+  return null // defensive; every loop iteration above returns before falling off the end
+}
+
+// proposeConsolidation: the Select-phase entry point (see the module comment
+// above for the full design). `candidates` are preflight-shaped objects
+// ({issue, title, resume_point, ...}) — the caller passes EVERY live preflight
+// (all resume_points), not just 'implement' ones, so HEAL below can recognize a
+// group whose members have since flipped to 'process_pr' or 'skip'.
+async function proposeConsolidation(candidates) {
+  const list = (candidates || []).filter(function (c) { return c && c.issue })
+  if (list.length <= 1) return new Map() // free-skip: nothing to group, no agent call at all
+
+  // ---- HEAL (always runs — even with PROFILE.consolidation === false; turning the
+  // gate off mid-run must not un-heal a group a PRIOR run already committed to.
+  // Runs over EVERY candidate regardless of resume_point: a group whose members
+  // now all resolve to 'process_pr' — the prior run created the shared PR but
+  // failed/crashed before merging it — must still be recognized here, or
+  // reconcileGroups()/deriveUnits() would never see it and each member would
+  // splinter into its own independent process_pr singleton, all targeting the
+  // SAME PR.) ----
+  const markers = await fetchConsolidationMarkers(list.map(function (c) { return c.issue }))
+  const healed = healGroups(list, markers)
+  const healedIssues = {}
+  healed.forEach(function (g) { for (const n of g.members) healedIssues[n] = true })
+  // ---- PROPOSE eligibility: only FRESH 'implement' candidates can enter a brand-new
+  // opus-gate grouping — an issue already resolved to 'process_pr' or 'skip' has no
+  // grouping decision left to make; if it belongs to a group, HEAL above already
+  // found it via markers. ----
+  const residual = list.filter(function (c) { return !healedIssues[c.issue] && c.resume_point === 'implement' })
+  const out = new Map(healed)
+
+  if (!consolidationEnabled(PROFILE) || residual.length <= 1) return out
+
+  // ---- PROPOSE (opus gate, READ-ONLY, conservative bar) ----
+  const menu = residual.map(function (c) { return '- #' + c.issue + ': ' + (c.title || '(no title)') }).join('\n')
+  const proposal = await consolidationAgent(residual.map(function (c) { return c.issue }), 'consolidation:propose', [
+    'READ-ONLY consolidation gate for a ticketmill batch run on ' + REPO + '. Decide whether any of these candidate',
+    'issues are cheaper to resolve as ONE worktree/branch/research/plan/PR unit instead of independently:',
+    menu,
+    '',
+    'Grouping is the EXCEPTION, not the rule — most runs should return an EMPTY groups array. Group two or more',
+    'issues ONLY when BOTH (a) they touch the SAME subsystem, AND (b) they share the SAME acceptance surface (the',
+    'same tests/endpoints/UI would verify all of them) — OR one issue has an EXPLICIT DEPENDENCY on another',
+    '(cannot be implemented or verified without it). Shared files touched is a HINT, never a REASON on its own —',
+    'many unrelated issues happen to touch the same file.',
+    'Read each issue first: gh issue view <n> --repo ' + REPO + ' --json title,body,comments',
+    'For each group: primary (the LOWEST issue number in the group — it will carry the comment trail), members',
+    '(every issue number in the group, primary included), subsystem, shared_surface OR dependency (populate',
+    'whichever reason applies — at least one is REQUIRED for any group; a group with neither is invalid),',
+    'rationale (1-3 concrete sentences).',
+    'Every candidate issue number listed above MUST appear in EXACTLY ONE of: some group\'s members, or ungrouped.',
+    'Return groups (possibly empty — that is the expected common case) and ungrouped.',
+  ].join('\n'), stageOpts('consolidation'), CONSOLIDATION_SCHEMA)
+
+  if (!proposal || !Array.isArray(proposal.groups) || !proposal.groups.length) return out // agent died, or found nothing to propose
+
+  const rawGroups = proposal.groups
+    .map(function (g) {
+      const members = (g.members || []).filter(function (n) { return residual.some(function (c) { return c.issue === n }) })
+      return Object.assign({}, g, { members: members, primary: pickPrimary(members, g.primary) })
+    })
+    .filter(function (g) { return g.members.length >= 2 })
+
+  if (!rawGroups.length) return out
+
+  // ---- DEDUPE (mechanical invariant enforced in code, not just the prompt above):
+  // CONSOLIDATION_SCHEMA does not forbid the same issue number appearing in two
+  // groups[] entries, and only the prompt instructs the opus gate to keep every
+  // candidate in exactly one bucket. If it ever violates that, two Map entries would
+  // claim the same issue and downstream deriveUnits() would enter it into two
+  // units/branches/PRs at once. First-seen wins: a later group that shares ANY member
+  // with an earlier-claimed group is dropped whole (not trimmed — trimming could
+  // silently orphan its primary or shrink it below a group without another look).
+  const claimedIssues = {}
+  const dedupedGroups = []
+  for (const g of rawGroups) {
+    if (g.members.some(function (n) { return claimedIssues[n] })) {
+      log('consolidation: dropping proposed group ' + fmtIssues(g.members) + ' — overlaps an already-claimed issue')
+      continue
+    }
+    g.members.forEach(function (n) { claimedIssues[n] = true })
+    dedupedGroups.push(g)
+  }
+  if (!dedupedGroups.length) return out
+
+  if (DRY_RUN) {
+    // DRY_RUN previews the RAW, PRE-CHALLENGE proposal — the contrarian challenge
+    // posts trail comments, so it never runs under DRY_RUN (see module comment).
+    for (const g of dedupedGroups) out.set(stableGroupId(g.members), toGroupEntry(g, { dry_run_preview: true }))
+    return out
+  }
+
+  // ---- CHALLENGE (capped; cap DISSOLVES — see module comment for the asymmetry) ----
+  const consSettled = { settled: [] } // local carrier — reuses settleDecision()/settledBlock(); no per-issue ctx exists at this gate
+  for (const g of dedupedGroups) {
+    const accepted = await challengeConsolidationGroup(g, consSettled)
+    if (!accepted) continue // dissolved — members fall through to the caller's ordinary singleton path
+    out.set(stableGroupId(accepted.members), toGroupEntry(accepted))
+  }
+  return out
+}
+
+// postConsolidationMarkers: post the group-membership marker on a materialized
+// group's PRIMARY (buildConsolidationGroupComment) and the absorbed-member marker
+// on every OTHER live member (buildConsolidatedMemberComment). Deliberately called
+// only AFTER Select-phase materialization (deriveUnits over the reconciled map +
+// live post-claim preflights) — see proposeConsolidation()'s module comment: real
+// membership is only settled post-claim, so posting any earlier could name a
+// member that never actually joins the live unit. Idempotent across resumes: each
+// post is instructed to first check for an existing marker (same pattern as
+// implementIssue()'s setup stage, "SKIP the comment if one with that exact title
+// already exists") so a resumed run's re-heal of an already-marked group never
+// double-posts. `units` is the array runPool() is about to process; singletons
+// (groupId null, or fewer than 2 live members) are silently skipped.
+async function postConsolidationMarkers(units) {
+  const groups = (units || []).filter(function (u) { return u && u.groupId != null && Array.isArray(u.members) && u.members.length >= 2 })
+  for (const u of groups) {
+    const memberIssueNums = u.members.map(function (m) { return m.issue })
+    const groupBody = buildConsolidationGroupComment(REPO, u.issue, u.groupId, memberIssueNums, u.subsystem, u.rationale)
+    await consolidationAgent(memberIssueNums, 'consolidation:mark-primary-g' + u.groupId, [
+      'Post the consolidation GROUP marker comment on issue #' + u.issue + ' of ' + REPO + '.',
+      'FIRST check whether it already exists: gh issue view ' + u.issue + ' --repo ' + REPO + ' --json comments',
+      '— SKIP posting if any comment\'s first line is exactly "' + CONSOLIDATION_GROUP_TITLE + '" and it contains',
+      '"group: ' + u.groupId + '" (resumed run; already posted).',
+      'Otherwise post EXACTLY this body verbatim, unchanged (gh issue comment ' + u.issue + ' --repo ' + REPO + ' --body):',
+      '"""',
+      groupBody,
+      '"""',
+      'Return posted (true if you posted it now, false if it already existed).',
+    ].join('\n'), stageOpts('probe'), NOTE_SCHEMA)
+
+    for (const m of u.members) {
+      if (m.issue === u.issue) continue // the primary carries the group marker, not a member marker
+      const memberBody = buildConsolidatedMemberComment(REPO, m.issue, u.issue, u.groupId, u.rationale)
+      await consolidationAgent([m.issue], 'consolidation:mark-member-' + m.issue, [
+        'Post the consolidation MEMBER marker comment on issue #' + m.issue + ' of ' + REPO + '.',
+        'FIRST check whether it already exists: gh issue view ' + m.issue + ' --repo ' + REPO + ' --json comments',
+        '— SKIP posting if any comment\'s first line is exactly "' + CONSOLIDATION_MEMBER_TITLE + '" (resumed run;',
+        'already posted).',
+        'Otherwise post EXACTLY this body verbatim, unchanged (gh issue comment ' + m.issue + ' --repo ' + REPO + ' --body):',
+        '"""',
+        memberBody,
+        '"""',
+        'Return posted (true if you posted it now, false if it already existed).',
+      ].join('\n'), stageOpts('probe'), NOTE_SCHEMA)
+    }
+  }
+}
+
+// =============================================================================
 // IMPLEMENT (setup -> research -> evaluate<->contrarian -> plan<->contrarian ->
 // tasks with review/quality loops -> test loop -> browser -> docblocks -> PR)
 // Returns null on success (ctx.pr set), or a failure result object.
@@ -1211,13 +1927,17 @@ async function implementIssue(ctx) {
   const setupScript = ROOT + '/.claude/scripts/ticketmill/setup-worktree.sh'
   const envFiles = PROFILE.env_files || []
   const installCmds = PROFILE.install_commands || []
+  // A group's worktree/branch/PR identity is bound to its stable groupId, never
+  // the mutable logical primary (ctx.issue) — see worktreeAnchor()'s comment.
+  // For a singleton, anchor === ctx.issue, so this is a no-op.
+  const anchor = worktreeAnchor(ctx)
   const setup = await stage(ctx, 'setup', [
     'Set up the git worktree for issue #' + ctx.issue + ' (ticketmill workflow).',
     '',
     '0. Fetch the batch integration branch first: git -C ' + ROOT + ' fetch origin ' + TARGET,
     '1. Run exactly, from ' + ROOT + ', and capture its single-line JSON output:',
-    '   ' + setupScript + ' ' + ctx.issue + ' ' + TARGET + ' ' + ROOT + ' ' + WORKTREES + ' ' + REPO,
-    '   (Idempotent: reuses an existing worktree already on an issue-' + ctx.issue + '-* branch.)',
+    '   ' + setupScript + ' ' + anchor + ' ' + TARGET + ' ' + ROOT + ' ' + WORKTREES + ' ' + REPO,
+    '   (Idempotent: reuses an existing worktree already on an issue-' + anchor + '-* branch.)',
     '2. If success, make the worktree bootable:',
     envFiles.length
       ? '   - Copy env files from the root checkout if missing in the worktree: ' + envFiles.map(function (f) { return 'cp -n ' + ROOT + '/' + f + ' <worktree>/' + f + ' 2>/dev/null || true' }).join('; ')
@@ -1241,10 +1961,19 @@ async function implementIssue(ctx) {
   ctx.branch = setup.branch
 
   // ---- RESEARCH ----
-  const research = await stage(ctx, 'research', [
+  // Group unit: read EVERY member's issue, not just the primary — and keep each
+  // member's requirements attributed to its own issue number rather than blended
+  // into one synthesized narrative, so a task can later be traced back to the
+  // member issue that drove it (see the plan stage's origin_issue tagging below).
+  const isGroupUnit = ctx.members.length > 1
+  const researchIssueStep = isGroupUnit
+    ? '1. This is a CONSOLIDATED GROUP unit — read EVERY member issue AND its comments, not just the primary:\n' +
+      ctx.members.map(function (m) { return '   gh issue view ' + m.issue + ' --repo ' + REPO + ' --json title,body,comments' }).join('\n')
+    : '1. Read the issue AND all comments: gh issue view ' + ctx.issue + ' --repo ' + REPO + ' --json title,body,comments'
+  const researchLines = [
     'Research context for issue #' + ctx.issue + ' of ' + REPO + '. Read-only exploration in worktree ' + ctx.worktree + '.',
     '',
-    '1. Read the issue AND all comments: gh issue view ' + ctx.issue + ' --repo ' + REPO + ' --json title,body,comments',
+    researchIssueStep,
     '2. Check prior PRs referencing it: gh pr list --repo ' + REPO + ' --state all --search "' + ctx.issue + '" --json number,title,state,body',
     '3. If prior work exists (implementation comments, closed/rejected PRs, review feedback): summarize what was',
     '   attempted, the outcome, what to preserve vs change.',
@@ -1255,8 +1984,16 @@ async function implementIssue(ctx) {
     'You may also use WebSearch/WebFetch (load via ToolSearch) for external references the issue depends on',
     '(regulations, vendor docs, upstream APIs) — cite fetched URLs in the context you return.',
     bwFeedback(ctx),
-    'Return status, context {issue_title, issue_body (brief requirements), related_files, dependencies, prior_work}.',
-  ].join('\n'), stageOpts('research'), RESEARCH_SCHEMA)
+  ]
+  if (isGroupUnit) {
+    researchLines.push(
+      'Return context.issue_body as PER-MEMBER sections tagged by issue number (e.g. "#' + ctx.members[0].issue +
+      ': ...", "#' + ctx.members[1].issue + ': ..." for every member) — do NOT synthesize one blended narrative;',
+      'downstream stages need to trace a requirement back to the member issue it came from.'
+    )
+  }
+  researchLines.push('Return status, context {issue_title, issue_body (brief requirements), related_files, dependencies, prior_work}.')
+  const research = await stage(ctx, 'research', researchLines.join('\n'), stageOpts('research'), RESEARCH_SCHEMA)
   if (!research) return fail(ctx, 'halted', 'research', 'research agent died')
   if (research.status === 'error') return fail(ctx, 'failed', 'research', research.error || 'research failed')
   const rc = research.context || {}
@@ -1390,8 +2127,18 @@ async function implementIssue(ctx) {
         return '- ' + n + ': ' + String(d).slice(0, 240)
       }).join('\n')
     : '- implementer: built-in generalist software engineer charter (this project declared no implementer agents)'
+  // Group unit: each task must be tagged with origin_issue — the member issue
+  // whose requirement drives it — so downstream (task-implement prompts) can
+  // reference the issue a task actually originated from instead of always the
+  // primary. Singleton: identical to the original single-line instruction.
+  // (isGroupUnit is declared once above, in the RESEARCH section — reused here.)
+  const taskBreakdownLine = isGroupUnit
+    ? 'Break the work into ordered tasks with agent assignments. Each task: {id, description, agent, origin_issue}\n' +
+      '  — origin_issue is the member issue number (from the group members list above) whose requirement drives\n' +
+      '  that task; use the primary #' + ctx.issue + ' only for cross-cutting work not specific to one member.'
+    : 'Break the work into ordered tasks with agent assignments. Each task: {id, description, agent}.'
   const planPromptFor = function (revision) {
-    return [
+    const lines = [
       // Both variants anchor the worktree/branch explicitly — an unanchored
       // revision prompt once committed plan docs to the session's checked-out branch.
       revision ? 'Revise the implementation plan for issue #' + ctx.issue + ' (worktree ' + ctx.worktree + ', branch ' + ctx.branch + ') based on contrarian feedback below.' :
@@ -1400,7 +2147,10 @@ async function implementIssue(ctx) {
       '## Decision chain', decisionChain(ctx),
       settledBlock(ctx), '',
       revision || '',
-      'Break the work into ordered tasks with agent assignments. Each task: {id, description, agent}.',
+    ]
+    if (isGroupUnit) lines.push('This is a CONSOLIDATED GROUP unit spanning member issues: ' + fmtIssues(memberIssues(ctx)) + '.')
+    lines.push(
+      taskBreakdownLine,
       'Available agents (from the target project\'s own roster):',
       agentMenu,
       IMPLEMENTERS.length ? 'Assign each task\'s "agent" to exactly one of those names.' : 'Set each task\'s "agent" to "implementer".',
@@ -1414,8 +2164,9 @@ async function implementIssue(ctx) {
       'Post TWO issue comments: first plan -> "## Implementation Plan" (summary + collapsible full plan) and',
       '"## Task List" (checkbox markdown); a revision -> "## Revised Implementation Plan (iteration N)" and',
       '"## Revised Task List (iteration N)" so the trail shows which is current.',
-      'Return status, plan_path (empty string — plans are not files), tasks, summary, task_list_markdown.',
-    ].join('\n')
+      'Return status, plan_path (empty string — plans are not files), tasks, summary, task_list_markdown.'
+    )
+    return lines.join('\n')
   }
 
   let planR = await stage(ctx, 'plan', planPromptFor(null), stageOpts('plan'), PLAN_SCHEMA)
@@ -1519,10 +2270,14 @@ async function implementIssue(ctx) {
         ctx.unresolved.map(function (u) { return '- ' + u }).join('\n') +
         '\nResolve or explicitly verify each of these FIRST — they were never accepted, only carried past the iteration cap.'
       : ''
+    // A group task's origin_issue names the member issue whose requirement drove
+    // it (defaults to ctx.issue for a singleton, so the clause below never fires
+    // there — the line stays byte-for-byte identical).
+    const originNote = (task.origin_issue && task.origin_issue !== ctx.issue) ? ' (originating from member issue #' + task.origin_issue + ')' : ''
     const impl = await stage(ctx, 'task-' + task.id + '-implement', [
       implementerBlock(task.agent),
       '',
-      'Implement task ' + task.id + ' for issue #' + ctx.issue + ' in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ':',
+      'Implement task ' + task.id + ' for issue #' + ctx.issue + originNote + ' in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ':',
       '',
       task.description,
       '',
@@ -1638,6 +2393,13 @@ async function implementIssue(ctx) {
   }
 
   // ---- PR (with the fallback: probe gh if structured output lacks the number) ----
+  // Group unit: the PR carries one "Closes #N" per member (not just the primary)
+  // so the eventual batch PR's own Closes references stay meaningful per-issue.
+  const closesInstruction = ctx.members.length > 1
+    ? '   Body MUST include one "Closes #N" line for EACH member issue: ' +
+      ctx.members.map(function (m) { return 'Closes #' + m.issue }).join(', ') +
+      ' — plus an implementation summary, and key decisions from:'
+    : '   Body MUST include "Closes #' + ctx.issue + '", an implementation summary, and key decisions from:'
   const pr = await stage(ctx, 'pr', [
     'Create or update the PR for issue #' + ctx.issue + ' from branch ' + ctx.branch + ' (worktree ' + ctx.worktree + ').',
     '',
@@ -1645,7 +2407,7 @@ async function implementIssue(ctx) {
     '2. Existing PR? gh pr list --repo ' + REPO + ' --head ' + ctx.branch + ' --json number',
     '3. If none: gh pr create --repo ' + REPO + ' --base ' + TARGET + ' --head ' + ctx.branch,
     '   Title: conventional commit style referencing issue #' + ctx.issue + '.',
-    '   Body MUST include "Closes #' + ctx.issue + '", an implementation summary, and key decisions from:',
+    closesInstruction,
     decisionChain(ctx),
     '   Body MUST also include this exact line verbatim (approximate — this issue\'s stages only, not the run',
     '   total; tokens only, no prices/currency): "Token usage (approximate, this issue only): ' +
@@ -1775,6 +2537,12 @@ async function reviewAndMerge(ctx) {
 
   // ---- MERGE (complete comment, squash merge, follow-ups, cleanup) ----
   const deferredBlock = ctx.deferred.length ? ctx.deferred.map(function (d) { return '- ' + d }).join('\n') : ''
+  // Group unit: release the claim on EVERY member, not just the primary — every
+  // member's claim label was taken at Select and must be freed the same way.
+  const releaseClaimStep = ctx.members.length > 1
+    ? '6. Release the claim on EVERY member issue:\n   ' +
+      ctx.members.map(function (m) { return 'gh issue edit ' + m.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true' }).join('\n   ')
+    : '6. Release the claim: gh issue edit ' + ctx.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true'
   const merge = await stage(ctx, 'merge', [
     'Finalize and merge PR #' + ctx.pr + ' for issue #' + ctx.issue + ' in ' + REPO + '. It passed spec and code review in this run.',
     '',
@@ -1791,7 +2559,7 @@ async function reviewAndMerge(ctx) {
     '   "consider adding", plus the deferred suggestions below. Create one GitHub issue per distinct actionable item',
     '   (reference PR #' + ctx.pr + ' and issue #' + ctx.issue + '; label bug/enhancement/tech-debt as appropriate).',
     '   First check for existing duplicates — do not re-file.',
-    '6. Release the claim: gh issue edit ' + ctx.issue + ' --repo ' + REPO + ' --remove-label ' + CLAIM_LABEL + ' 2>/dev/null || true',
+    releaseClaimStep,
     '7. Cleanup (non-blocking): ' + (BROWSER ? 'fuser -k ' + bwPort(ctx.issue) + '/tcp 2>/dev/null || true;' : '') ,
     '   rm -rf /tmp/ticketmill-issue-' + ctx.issue + ' || true;',
     '   git -C ' + ROOT + ' worktree remove ' + ctx.worktree + ' --force; git -C ' + ROOT + ' worktree prune',
@@ -1805,7 +2573,7 @@ async function reviewAndMerge(ctx) {
   if (merge.status !== 'merged') return fail(ctx, 'needs_human', 'merge', merge.error || 'merge blocked (' + merge.status + ') — PR #' + ctx.pr + ' left open')
 
   log('#' + ctx.issue + ' merged PR #' + ctx.pr + (merge.follow_up_issues && merge.follow_up_issues.length ? ' (follow-ups: ' + merge.follow_up_issues.join(', ') + ')' : ''))
-  return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice() }
+  return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx) }
 }
 
 // =============================================================================
@@ -1819,21 +2587,35 @@ async function processIssue(pre) {
     notes: [],      // handoff notes: env quirks/gotchas agents pass to later stages
     unresolved: [], // critical/major findings carried past a contrarian iteration cap
     approach: '',   // evaluate's approach one-liner, threaded into fix/test prompts
+    // Consolidation (unit-of-work): live preflight refs for every issue this unit
+    // covers. deriveUnits() sets these on a group unit; anything else defaults to
+    // a self-reference singleton, so ctx.members === [pre] and ctx.groupId === null
+    // for every issue, matching the byte-for-byte no-group behavior the
+    // unit-of-work abstraction must preserve.
+    members: Array.isArray(pre.members) && pre.members.length ? pre.members : [pre],
+    groupId: ('groupId' in pre && pre.groupId != null) ? pre.groupId : null, // stable consolidation-group id; null outside a group
     metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0 },
     tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
   }
   if (pre.resume_point === 'skip') {
     log('#' + ctx.issue + ' skipped: ' + pre.reason)
-    return { issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason }
+    return { issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx) }
   }
   if (pre.resume_point === 'process_pr') {
     log('#' + ctx.issue + ' healing: open PR #' + ctx.pr + ' found — jumping to review/merge')
-    // idempotent setup so review-fix stages have a worktree
+    // idempotent setup so review-fix stages have a worktree. Anchor on the stable
+    // groupId (see worktreeAnchor()) — reconcileGroups() admits members whose live
+    // resume_point is 'implement' OR 'process_pr', so a healed-from-marker GROUP
+    // unit can and does arrive here already mid-review (every member flipped to
+    // 'process_pr' after a prior run created the shared PR but crashed/failed
+    // before merging it). It must resolve the SAME worktree its implement phase
+    // created, not a fresh one keyed off a re-anchored primary — hence the anchor.
+    const anchor = worktreeAnchor(ctx)
     const envFiles = PROFILE.env_files || []
     const setup = await stage(ctx, 'setup-for-review', [
       'Ensure a worktree exists for issue #' + ctx.issue + ' (an open PR already exists; we only need the checkout for potential fixes).',
       'First: git -C ' + ROOT + ' fetch origin ' + TARGET,
-      'Run from ' + ROOT + ': ' + ROOT + '/.claude/scripts/ticketmill/setup-worktree.sh ' + ctx.issue + ' ' + TARGET + ' ' + ROOT + ' ' + WORKTREES + ' ' + REPO,
+      'Run from ' + ROOT + ': ' + ROOT + '/.claude/scripts/ticketmill/setup-worktree.sh ' + anchor + ' ' + TARGET + ' ' + ROOT + ' ' + WORKTREES + ' ' + REPO,
       'Then: git -C <worktree> pull origin <branch> (branch from the script JSON) so the checkout matches the PR head.',
       envFiles.length ? 'Copy env files if missing: ' + envFiles.map(function (f) { return 'cp -n ' + ROOT + '/' + f + ' <worktree>/' + f + ' 2>/dev/null || true' }).join('; ') : '',
       'Return status, worktree, branch.',
@@ -1858,7 +2640,9 @@ async function runPool(items, limit, fn) {
       const i = next++
       if (i >= items.length) return
       if (STOP.tripped) {
-        results[i] = { issue: items[i].issue, title: items[i].title || '', status: 'not_started', pr: items[i].pr_number || null, follow_ups: [], stage: 'queue', error: 'not launched: ' + STOP.reason }
+        // items[i] is a unit (deriveUnits() shape) — .members is always present
+        // (a self-reference singleton, or real group members), never ctx-shaped.
+        results[i] = { issue: items[i].issue, title: items[i].title || '', status: 'not_started', pr: items[i].pr_number || null, follow_ups: [], stage: 'queue', error: 'not launched: ' + STOP.reason, members: (items[i].members || []).map(function (m) { return m.issue }) }
         continue
       }
       results[i] = await fn(items[i])
@@ -2068,6 +2852,28 @@ if (learnR && learnR.found) {
   log('no prior-run learnings digest — plan stage falls back to reading the retro file itself')
 }
 
+// ---- Select: consolidation gate (judgment call — see the PROPOSECONSOLIDATION
+// module comment above the harness split for the full design). EVERY preflight is
+// a candidate here, regardless of resume_point — NOT filtered to 'implement' —
+// because proposeConsolidation()'s HEAL phase must see 'process_pr'/'skip' members
+// too: a group whose members ALL flipped to 'process_pr' (a prior run created the
+// shared PR but crashed/failed before merging it — spec review, code review, and
+// merge all happen post-PR, in reviewAndMerge) still needs to be recognized as ONE
+// group so its whole unit routes together through processIssue's process_pr branch
+// (one setup + one reviewAndMerge on the shared PR), not as N independent
+// process_pr singletons that would each attempt to review/merge the SAME PR.
+// proposeConsolidation() itself restricts brand-new opus-gate proposals to
+// 'implement' candidates only (see its own filter) — only the HEAL step is
+// resume_point-agnostic. proposeConsolidation() free-skips internally with NO
+// agent call at all when candidates.length <= 1, and skips the opus proposal (but
+// still heals a group a PRIOR run already committed to, via comment markers) when
+// PROFILE.consolidation is explicitly false — see its module comment on why the
+// heal must survive a mid-run flag flip. It is read-only and side-effect-free
+// under DRY_RUN: the marker-heal and opus proposal both run (gh reads only); the
+// comment-posting contrarian challenge is skipped entirely.
+const consolidationCandidates = preflights
+const consolidationMap = await proposeConsolidation(consolidationCandidates)
+
 if (DRY_RUN) {
   return {
     state: 'dry_run', root: ROOT, repo: REPO, base_branch: BASE,
@@ -2075,6 +2881,14 @@ if (DRY_RUN) {
     agent_roster: AGENT_INFO,
     batch_branch_note: 'dry run probes against ' + TARGET + '; a real run creates Batch_<start-timestamp> from ' + BASE + ' (or pass args.batch_branch)',
     plan: preflights.map(function (p) { return { issue: p.issue, title: p.title, resume_point: p.resume_point, pr: p.pr_number, reason: p.reason } }),
+    // Consolidation preview — a PRE-CHALLENGE veto point: dry_run runs only the
+    // read-only marker-heal + opus proposal, never the comment-posting contrarian
+    // challenge, so a human can veto a proposed grouping before it ever takes
+    // effect for real (entries healed from a prior run's markers carry no
+    // dry_run_preview flag; a fresh, unchallenged proposal does).
+    consolidation_groups: Array.from(consolidationMap.values()).map(function (g) {
+      return { group_id: g.groupId, primary: g.primary, members: g.members, subsystem: g.subsystem, rationale: g.rationale, dry_run_preview: !!g.dry_run_preview }
+    }),
     note: 'No changes made. Re-run without dry_run to execute.',
   }
 }
@@ -2130,8 +2944,34 @@ if (toClaim.length) {
   log('claims: ' + HELD_CLAIMS.length + '/' + toClaim.length + ' held by this run')
 }
 
+// ---- Select: materialize final consolidation units now that claims are settled —
+// claims (and any claim-race resume_point flip just above, e.g. p.resume_point =
+// 'skip') make membership authoritative over the pre-claim proposal.
+// reconcileGroups() drops any member whose LIVE preflight resume_point is
+// 'skip' (a skip-flipped member falls through deriveUnits() to an ordinary
+// skip singleton, handled by processIssue()'s existing resume_point==='skip'
+// return path) and keeps 'implement' or 'process_pr' members live; dissolves
+// a group left with fewer than 2 live members; re-anchors
+// the primary onto another live member (by stableGroupId, so the group's
+// worktree/branch/PR identity never moves) when the proposed primary itself was
+// excluded. deriveUnits() then translates the reconciled groups plus every other
+// live preflight into the array runPool() below actually iterates — preflights
+// itself stays untouched (still used by the claim loop above and the Report sweep
+// below), so a no-group run's units are byte-for-byte identical to preflights.
+const reconciledGroups = reconcileGroups(consolidationMap, preflights)
+const units = deriveUnits(reconciledGroups, preflights)
+const groupUnitCount = units.filter(function (u) { return u.groupId != null }).length
+if (groupUnitCount) log('consolidation: ' + groupUnitCount + ' group unit(s) materialized out of ' + units.length + ' total')
+
+// Post absorbed-member / primary group-membership markers ONLY now, post-
+// materialization (see proposeConsolidation()'s module comment on why posting any
+// earlier could name a member that never actually joins the live unit). DRY_RUN
+// already returned above, so this line is only ever reached for a real run — the
+// explicit guard documents that no marker is ever posted for a preview.
+if (!DRY_RUN) await postConsolidationMarkers(units)
+
 // ---- Process: per-issue pipeline with issue-level concurrency + breakers ----
-const results = await runPool(preflights, CONCURRENCY, processIssue)
+const results = await runPool(units, CONCURRENCY, processIssue)
 
 const counts = {}
 for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1
@@ -2139,7 +2979,22 @@ const state = STOP.tripped ? 'circuit_breaker'
   : (results.some(function (r) { return r.status !== 'completed' && r.status !== 'skipped' }) ? 'completed_with_errors' : 'completed')
 log('Batch done: ' + JSON.stringify(counts) + ' state=' + state + (STOP.tripped ? ' (' + STOP.reason + ')' : ''))
 
+// ---- Consolidation groups this run actually materialized and processed (post-
+// reconciliation, so this reflects live membership, not the pre-claim proposal) —
+// one entry per group unit, reused below by BOTH the batch PR body and the run
+// report so a reviewer sees primary/members/rationale explicitly, not just the
+// primary issue's line. counts/state above already treat a group as ONE unit
+// (runPool iterates `units`, one result per group, not per member) — nothing
+// further to aggregate there.
+const finalGroups = units.filter(function (u) { return u.groupId != null }).map(function (u) {
+  return { group_id: u.groupId, primary: u.issue, members: memberIssues(u), subsystem: u.subsystem, rationale: u.rationale }
+})
+
 // ---- Release any claims this run still holds (circuit-breaker leftovers, misses) ----
+// (toClaim/HELD_CLAIMS above and this sweep both operate on `preflights` — the raw
+// per-issue array untouched by consolidation — so every group member was claimed
+// individually and is released individually here; grouping never hides a member
+// from claim coordination.)
 phase('Report')
 if (HELD_CLAIMS.length) {
   const swept = await agent([
@@ -2164,6 +3019,12 @@ const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY)
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
 const completedIssues = results.filter(function (r) { return r && r.status === 'completed' })
+// Groups this run actually completed (a group unit's result carries the primary's
+// issue number, materialized/reconciled BEFORE processIssue ran — see finalGroups
+// above), reused for the explicit "## Consolidated Groups" section below.
+const completedGroups = finalGroups.filter(function (g) {
+  return completedIssues.some(function (r) { return r.issue === g.primary })
+})
 if (completedIssues.length) {
   const bp = await agent([
     'Create (or update) the batch integration PR for this run — DO NOT MERGE IT under any circumstances;',
@@ -2173,10 +3034,20 @@ if (completedIssues.length) {
     '2. If none: gh pr create --repo ' + REPO + ' --base ' + BASE + ' --head ' + TARGET,
     '   Title: "Batch ' + RUN_TAG + ': ' + completedIssues.length + ' issue(s) (' + TARGET + ')"',
     '   Body must contain:',
-    '   - one "Closes #<issue>" line per completed issue (this is what closes them on merge):',
-    completedIssues.map(function (r) { return '     Closes #' + r.issue }).join('\n'),
+    '   - one "Closes #<issue>" line per completed issue AND every issue absorbed into it via',
+    '     consolidation (flatMap so a completed group closes EVERY member, not just its primary —',
+    '     this is what closes them all on merge):',
+    completedIssues.flatMap(function (r) { return (r.members && r.members.length ? r.members : [r.issue]) })
+      .map(function (n) { return '     Closes #' + n }).join('\n'),
     '   - a results table (Issue | Title | PR into batch | Status) built from:',
     JSON.stringify(results.map(function (r) { return { issue: r.issue, title: r.title, pr: r.pr, status: r.status } })).slice(0, 6000),
+    completedGroups.length
+      ? '   - a "## Consolidated Groups" section the reviewer MUST see, listing EXACTLY these lines (one\n' +
+        '     line per group: its primary issue, every absorbed member, and why they were grouped):\n' +
+        completedGroups.map(function (g) {
+          return '     - primary #' + g.primary + ' — members: ' + g.members.map(function (n) { return '#' + n }).join(', ') + ' — ' + g.rationale
+        }).join('\n')
+      : '   - (no consolidation groups completed this run — every issue merged as its own unit)',
     VERIFY_SKIPS.length
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
@@ -2198,6 +3069,7 @@ const resultsJson = JSON.stringify({
   state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts,
   verification_gaps: VERIFY_SKIPS, tokens_spent: budget.spent(),
   tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
+  consolidation_groups: finalGroups,
   results: results,
 }, null, 2)
 const report = await agent([
@@ -2207,11 +3079,14 @@ const report = await agent([
   '2. Write the JSON below verbatim to ' + LOGS + '/summary-' + RUN_TAG + '.json',
   '3. Write a human-readable markdown summary to ' + LOGS + '/summary-' + RUN_TAG + '.md with:',
   '   a results table (Issue | Title | Status | PR | Follow-ups | Error), a per-issue pipeline narrative built',
-  '   from each result\'s "timeline" field (gates, verdicts, iterations), a "Verification Gaps" section if',
-  '   verification_gaps is non-empty, a failures section with halt stages, and — if state is not "completed" —',
-  '   a "Resume" section: re-run ticketmill with the same args (preflight skips finished work) or resume via',
-  '   resumeFromRunId. Include this "## Token Usage" section VERBATIM (already computed in JS — do not',
-  '   recompute, re-sum, or add commentary beyond copying it in):',
+  '   from each result\'s "timeline" field (gates, verdicts, iterations), a "Consolidated Groups" section if',
+  '   consolidation_groups is non-empty — one line per group naming its primary issue, every absorbed member,',
+  '   and the rationale it was grouped for (a group is ONE unit: its members share one worktree/branch/PR/result,',
+  '   so list them explicitly here rather than only showing the primary\'s row in the results table), a',
+  '   "Verification Gaps" section if verification_gaps is non-empty, a failures section with halt stages, and —',
+  '   if state is not "completed" — a "Resume" section: re-run ticketmill with the same args (preflight skips',
+  '   finished work) or resume via resumeFromRunId. Include this "## Token Usage" section VERBATIM (already',
+  '   computed in JS — do not recompute, re-sum, or add commentary beyond copying it in):',
   TOKEN_AGG.markdown,
   '4. Include the current timestamp from: date -Iseconds',
   RUN_TAG === 'run' ? '5. The tag "run" is a collision-prone default: substitute the current date (date +%F) for "run" in BOTH filenames so successive runs do not overwrite each other, and return the actual path.' : '',
