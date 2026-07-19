@@ -18,11 +18,15 @@
 //   (f) [new] a resolved conflict touching only files outside PROFILE.test_globs
 //       still runs the full suite (forced), not silently skipped on "no
 //       testable code changed".
+//   (g) [new] the helper resolves (mar.resolved=true, full rebase/test/push
+//       sequence succeeds) but the merge stage's OWN subsequent preflight then
+//       blocks for an unrelated reason -> needs_human, and merge_auto_resolved
+//       must stay 0 (the metric only bumps after a CONFIRMED merge).
 //
-// (a), (c), and (d) drive the FULL reviewAndMerge() — not just the helper — so
-// the assertions prove the real user-visible outcome (merged status / metric
-// timing / needs_human with the merge stage never reached), not just the
-// helper's own return shape. (b), (e), and (f) are narrower and drive
+// (a), (c), (d), and (g) drive the FULL reviewAndMerge() — not just the helper
+// — so the assertions prove the real user-visible outcome (merged status /
+// metric timing / needs_human with the merge stage never reached), not just
+// the helper's own return shape. (b), (e), and (f) are narrower and drive
 // runMergeAutoResolve() directly since their contract is entirely about what
 // the helper does (or deliberately does NOT do).
 
@@ -243,6 +247,50 @@ test('(f) [new] a resolved conflict touching only files outside PROFILE.test_glo
   // README.md as "not testable") must be entirely absent from this prompt.
   assert.ok(testRunCall.prompt.includes('MANDATORY re-run'))
   assert.ok(!testRunCall.prompt.includes('do NOT run the suite'))
+})
+
+test('(g) [new] auto-resolve rebases and force-pushes clean (mar.resolved=true), but the merge stage\'s own preflight then blocks for an unrelated reason — needs_human, and merge_auto_resolved must NOT be bumped', async function () {
+  const context = harness.boot()
+  seedMergeFlow(context)
+
+  installScriptedResponder(context, {
+    'spec-review-i1': APPROVED_REVIEW,
+    'code-review-i1': APPROVED_REVIEW,
+    'merge-preflight-probe': { state: 'OPEN', mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' },
+    'merge-rebase': { status: 'clean', conflicted_files: [], error: null },
+    'test-run-i1': { result: 'passed', total_tests: 5, passed_tests: 5, failed_tests: 0, failures: [], summary: 'all green' },
+    'test-validate-i1': { result: 'approved', comments: '', issues: [], summary: 'covered' },
+    'merge-preflight-guard': { moved: false, detail: 'TARGET unchanged' },
+    'merge-force-push': { status: 'success', error: null },
+    // runMergeAutoResolve completes successfully (resolved: true) — but the
+    // merge stage's OWN settle-tolerant preflight then finds the PR blocked for
+    // a reason unrelated to the auto-resolve flow entirely (e.g. a branch
+    // protection rule, a required check still pending, a human review request
+    // filed after force-push). This is the exact combination the doc comment
+    // above the metric-bump line in reviewAndMerge calls out by name.
+    merge: { status: 'blocked', follow_up_issues: [], error: 'required status check "ci/lint" has not completed' },
+    'halt-note-merge': { posted: true },
+  })
+
+  const ctx = harness.makeCtx({ issue: 27, pr: 270 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'needs_human')
+  assert.strictEqual(result.stage, 'merge')
+  assert.ok(result.error.includes('ci/lint'), result.error)
+  // The load-bearing assertion: auto-resolve DID resolve the PR (rebased,
+  // tested, force-pushed) but the metric must stay at 0 because the merge
+  // stage right after it never reported status==='merged'.
+  assert.strictEqual(ctx.metrics.merge_auto_resolved, 0)
+  assert.strictEqual(ctx.metrics.merge_thrash, 0)
+
+  const keys = context.agent.calls.map(stageKeyOf)
+  // The full auto-resolve mechanical sequence DID run, all the way through the
+  // force-push — this is not a case where auto-resolve itself declined or
+  // aborted early.
+  for (const expected of ['merge-rebase', 'merge-preflight-guard', 'merge-force-push', 'merge']) {
+    assert.ok(keys.includes(expected), 'expected stage "' + expected + '" to have run; ran: ' + keys.join(', '))
+  }
 })
 
 // ---- shared responder plumbing ----

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.20 (2026-07-19)
+
+- Test quality fix for the merge auto-resolve harness coverage (#2): closed a
+  green-by-omission gap where `aggregateMergeAutoResolve` (the run-level
+  rollup that feeds the batch-PR body, the final agent report, and
+  `resultsJson.merge_auto_resolve`) had zero test coverage despite having four
+  distinct markdown branches. Added `tests/merge-auto-resolve-aggregate.test.js`
+  covering all four (none / resolved-only / thrash-only / both) plus the
+  missing-metrics and empty/null-input degrade paths, modeled on the sibling
+  `aggregateTokens` coverage in `tests/token-usage.test.js`. Also added a new
+  scenario to `tests/merge-auto-resolve.test.js` driving the full
+  `reviewAndMerge()` for the case the code comment above the metric-bump line
+  explicitly calls out but no test previously verified: `runMergeAutoResolve`
+  resolves cleanly (rebase, forced green tests, force-push all succeed) but
+  the merge stage's own subsequent preflight then blocks for an unrelated
+  reason — asserting `ctx.metrics.merge_auto_resolved` stays at 0 in that
+  case, not just when auto-resolve itself declines or aborts.
+
 ## 0.1.19 (2026-07-19)
 
 - Merge stage auto-rebase and resolve for CONFLICTING PRs (#2). Previously any
