@@ -245,6 +245,25 @@ via its comment markers, so turning the flag off mid-run can't strand a group
 that already exists on GitHub. Single-issue runs and runs with at most one
 `implement`-bound candidate skip the gate for free (there is nothing to group).
 
+**Billing anchor.** A group's tokens book under the primary issue, not spread
+across members: `aggregateTokens()`'s per-issue breakdown keys off each
+result's `issue` field, which for a group unit is `ctx.issue` — the
+(possibly re-anchored) primary — so the run report's Token Usage table shows
+one row for the whole group and absorbed members show no row of their own.
+
+**Known gap — partial-branch members aren't excluded.** A member issue that
+already has unmerged work sitting on its own `issue-<N>` branch
+(`commits_ahead > 0` on its preflight) is not currently filtered out of
+consolidation: `consolidationCandidates` only checks `resume_point`, and
+`reconcileGroups()` only excludes members whose live `resume_point` isn't
+`implement`, never on `commits_ahead`. If such an issue is folded into a
+group, `setup-worktree.sh` runs against the group's `worktreeAnchor()`
+instead of the member's own branch, so those pre-existing commits are not
+carried forward — they are effectively orphaned rather than merged. This is
+a known caveat, not yet a mechanical exclusion; treat an `implement`-bound
+issue with nonzero `commits_ahead` as a poor consolidation candidate until
+`consolidationCandidates`/`reconcileGroups` are extended to drop it.
+
 ## Failure semantics
 
 - Stage dies twice -> the issue fails/halts at that stage with an issue comment
