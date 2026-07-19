@@ -46,7 +46,7 @@ claude plugin marketplace add aaddrick/ticketmill
 ## Quickstart
 
 ```text
-/ticketmill:mill-init      # once per repo: doctor pass, profile, role map
+/ticketmill:mill-init      # once per repo: doctor pass, profile, agent staffing
 /ticketmill:mill           # per batch: "mill issues 701 and 702 against dev"
 ```
 
@@ -124,10 +124,16 @@ agent file and adopt its persona. The engine never depends on the session's agen
 registry, so a freshly generated agent works in the very next run, and behavior is
 identical before and after a session restart.
 
-Missing an agent for a role? The contrarian role ships with a bundled template
-that mill-init copies into your repo (preferring a `~/.claude/agents/contrarian.md`
-of your own if one exists). For other gaps, `/ticketmill:forge-agent` generates an
-agent grounded in domain research plus your actual codebase conventions.
+Role staffing happens during onboarding. mill-init reads each agent in your
+repo's `.claude/agents/` and maps it to a role by what its description says it
+does. It never force-fits: a UX reviewer is not a code reviewer, and a role with
+no honest match stays `null`. The contrarian role fills automatically from a
+bundled template copied into your repo (mill-init prefers a
+`~/.claude/agents/contrarian.md` of your own if one exists). Every other gap
+gets an inline choice: keep the built-in charter, or have
+`/ticketmill:forge-agent` write a project agent grounded in domain research plus
+your actual codebase conventions. A forged agent updates the role map itself, so
+the profile needs no hand edits.
 
 ## Profile reference
 

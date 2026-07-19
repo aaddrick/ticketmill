@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.4 (2026-07-18)
+
+- README: "How agents work" now describes init-time role staffing. mill-init
+  maps existing agents by their descriptions without force-fitting, resolves the
+  contrarian role from the bundled template, and offers forge-agent inline for
+  each remaining gap. A forged agent updates the role map itself.
+- README: the Quickstart mill-init comment says "agent staffing" instead of
+  "role map".
+
 ## 0.1.3 (2026-07-18)
 
 - README: expanded the one-line requirements note into a full Requirements
