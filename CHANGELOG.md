@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.14 (2026-07-19)
+
+- Forged `.claude/agents/ticketmill-doc-writer.md` and staffed the profile's
+  `doc_writer` role with it. The agent distills the maintainer's voice rules
+  (position-first structure, FK 6-8 readability, short-long sentence rhythm)
+  and an AI-tell scrub list directly into the file, so the engine's tech-docs
+  stage produces prose in the house voice on any machine, with no dependency
+  on user-level agents.
+- Widened `simplify_globs` with `tests/**/*.js` and `tests/**/*.sh`. The
+  first batch run skipped every simplify pass with "no in-scope files in
+  change" because the work landed in `tests/`, which the globs didn't cover.
+
 ## 0.1.13 (2026-07-19)
 
 - Added `.github/workflows/ci.yml`: runs the profile's `test_command` on

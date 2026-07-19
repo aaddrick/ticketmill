@@ -4,7 +4,7 @@
   "test_globs": ["workflows/**", "scripts/**", ".claude-plugin/**", "tests/**"],
   "install_commands": [],
   "env_files": [],
-  "simplify_globs": ["workflows/**/*.js", "scripts/**/*.sh"],
+  "simplify_globs": ["workflows/**/*.js", "scripts/**/*.sh", "tests/**/*.js", "tests/**/*.sh"],
   "docblock_globs": null,
   "docs_dir": "docs",
   "logs_dir": "logs/ticketmill",
@@ -30,6 +30,6 @@
     "test_validator": "ticketmill-test-validator",
     "simplifier": null,
     "docblock_writer": null,
-    "doc_writer": null
+    "doc_writer": "ticketmill-doc-writer"
   }
 }
