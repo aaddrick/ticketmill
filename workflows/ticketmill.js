@@ -467,6 +467,11 @@ function tripStop(reason) {
   if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; log('STOP: ' + reason) }
 }
 
+// True only for values safe to do arithmetic on (excludes NaN/Infinity/non-numbers).
+function isFiniteNumber(v) {
+  return typeof v === 'number' && isFinite(v)
+}
+
 // Guarded wrapper over the runtime's budget.spent() (cumulative output tokens
 // for the whole run, monotonic). Never throws; returns a finite Number or null
 // when the runtime hook is unavailable or reports something non-numeric, so
@@ -475,7 +480,7 @@ function spentTokens() {
   try {
     if (typeof budget === 'undefined' || !budget || typeof budget.spent !== 'function') return null
     const v = budget.spent()
-    return (typeof v === 'number' && isFinite(v)) ? v : null
+    return isFiniteNumber(v) ? v : null
   } catch (e) {
     return null
   }
@@ -537,7 +542,7 @@ async function stage(ctx, key, prompt, opts, schema, tries) {
     // accumulate into one delta; opts.model is stable across attempts.
     try {
       const tokensAfter = spentTokens()
-      if (typeof tokensBefore === 'number' && isFinite(tokensBefore) && typeof tokensAfter === 'number' && isFinite(tokensAfter) && ctx && ctx.tokens) {
+      if (isFiniteNumber(tokensBefore) && isFiniteNumber(tokensAfter) && ctx && ctx.tokens) {
         const delta = Math.max(0, tokensAfter - tokensBefore)
         ctx.tokens.total += delta
         const model = opts && opts.model
@@ -696,7 +701,7 @@ function aggregateTokens(results, spent, concurrency) {
     }
   }
 
-  const hasSpent = typeof spent === 'number' && isFinite(spent)
+  const hasSpent = isFiniteNumber(spent)
   const runTotal = hasSpent ? spent : (anyTracked ? sumDeltas : null)
   const tracked = anyTracked || hasSpent
   const reconciles = concurrency === 1 && hasSpent && anyTracked
