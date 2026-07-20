@@ -330,6 +330,24 @@ otherwise-green issue.
 | Browser lock (mkdir + owner + stale-steal) | Concurrent agents hijacked each other's browser tabs |
 | Degrade windows + circuit breakers | Distinguish one flaky stage from a systemic failure worth stopping for |
 | `isBudgetExhaustedError` noun+verb match | A bare keyword sweep on "budget"/"ceiling" matched a target repo's own domain errors, misreporting an ordinary agent death as token exhaustion and halting every remaining issue |
+| `COMMIT_SHA_ASK` guard | Twice, an agent typed a fabricated or shortened commit SHA into a posted comment instead of reading the real one, requiring a fixup edit |
+
+### Commit SHA integrity: read it, don't recall it
+
+Every stage prompt that asks an agent to post a comment with a commit SHA
+appends `COMMIT_SHA_ASK`. It tells the agent to run
+`git -C <worktree> log -1 --format=%H` and paste that output exactly, with
+no edits. The instruction rules out typing, shortening, guessing, or
+recalling a SHA from memory.
+
+The rule exists because agents did exactly that. Twice, a posted comment
+carried a SHA the agent invented rather than one it read from git, and a
+later stage had to post a fixup comment with the correct value.
+
+`COMMIT_SHA_ASK` is declared once and reused across eight stage prompts:
+simplify, quality fix, browser fix, test fix, test quality fix, task
+implementation, task review fix, and PR review fix. Sharing one constant
+keeps the wording in sync across all of them if it changes later.
 
 ### Model policy
 
