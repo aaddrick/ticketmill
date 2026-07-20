@@ -4393,7 +4393,7 @@ if (shippedIssues.length) {
 // ---- Report ----
 const resultsJson = JSON.stringify({
   state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts,
-  verification_gaps: VERIFY_SKIPS, tokens_spent: budget.spent(),
+  verification_gaps: VERIFY_SKIPS, tokens_spent: spentTokens(),
   tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
   merge_auto_resolve: { resolved_count: MERGE_RESOLVE_AGG.resolved_count, resolved_issues: MERGE_RESOLVE_AGG.resolved_issues, thrash_count: MERGE_RESOLVE_AGG.thrash_count, thrash_issues: MERGE_RESOLVE_AGG.thrash_issues },
   consolidation_groups: finalGroups,
