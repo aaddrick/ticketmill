@@ -82,7 +82,13 @@ export const meta = {
 //                                        // project-shaped branch names of its own.
 //     "browser": null,                   // OPT-IN browser verification:
 //     // { "serve_command": "php artisan serve --port={port}", "build_command": null,
-//     //   "ui_globs": ["resources/views/**"], "port_base": 8100, "notes": "..." }
+//     //   "ui_globs": ["resources/views/**"], "port_base": 8100, "notes": "...",
+//     //   "port_span": 900, "lock_path": "/tmp/ticketmill-browser-lock",
+//     //   "stale_seconds": 1800, "poll_seconds": 15,
+//     //   "artifact_dir": "/tmp/ticketmill-issue-{issue}" }
+//     // All five of port_span/lock_path/stale_seconds/poll_seconds/artifact_dir are
+//     // optional and default to the values shown above; artifact_dir substitutes
+//     // {issue} if present (like serve_command's {port}), else appends -<issue>.
 //     "models": { "plan": { "model": "opus", "effort": "high" } }, // per-stage overrides
 //     "roles": {
 //       "implementers": ["laravel-backend-developer", "frontend-developer"],
@@ -134,9 +140,10 @@ export const meta = {
 //   through a chained mutex; probes and fix stages run outside the lock. Each
 //   pass boots profile.browser.serve_command (with {port} substituted per issue).
 //   Two-layer locking: the JS mutex only orders stages THIS SCRIPT schedules, so
-//   a host-global mkdir lock (/tmp/ticketmill-browser-lock, owner file, 30-min
-//   stale-steal) additionally guards the browser itself; ad-hoc agent use goes
-//   through the same lock.
+//   a host-global mkdir lock (default /tmp/ticketmill-browser-lock, owner file,
+//   default 30-min stale-steal, default 15s poll — all overridable via
+//   profile.browser.lock_path/stale_seconds/poll_seconds) additionally guards the
+//   browser itself; ad-hoc agent use goes through the same lock.
 //
 // RESTARTABLE (two independent paths)
 //   1. Same session, exact resume: Workflow({ scriptPath, resumeFromRunId: 'wf_...' })
@@ -1391,7 +1398,7 @@ function scopeGuard(ctx) {
         'End every comment body you post with this exact marker line: <!-- ticketmill ' + REPO + '#' + ctx.issue + ' -->',
       ]
   if (BROWSER) {
-    lines.push('The shared verification browser is lock-guarded (' + BW_LOCK + '): only use it if your prompt includes the')
+    lines.push('The shared verification browser is lock-guarded (' + bwLock() + '): only use it if your prompt includes the')
     lines.push('"live browser feedback" protocol block — without that block, do NOT open the browser.')
   }
   // Engine-owned advisory clause (issue #3): a deterministic post-implement
@@ -2070,9 +2077,13 @@ function withBrowser(fn) {
   BW_QUEUE = run.then(function () {}, function () {}) // keep the chain alive past failures
   return run
 }
-function bwPort(issue) { return ((BROWSER && BROWSER.port_base) || 8100) + (issue % 900) }
+function bwPort(issue) { return ((BROWSER && BROWSER.port_base) || 8100) + (issue % ((BROWSER && BROWSER.port_span) || 900)) }
 function serveCmd(issue) {
   return String((BROWSER && BROWSER.serve_command) || '').replace(/\{port\}/g, String(bwPort(issue)))
+}
+function bwArtifactDir(issue) {
+  const tmpl = (BROWSER && BROWSER.artifact_dir) || '/tmp/ticketmill-issue-{issue}'
+  return /\{issue\}/.test(tmpl) ? tmpl.replace(/\{issue\}/g, String(issue)) : tmpl + '-' + issue
 }
 
 // Host-global browser lock. The JS mutex above only serializes stages THIS SCRIPT
@@ -2080,25 +2091,29 @@ function serveCmd(issue) {
 // browser use (implement/fix/review agents wanting live feedback) needs a lock
 // that works from inside any agent's shell. flock can't span separate Bash tool
 // calls (each call is its own process), so the lock is an atomic mkdir directory
-// with an owner file and a 30-minute stale-steal. Scheduled verification stages
-// acquire the SAME lock, so ad-hoc use and the verification pipeline stay
-// mutually serial.
-const BW_LOCK = '/tmp/ticketmill-browser-lock'
+// with an owner file and a 30-minute stale-steal (both configurable via
+// profile.browser). Scheduled verification stages acquire the SAME lock, so
+// ad-hoc use and the verification pipeline stay mutually serial.
+function bwLock() { return (BROWSER && BROWSER.lock_path) || '/tmp/ticketmill-browser-lock' }
 function bwAcquire(who) {
+  const lock = bwLock()
+  const staleSeconds = parseInt((BROWSER && BROWSER.stale_seconds), 10) || 1800
+  const pollSeconds = parseInt((BROWSER && BROWSER.poll_seconds), 10) || 15
   return [
     'Acquire the global browser lock (bounded wait; NEVER touch the browser without it):',
-    '  until mkdir ' + BW_LOCK + ' 2>/dev/null; do',
-    '    s=$(cat ' + BW_LOCK + '/started 2>/dev/null || echo 0); now=$(date +%s)',
-    '    if [ $((now - s)) -gt 1800 ]; then rm -rf ' + BW_LOCK + '; fi   # steal stale locks (dead holder)',
-    '    sleep 15',
+    '  until mkdir ' + lock + ' 2>/dev/null; do',
+    '    s=$(cat ' + lock + '/started 2>/dev/null || echo 0); now=$(date +%s)',
+    '    if [ $((now - s)) -gt ' + staleSeconds + ' ]; then rm -rf ' + lock + '; fi   # steal stale locks (dead holder)',
+    '    sleep ' + pollSeconds,
     '  done',
-    '  echo ' + who + ' > ' + BW_LOCK + '/owner; date +%s > ' + BW_LOCK + '/started',
+    '  echo ' + who + ' > ' + lock + '/owner; date +%s > ' + lock + '/started',
     '(Bound the wait to ~15 minutes of looping. If holding the lock across a long step — a build, a fix —',
-    'release it first and re-acquire after; re-touch ' + BW_LOCK + '/started if a browser session runs long.)',
+    'release it first and re-acquire after; re-touch ' + lock + '/started if a browser session runs long.)',
   ].join('\n')
 }
 function bwRelease(who) {
-  return 'Release the lock ONLY if you own it: grep -qx "' + who + '" ' + BW_LOCK + '/owner 2>/dev/null && rm -rf ' + BW_LOCK
+  const lock = bwLock()
+  return 'Release the lock ONLY if you own it: grep -qx "' + who + '" ' + lock + '/owner 2>/dev/null && rm -rf ' + lock
 }
 // Optional live-feedback offer for implement/fix/review prompts. Empty when the
 // profile has no browser config — the offer must not exist for non-UI projects.
@@ -2169,7 +2184,7 @@ async function runBrowserCheck(ctx, where) {
         '3. In the browser, exercise the SPECIFIC UI behaviors this issue changes — the affected flow end-to-end,',
         '   not a generic smoke test. Follow the target project\'s CLAUDE.md guidance for selectors/login/theme quirks.',
         BROWSER.notes ? '   Project notes: ' + BROWSER.notes : '',
-        '4. Artifact discipline: save any screenshots/traces/scratch files ONLY under /tmp/ticketmill-issue-' + ctx.issue,
+        '4. Artifact discipline: save any screenshots/traces/scratch files ONLY under ' + bwArtifactDir(ctx.issue),
         '   — never inside the worktree (they would pollute commits and the PR diff).',
         '5. result=passed only if every exercised behavior works; failed with concrete failures (what you did,',
         '   what you saw, what was expected) otherwise; skipped ONLY if nothing here is actually verifiable in a',
@@ -2187,7 +2202,7 @@ async function runBrowserCheck(ctx, where) {
         'Cleanup after a browser verification pass (idempotent; repo-safe — touch NO files in ' + ctx.worktree + '):',
         '1. Kill any server listening on port ' + port + ': fuser -k ' + port + '/tcp 2>/dev/null || true',
         '2. Load the browser MCP tools via ToolSearch and close the browser (ignore errors if nothing is open).',
-        '3. rm -rf /tmp/ticketmill-issue-' + ctx.issue + ' || true',
+        '3. rm -rf ' + bwArtifactDir(ctx.issue) + ' || true',
         '4. ' + bwRelease('issue-' + ctx.issue + '-verify'),
         '   (owner-guarded on purpose: if the verifier died BEFORE acquiring, the lock belongs to someone else — leave it)',
         'Return posted=true when done.',
@@ -3685,7 +3700,7 @@ async function reviewAndMerge(ctx) {
     '   First check for existing duplicates — do not re-file.',
     releaseClaimStep,
     '7. Cleanup (non-blocking): ' + (BROWSER ? 'fuser -k ' + bwPort(ctx.issue) + '/tcp 2>/dev/null || true;' : '') ,
-    '   rm -rf /tmp/ticketmill-issue-' + ctx.issue + ' || true;',
+    '   rm -rf ' + bwArtifactDir(ctx.issue) + ' || true;',
     '   git -C ' + ROOT + ' worktree remove ' + ctx.worktree + ' --force; git -C ' + ROOT + ' worktree prune',
     '',
     'Deferred suggestions collected during implementation:',
