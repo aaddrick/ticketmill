@@ -17,9 +17,15 @@
 //      so the attribution math is proven end-to-end rather than assumed from
 //      the changelog's description of it.
 
+const fs = require('node:fs')
+const path = require('node:path')
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const harness = require('./harness')
+
+const ROOT = path.join(__dirname, '..')
+const ENGINE_PATH = path.join(ROOT, 'workflows', 'ticketmill.js')
+const CLAUDE_ENGINE_PATH = path.join(ROOT, '.claude', 'workflows', 'ticketmill.js')
 
 // ---- spentTokens(): guard branches ----
 
@@ -201,3 +207,33 @@ test('stage(): a budget.spent() that throws on every call never affects the stag
   assert.strictEqual(ctx.tokens.total, 0)
   assert.strictEqual(ctx.tokens.tracked, false)
 })
+
+// ---- Report-phase resultsJson: source-level regression for the raw budget.spent() bug ----
+//
+// A raw budget.spent() call (unlike the guarded spentTokens() wrapper above) throws
+// when the runtime hook misbehaves, which would abort resultsJson construction and
+// kill the whole Report phase — no run report, no retrospective write, even for an
+// otherwise-successful run. Neither engine copy can be `require`d (Workflow-tool
+// globals, top-level await), so this reads the source text directly, mirroring the
+// fs.readFileSync source-inspection pattern in tests/sandbox-lint.test.js, and
+// isolates the `resultsJson` object literal so the assertion can't be satisfied by
+// an unrelated spentTokens() call elsewhere in the file (e.g. the TOKEN_AGG line).
+
+/** Extract the `const resultsJson = JSON.stringify({ ... }, null, 2)` block verbatim. */
+function extractResultsJsonBlock(source) {
+  const start = source.indexOf('const resultsJson = JSON.stringify({')
+  assert.notStrictEqual(start, -1, 'resultsJson block not found in engine source')
+  const end = source.indexOf('}, null, 2)', start)
+  assert.notStrictEqual(end, -1, 'resultsJson block close (`}, null, 2)`) not found in engine source')
+  return source.slice(start, end)
+}
+
+for (const [label, enginePath] of [['workflows/ticketmill.js', ENGINE_PATH], ['.claude/workflows/ticketmill.js', CLAUDE_ENGINE_PATH]]) {
+  test('Report phase (' + label + '): resultsJson.tokens_spent uses the guarded spentTokens(), not raw budget.spent()', function () {
+    const source = fs.readFileSync(enginePath, 'utf8')
+    const block = extractResultsJsonBlock(source)
+
+    assert.match(block, /tokens_spent:\s*spentTokens\(\)/, 'resultsJson.tokens_spent must call spentTokens(), the guarded wrapper that never throws')
+    assert.doesNotMatch(block, /budget\.spent\(\)/, 'resultsJson block must not call the unguarded budget.spent() directly — a misbehaving hook would abort the whole Report phase')
+  })
+}
