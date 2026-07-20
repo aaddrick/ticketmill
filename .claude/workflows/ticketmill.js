@@ -72,6 +72,14 @@ export const meta = {
 //                                        // post-implement hard-revert gate; see
 //                                        // isHardRevertPath. This repo sets
 //                                        // [".claude/workflows/ticketmill.js"].
+//     "warn_base_branches": [],          // OPTIONAL (issue #36), default []: base
+//                                        // branch names that trigger a Select-phase
+//                                        // WARNING when a batch's target branch looks
+//                                        // like a CI/CD deploy-trigger branch (PRs
+//                                        // normally target the working branch, not a
+//                                        // branch that auto-deploys on push). Unset/[]
+//                                        // = no warning; the engine bakes in no
+//                                        // project-shaped branch names of its own.
 //     "browser": null,                   // OPT-IN browser verification:
 //     // { "serve_command": "php artisan serve --port={port}", "build_command": null,
 //     //   "ui_globs": ["resources/views/**"], "port_base": 8100, "notes": "..." }

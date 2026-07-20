@@ -269,6 +269,7 @@ load-bearing fields:
 | `models` | Per-stage model/effort overrides |
 | `consolidation` | Default `true`. Set `false` to disable the Select-phase consolidation gate entirely (a resumed run still heals any group a prior run already committed to) |
 | `serialize_globs` | Optional, default `[]`. Patterns worth trusting as a lane-scheduling hint beyond predicted-file overlap alone: a shared schema, a magnet config, anything two issues could conflict on without their own predicted paths overlapping |
+| `warn_base_branches` | Optional, default `[]`. Base branch names that trigger a Select-phase warning when a batch targets one of them (PRs normally target the working branch, not a branch that auto-deploys on push). Unset/`[]` = no warning |
 
 ## Repo layout
 

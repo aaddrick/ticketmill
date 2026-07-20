@@ -36,6 +36,7 @@ every profile field. Show the user the proposal and confirm the load-bearing one
   "logs_dir": "logs/ticketmill",
   "claim_label": "ticketmill",
   "verify_notes": [],
+  "warn_base_branches": [],
   "browser": null,
   "models": {},
   "roles": { }
@@ -71,6 +72,11 @@ Field rules:
   sets don't otherwise overlap. Leave it `[]` unless the user names such a file;
   propose it only when the stack detection in Step 2 surfaces an obvious
   candidate (e.g. a single central routes/config file every feature touches).
+- `warn_base_branches`: OPTIONAL, default `[]`. Base branch names that should trigger
+  a Select-phase warning when a batch targets one (a signal the run may be pointed at
+  a branch that auto-deploys on push rather than the intended working branch). Leave
+  it `[]` unless the user names CI/CD-trigger branches for this repo (e.g. a
+  `deploy-prod`/`deploy-dev` convention) — never propose a default on your own.
 
 ## Step 3 — Map project agents onto pipeline roles
 
