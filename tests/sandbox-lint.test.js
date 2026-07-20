@@ -57,9 +57,9 @@ function makeSandbox(workflowsSource, claudeSource) {
 }
 
 /** Run a lint-engine.js copy as a child process; never throws on non-zero exit. */
-function runLint(lintScriptPath) {
+function runLintWithArgs(lintScriptPath, args) {
   try {
-    const stdout = execFileSync(process.execPath, [lintScriptPath], { encoding: 'utf8' })
+    const stdout = execFileSync(process.execPath, [lintScriptPath].concat(args), { encoding: 'utf8' })
     return { code: 0, stdout: stdout, stderr: '' }
   } catch (err) {
     return {
@@ -70,12 +70,45 @@ function runLint(lintScriptPath) {
   }
 }
 
+function runLint(lintScriptPath) {
+  return runLintWithArgs(lintScriptPath, [])
+}
+
 function runSandboxLint(dir) {
   return runLint(path.join(dir, 'scripts', 'lint-engine.js'))
 }
 
+/** Same as runSandboxLint but invokes `--fix` mode. */
+function runSandboxLintFix(dir) {
+  return runLintWithArgs(path.join(dir, 'scripts', 'lint-engine.js'), ['--fix'])
+}
+
+/**
+ * Build a sandbox like makeSandbox, but omit .claude/workflows/ticketmill.js
+ * entirely (directory still created, since --fix only needs to write the
+ * file, not create the directory) — for exercising --fix's copy-creation path.
+ */
+function makeSandboxWithoutClaudeCopy(workflowsSource) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ticketmill-lint-test-'))
+  fs.mkdirSync(path.join(dir, 'workflows'), { recursive: true })
+  fs.mkdirSync(path.join(dir, '.claude', 'workflows'), { recursive: true })
+  fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true })
+  fs.copyFileSync(REAL_LINT_SCRIPT, path.join(dir, 'scripts', 'lint-engine.js'))
+  fs.writeFileSync(path.join(dir, 'workflows', 'ticketmill.js'), workflowsSource)
+  return dir
+}
+
 function withSandbox(workflowsSource, claudeSource, fn) {
   const dir = makeSandbox(workflowsSource, claudeSource)
+  try {
+    fn(dir)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+function withSandboxNoClaudeCopy(workflowsSource, fn) {
+  const dir = makeSandboxWithoutClaudeCopy(workflowsSource)
   try {
     fn(dir)
   } finally {
@@ -142,6 +175,70 @@ test('lint-engine byte-compare sync check fails when the two engine copies diffe
       output.includes('.claude/workflows/ticketmill.js:1:') && output.includes('out of sync'),
       'expected an out-of-sync violation reported against .claude/workflows/ticketmill.js:1:; got:\n' + output,
     )
+  })
+})
+
+test('--fix repairs a drifted .claude copy (exit 0, files now byte-identical)', function () {
+  const driftedClaudeCopy = realEngineSource + '\n// drifted: this copy was edited without workflows/ticketmill.js\n'
+  withSandbox(realEngineSource, driftedClaudeCopy, function (dir) {
+    const result = runSandboxLintFix(dir)
+    const output = result.stdout + result.stderr
+
+    assert.strictEqual(result.code, 0, 'expected --fix to exit 0 after repairing drift; got:\n' + output)
+
+    const workflowsAfter = fs.readFileSync(path.join(dir, 'workflows', 'ticketmill.js'))
+    const claudeAfter = fs.readFileSync(path.join(dir, '.claude', 'workflows', 'ticketmill.js'))
+    assert.ok(workflowsAfter.equals(claudeAfter), 'expected the two copies to be byte-identical after --fix')
+    assert.strictEqual(claudeAfter.toString(), realEngineSource, 'expected the .claude copy to now match the source verbatim')
+  })
+})
+
+test('--fix is idempotent on already-synced copies (exit 0)', function () {
+  withSandbox(realEngineSource, realEngineSource, function (dir) {
+    const first = runSandboxLintFix(dir)
+    assert.strictEqual(first.code, 0, 'expected first --fix run on synced copies to exit 0; got:\n' + first.stdout + first.stderr)
+
+    const second = runSandboxLintFix(dir)
+    assert.strictEqual(second.code, 0, 'expected second --fix run to also exit 0; got:\n' + second.stdout + second.stderr)
+
+    const workflowsAfter = fs.readFileSync(path.join(dir, 'workflows', 'ticketmill.js'))
+    const claudeAfter = fs.readFileSync(path.join(dir, '.claude', 'workflows', 'ticketmill.js'))
+    assert.ok(workflowsAfter.equals(claudeAfter), 'expected the two copies to remain byte-identical after a second --fix run')
+  })
+})
+
+test('--fix does not mask a seeded sandbox violation in the source (non-zero exit + violation message even though copies match)', function () {
+  const construct = FORBIDDEN_CONSTRUCTS[0]
+  const seeded = seedAt(realEngineSource, INSERT_LINE, construct.codeLine)
+  // Both copies already match (no drift) so the byte-compare alone would pass —
+  // --fix must still surface the source's own sandbox violation.
+  withSandbox(seeded, seeded, function (dir) {
+    const result = runSandboxLintFix(dir)
+    const output = result.stdout + result.stderr
+
+    assert.notStrictEqual(result.code, 0, 'expected --fix to fail on a seeded sandbox violation even with matching copies; got:\n' + output)
+
+    const expectedPrefix = 'workflows/ticketmill.js:' + INSERT_LINE + ':'
+    assert.ok(output.includes(expectedPrefix), 'expected output to report "' + expectedPrefix + '"; got:\n' + output)
+    assert.ok(output.includes(construct.messageSubstring), 'expected output to include "' + construct.messageSubstring + '"; got:\n' + output)
+
+    const workflowsAfter = fs.readFileSync(path.join(dir, 'workflows', 'ticketmill.js'))
+    const claudeAfter = fs.readFileSync(path.join(dir, '.claude', 'workflows', 'ticketmill.js'))
+    assert.ok(workflowsAfter.equals(claudeAfter), 'expected --fix to still have synced the copies even though the source itself is violating')
+  })
+})
+
+test('--fix creates the copy when absent (byte-identical, exit 0)', function () {
+  withSandboxNoClaudeCopy(realEngineSource, function (dir) {
+    assert.strictEqual(fs.existsSync(path.join(dir, '.claude', 'workflows', 'ticketmill.js')), false, 'test setup sanity: copy should not exist yet')
+
+    const result = runSandboxLintFix(dir)
+    const output = result.stdout + result.stderr
+
+    assert.strictEqual(result.code, 0, 'expected --fix to exit 0 after creating the missing copy; got:\n' + output)
+
+    const claudeAfter = fs.readFileSync(path.join(dir, '.claude', 'workflows', 'ticketmill.js'))
+    assert.strictEqual(claudeAfter.toString(), realEngineSource, 'expected the newly created copy to match the source verbatim')
   })
 })
 
