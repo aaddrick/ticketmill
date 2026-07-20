@@ -39,6 +39,13 @@ test('isBudgetExhaustedError: domain error with an exhaustion verb but no budget
   assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
 })
 
+test('isBudgetExhaustedError: domain error with a budget noun and a bare "over"-substring word (not an overrun-shaped phrase) returns false and leaves STOP untripped', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('failed to recover the budget ledger')
+  assert.strictEqual(result, false)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+})
+
 // ---- context.stage(): harness-driven, scripted throwing agent ----
 
 test('stage(): a true-exhaustion throw trips STOP and returns null on the first throw, without consuming a retry', async function () {
