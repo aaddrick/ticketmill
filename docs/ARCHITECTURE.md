@@ -328,6 +328,7 @@ otherwise-green issue.
 | Claim protocol with label-safety rules | A claim agent once replaced an issue's full label set |
 | Browser lock (mkdir + owner + stale-steal) | Concurrent agents hijacked each other's browser tabs |
 | Degrade windows + circuit breakers | Distinguish one flaky stage from a systemic failure worth stopping for |
+| `isBudgetExhaustedError` noun+verb match | A bare keyword sweep on "budget"/"ceiling" matched a target repo's own domain errors, misreporting an ordinary agent death as token exhaustion and halting every remaining issue |
 
 ### Model policy
 
@@ -364,6 +365,34 @@ issue's stages only, not the run total).
 Tokens only, never dollars: price varies by model and shifts over time, so no
 currency figure appears anywhere in the engine, profile, or output. The
 per-model-tier breakdown is what lets a human run that math outside the tool.
+
+### Budget-exhaustion detection: a noun+verb match, not a keyword sweep
+
+`isBudgetExhaustedError(msg)` decides what a caught stage error means: real
+runtime token exhaustion, which trips the whole-run `tripStop()`, or an
+ordinary per-attempt death, which retries and then falls through to
+`recordAgentDeath()`. It used to fire on a bare keyword sweep: any message
+containing "budget", "token target", or "ceiling" tripped the whole run.
+That caught more than exhaustion. A target repo's own domain error, a
+"budget" feature or a "ceiling" config value, matched the same sweep with
+nothing to do with tokens. An ordinary agent death got misreported as
+exhaustion, and the whole batch halted with every remaining issue left
+unstarted.
+
+The check now requires a budget/token/ceiling noun to co-occur with an
+exhaustion-shaped verb: exhaust, exceed, deplete, ran out, overrun/overage,
+went over, ran over, over budget, over the limit, or limit reached. Either
+alone isn't enough. The "over" family is anchored to those overrun-shaped
+phrases rather than the bare word "over", which turns up in ordinary prose
+("budget review is over") without meaning exhaustion.
+
+Anchoring to the runtime's exact exhaustion error string was rejected: that
+text isn't documented anywhere accessible, and the runtime's budget object
+exposes only `.spent()`, no `.remaining()` and no structured error field. A
+wrong guess would silently disable real exhaustion detection, so the match
+stays semantic instead. `recordAgentDeath()`'s existing three-consecutive-
+death circuit breaker is the backstop for any true exhaustion the tightened
+match still misses.
 
 ### Claims interop
 
