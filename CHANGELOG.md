@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.1.28 (2026-07-19)
+
+Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
+
+- Results contract (#16, PR #31): renamed `by_issue[].byModel` to `by_model`
+  in `aggregateTokens()` output, so `resultsJson.tokens` is snake_case
+  throughout (`run_total`, `by_issue`, `by_model`). The engine-internal
+  `ctx.tokens.byModel` shape is unchanged. Updated the matching assertion in
+  `tests/token-usage.test.js`.
+- Merge stage (#21, PR #49): dropped the undocumented tries=1 override on the
+  `merge-preflight-guard` `stage()` call, the only stage in the engine passing
+  a literal sixth arg. The guard is a read-only, idempotent check (`git fetch`
+  plus `merge-base --is-ancestor`) at the end of a costly
+  rebase/resolve/green-test sequence, so a single transient agent death threw
+  all that work away and escalated straight to needs_human. It now gets the
+  default `STAGE_TRIES` (2) like its git-mechanics siblings. Two regression
+  tests in `tests/merge-auto-resolve.test.js` pin both edges: a first-attempt
+  null is retried, and the retry ceiling is exactly 2.
+- Test docs (#22, PR #50): rewrote the `installScriptedResponder` header
+  comment in `tests/merge-auto-resolve.test.js`. It claimed a throw on an
+  unscripted stage key makes the test "fail loudly". Per the harness contract,
+  `stage()` catches a non-budget throw and retries it the same as a null
+  return, then gives up quietly. The comment now describes the real mechanism:
+  a responder-level guard that surfaces an unscripted stage at the agent-call
+  boundary, useful for debugging. Comment-only change.
+- Docs check (#24, PR #51): verified `docs/ARCHITECTURE.md` already carries
+  the "Lane scheduling" design-decision section (landed with PR #23). No
+  changes needed.
+- Dry-run preview (#25, PR #52): a lane's `issues:` array now lists every
+  member issue of a consolidated group unit. It used to show only the group's
+  primary. The flatten-and-dedup lives in a new `laneMemberIssues(units,
+  unitIndices)` helper, declared before the harness split so it's directly
+  unit-testable, with 5 tests in `tests/lanes.test.js`. Display-only fix; the
+  scheduling itself already used full member sets.
+- Engine-owned gate (#28, PR #53): hardened the regime (c) revert.
+  `git checkout origin/<TARGET> -- <path>` fails on a file created fresh on
+  the branch, since there's no baseline copy to restore. The diff probe now
+  also returns `added_files`, and the revert partitions accordingly: created
+  files get `git rm`, existing files still go through checkout, both in the
+  same revert commit. A probe response without `added_files` degrades to the
+  prior checkout-then-defer behavior. Regression tests for both paths in
+  `tests/engine-owned.test.js`.
+- Prompt cleanup (#29, PR #54): renumbered the preflight probe prompt's
+  duplicate "4." steps (a merge artifact) to a clean 1..6 sequence. Cosmetic
+  only; the probe schema names every field explicitly.
+- Resume correctness (#30, PR #55): a resumed run no longer drops `Closes #N`
+  lines for issues whose per-issue PR merged into the batch branch in a prior
+  pass. Those issues preflight as skipped, and the batch PR body was rebuilt
+  from this pass's completed results alone, so the human's batch merge left
+  them open. A new pure `batchClosesIssues(results)` keys inclusion on a
+  shipped set instead: completed, or skipped with `merged_into_target` true.
+  That flag is a plain JS string match at the skip return, `pr_state ===
+  'merged' && pr_base === TARGET` (`pr_base` is a new preflight schema field),
+  so a PR merged into a different run's batch branch never counts. The same
+  set drives the batch PR's create/update gate, title count, Consolidated
+  Groups section, and Closes lines, so the four agree by construction.
+  Covered by `tests/batch-closes-issues.test.js`, plus a new ARCHITECTURE.md
+  design-decision entry.
+
 ## 0.1.27 (2026-07-19)
 
 - Set `serialize_globs` in this repo's own profile to the two engine copies
