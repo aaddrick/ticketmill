@@ -4009,7 +4009,7 @@ if (DRY_RUN) {
   })
   const lanesPreviewOut = previewLanes.map(function (l) {
     return {
-      issues: l.unitIndices.map(function (i) { return previewUnits[i].issue }),
+      issues: l.unitIndices.reduce(function (acc, i) { memberIssues(previewUnits[i]).forEach(function (n) { if (acc.indexOf(n) === -1) acc.push(n) }); return acc }, []),
       predicted_files: l.predicted_files,
       provenance: l.unitIndices.length < 2 ? 'none' : (previewTrustedKeys[laneKey(l.unitIndices)] ? 'trusted' : 'heuristic'),
     }
