@@ -13,11 +13,14 @@
   construction. The stage regenerates a single CHANGELOG section in place
   (idempotent across resumes) and bumps the configured version file(s) in an
   ephemeral `git worktree` — the run root is never mutated, and a push
-  failure is non-fatal-but-logged. Activates `release` in this repo's own
-  `.claude/ticketmill.json` (`version_files: [".claude-plugin/plugin.json"]`,
-  `changelog: "CHANGELOG.md"`, `bump: null`); the new stage will not fire
-  for this batch since the running engine at the run root predates it, so
-  this entry and the version bump are done by hand this one time.
+  failure is non-fatal-but-logged. The `release` field is defined in the
+  engine; activating it in this repo's own `.claude/ticketmill.json` was
+  attempted, then deferred/reverted per the engine-owned-paths scope guard
+  (`.claude/ticketmill.json` is out of scope for this issue), so profile
+  activation is a follow-up. The new stage will not fire for this batch
+  regardless, since the running engine at the run root predates it — so
+  this entry and the version bump (0.1.28 -> 0.1.29) are done by hand this
+  one time.
 
   Deferred follow-up (out of scope for this issue): `.claude/agents/
   ticketmill-implementer.md` and `ticketmill-code-reviewer.md` still read as
