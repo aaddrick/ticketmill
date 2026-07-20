@@ -22,13 +22,23 @@
 //       sequence succeeds) but the merge stage's OWN subsequent preflight then
 //       blocks for an unrelated reason -> needs_human, and merge_auto_resolved
 //       must stay 0 (the metric only bumps after a CONFIRMED merge).
+//   (h) [new] regression test for issue #21 (undocumented STAGE_TRIES override
+//       of 1 on merge-preflight-guard): a transient null on the guard's FIRST
+//       attempt is retried and succeeds on the second -> proves the stage now
+//       gets the default STAGE_TRIES (2) like its git-mechanics siblings
+//       (merge-rebase, merge-conflict-resolve, merge-force-push), not the old
+//       single-try override that would have died on that first null.
+//   (i) [new] issue #21 regression, the other edge: the guard exhausting BOTH
+//       STAGE_TRIES attempts (not just one) dies and surfaces "guard stage
+//       died" -> proves the retry ceiling is exactly 2, not unbounded and not
+//       silently swallowed back down to 1.
 //
 // (a), (c), (d), and (g) drive the FULL reviewAndMerge() — not just the helper
 // — so the assertions prove the real user-visible outcome (merged status /
 // metric timing / needs_human with the merge stage never reached), not just
-// the helper's own return shape. (b), (e), and (f) are narrower and drive
-// runMergeAutoResolve() directly since their contract is entirely about what
-// the helper does (or deliberately does NOT do).
+// the helper's own return shape. (b), (e), (f), (h), and (i) are narrower and
+// drive runMergeAutoResolve() directly since their contract is entirely about
+// what the helper does (or deliberately does NOT do).
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
@@ -291,6 +301,75 @@ test('(g) [new] auto-resolve rebases and force-pushes clean (mar.resolved=true),
   for (const expected of ['merge-rebase', 'merge-preflight-guard', 'merge-force-push', 'merge']) {
     assert.ok(keys.includes(expected), 'expected stage "' + expected + '" to have run; ran: ' + keys.join(', '))
   }
+})
+
+test('(h) [new] regression for issue #21: merge-preflight-guard now gets the default STAGE_TRIES (2) attempts like its git-mechanics siblings — a transient null on the first attempt is retried and succeeds, not left to die after a single try', async function () {
+  const context = harness.boot()
+  seedMergeFlow(context)
+
+  let guardCalls = 0
+  const byKey = {
+    'merge-preflight-probe': { state: 'OPEN', mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' },
+    'merge-rebase': { status: 'clean', conflicted_files: [], error: null },
+    'test-run-i1': { result: 'passed', total_tests: 5, passed_tests: 5, failed_tests: 0, failures: [], summary: 'all green' },
+    'test-validate-i1': { result: 'approved', comments: '', issues: [], summary: 'covered' },
+    'merge-force-push': { status: 'success', error: null },
+  }
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const key = stageKeyOf({ opts: opts })
+    if (key === 'merge-preflight-guard') {
+      guardCalls++
+      // First attempt simulates a transient dead/failed agent call (harness.js's
+      // documented null convention). Only the SECOND attempt returns the live
+      // response — before the fix, tries was hardcoded to 1 and stage() would
+      // give up right here, never issuing this second call at all.
+      return guardCalls < 2 ? null : { moved: false, detail: 'TARGET unchanged' }
+    }
+    if (!Object.prototype.hasOwnProperty.call(byKey, key)) {
+      throw new Error('unscripted stage in this scenario: "' + key + '" (label "' + ((opts && opts.label) || '') + '")')
+    }
+    return byKey[key]
+  })
+
+  const ctx = harness.makeCtx({ issue: 28, pr: 280 })
+  const result = await context.runMergeAutoResolve(ctx)
+
+  assert.strictEqual(result.ok, true)
+  assert.strictEqual(result.resolved, true)
+  assert.strictEqual(guardCalls, 2, 'merge-preflight-guard must be retried once after a transient null before succeeding — proves it now gets STAGE_TRIES (2) attempts, not the old hardcoded single try')
+})
+
+test('(i) [new] regression for issue #21, the other edge: merge-preflight-guard exhausting BOTH STAGE_TRIES attempts dies and surfaces "guard stage died" — the retry ceiling is exactly 2, not unbounded and not silently swallowed', async function () {
+  const context = harness.boot()
+  seedMergeFlow(context)
+
+  let guardCalls = 0
+  const byKey = {
+    'merge-preflight-probe': { state: 'OPEN', mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' },
+    'merge-rebase': { status: 'clean', conflicted_files: [], error: null },
+    'test-run-i1': { result: 'passed', total_tests: 5, passed_tests: 5, failed_tests: 0, failures: [], summary: 'all green' },
+    'test-validate-i1': { result: 'approved', comments: '', issues: [], summary: 'covered' },
+  }
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const key = stageKeyOf({ opts: opts })
+    if (key === 'merge-preflight-guard') {
+      guardCalls++
+      return null // dies on every attempt — proves the ceiling, not a lucky retry
+    }
+    if (!Object.prototype.hasOwnProperty.call(byKey, key)) {
+      throw new Error('unscripted stage in this scenario: "' + key + '" (label "' + ((opts && opts.label) || '') + '")')
+    }
+    return byKey[key]
+  })
+
+  const ctx = harness.makeCtx({ issue: 29, pr: 290 })
+  const result = await context.runMergeAutoResolve(ctx)
+
+  assert.strictEqual(result.ok, false)
+  assert.ok(result.error.includes('guard stage died'), result.error)
+  // merge-force-push must never run — the guard died, nothing downstream of it
+  // should fire.
+  assert.strictEqual(guardCalls, 2, 'must exhaust exactly STAGE_TRIES (2) attempts before giving up — not 1 (the old undocumented override) and not unbounded')
 })
 
 // ---- shared responder plumbing ----
