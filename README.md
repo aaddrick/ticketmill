@@ -282,14 +282,19 @@ load-bearing fields:
 workflows/         ticketmill.js, the engine (invoked via Workflow scriptPath)
 skills/            mill (launch), mill-init (onboarding), forge-agent (agent generation)
 templates/         agents/contrarian.md, copied into repos that lack one
-scripts/           setup-worktree.sh, deterministic worktree creation
+scripts/           setup-worktree.sh (worktree creation), lint-engine.js (sandbox/lockstep gate)
+tests/             the test suite gating every run
 docs/              ARCHITECTURE.md
+.claude/           this repo's own ticketmill profile, workflows/, and agents/ — it self-hosts its mill runs
 ```
 
 Note: workflow scripts are not a registered Claude Code plugin component, which is
 why `mill-init` copies the engine into your repo's `.claude/workflows/` and the
 `mill` skill invokes it by `scriptPath`. A plain git clone of this repo works too;
-the plugin install just adds the namespaced skills.
+the plugin install just adds the namespaced skills. This repo runs `mill` on itself: it
+carries its own `.claude/ticketmill.json` profile plus a `.claude/workflows/ticketmill.js`
+lockstep-installed copy of `workflows/ticketmill.js` (see `lockstep_installed_paths` above)
+and `.claude/agents/*.md`, the forged agent personas that do the work.
 
 ## Author
 
