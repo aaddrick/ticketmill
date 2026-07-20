@@ -46,6 +46,33 @@ test('isBudgetExhaustedError: domain error with a budget noun and a bare "over"-
   assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
 })
 
+// Every alternative in hasExhaustionVerb's regex gets its own true-positive
+// case here, each paired with a budget noun. A typo in any one alternative
+// (e.g. "ran\s+out" losing its \s+) would silently disable detection for
+// that phrasing with no other test catching it, since the earlier
+// true-exhaustion case above only exercises the exhaust(ed) family.
+const exhaustionVerbTruePositives = [
+  ['exceed', 'the token ceiling was exceeded'],
+  ['deplete', 'the budget has been depleted'],
+  ['ran out', 'we ran out of budget'],
+  ['overrun', 'budget overrun detected'],
+  ['overage', 'token overage this cycle'],
+  ['went over', 'we went over budget this month'],
+  ['ran over', 'the run ran over the token ceiling'],
+  ['over budget', 'the run is over budget'],
+  ['over the limit', 'token usage is over the limit'],
+  ['limit reached', 'budget limit reached'],
+]
+
+for (const [label, msg] of exhaustionVerbTruePositives) {
+  test('isBudgetExhaustedError: "' + label + '" verb family co-occurring with a budget noun returns true and trips STOP', function () {
+    const context = harness.boot()
+    const result = context.isBudgetExhaustedError(msg)
+    assert.strictEqual(result, true)
+    assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+  })
+}
+
 // ---- context.stage(): harness-driven, scripted throwing agent ----
 
 test('stage(): a true-exhaustion throw trips STOP and returns null on the first throw, without consuming a retry', async function () {
