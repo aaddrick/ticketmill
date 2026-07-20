@@ -196,6 +196,32 @@ test('aggregateTokens: a resumed run with every per-issue row untracked but popu
   assert.ok(agg.markdown.includes('| orchestration/unattributed |'))
 })
 
+// ---- degenerate case: spent available but zero attribution (no per-issue, no stage) ----
+
+test('aggregateTokens: Quality Review (task 1, iteration 1) fix — hasSpent true but trackedAny false still renders the remainder row instead of hiding the full spend behind "not tracked"', function () {
+  const context = harness.boot()
+  // Exact repro from the review finding: a run that crashed/resumed before any
+  // per-issue row OR any STAGE_TOKENS bracket ever sampled a usable delta, but
+  // budget.spent() itself is still available and nonzero.
+  const results = [
+    { issue: 1, status: 'skipped' },
+    { issue: 2, status: 'not_started' },
+  ]
+  const agg = context.aggregateTokens(results, 500000, 1, {})
+
+  assert.strictEqual(agg.tracked, true) // hasSpent alone makes it "tracked"
+  assert.strictEqual(agg.remainder, 500000) // the entire spend is unattributed
+  assert.strictEqual(agg.run_total, 500000)
+  // The full spend must be visible in the markdown, not silently absorbed by
+  // the "not tracked" line.
+  assert.ok(!agg.markdown.includes(
+    'Per-issue / per-model breakdown: not tracked (no stage in this run reported a usable token delta).'
+  ))
+  assert.ok(agg.markdown.includes('| orchestration/unattributed |'))
+  assert.ok(/\|\s*orchestration\/unattributed\s*\|\s*500000\s*\|/.test(agg.markdown))
+  assert.ok(/\|\s*\*\*Total\*\*\s*\|\s*\*\*500000\*\*\s*\|/.test(agg.markdown))
+})
+
 // ---- 3-arg backward compat ----
 
 test('aggregateTokens: calling with only 3 args (no byStage) behaves exactly as before — empty by_stage, no stage rows', function () {

@@ -1629,10 +1629,18 @@ function aggregateTokens(results, spent, concurrency, byStage) {
     : 'Run total: not tracked (budget.spent() unavailable this run)')
   lines.push('')
 
-  if (!trackedAny) {
+  if (!tracked) {
     lines.push('Per-issue / per-model breakdown: not tracked (no stage in this run reported a usable token delta).')
   } else {
-    if (concurrency > 1) {
+    if (!trackedAny) {
+      // hasSpent is true here (tracked === trackedAny || hasSpent, trackedAny is
+      // false) but no per-issue row or stage bucket attributed any of it — the
+      // degenerate case this fix closes. Still render the table (all rows "not
+      // tracked") so the remainder row below carries the full run total instead
+      // of it vanishing into a "not tracked" line that contradicts "Run total: N".
+      lines.push('_no per-issue or stage data attributed any spend this run — the "orchestration/unattributed" row ' +
+        'below carries the full run total instead of leaving it implicit._')
+    } else if (concurrency > 1) {
       lines.push('_approximate - overlapping concurrent stages over-count and do NOT reconcile to the run total._')
       lines.push('(A single shared monotonic counter cannot be split per concurrent call — agent() returns schema ' +
         'content only, no per-call usage — so simultaneous issues each see the same counter movement. The stage ' +
