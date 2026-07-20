@@ -296,9 +296,17 @@ test('(g) [new] auto-resolve rebases and force-pushes clean (mar.resolved=true),
 // ---- shared responder plumbing ----
 
 // Installs a scripted agent keyed by exact stage key (see stageKeyOf above).
-// Any stage key not present in `byKey` throws immediately — an uninstrumented
-// stage silently returning null would make stage()'s retry/death machinery
-// swallow the gap instead of failing the test loudly.
+// Any stage key not present in `byKey` throws immediately, so an
+// uninstrumented/unscripted stage is surfaced explicitly at this
+// responder-level guard rather than silently falling through to a canned
+// reply. Note this throw does not itself fail the test loudly once it
+// reaches stage(): per installScriptedAgent's contract (harness.js), a throw
+// whose message doesn't match /budget|token target|ceiling/i is caught and
+// retried the same as a null return, up to STAGE_TRIES times, then given up
+// on quietly. This message never matches that regex, so the real signal here
+// is the guard existing at all — it turns "which stage key did I forget to
+// script" into a readable error message during debugging, not a test
+// failure by itself.
 function installScriptedResponder(context, byKey) {
   return harness.installScriptedAgent(context, function (prompt, opts) {
     const label = (opts && opts.label) || ''
