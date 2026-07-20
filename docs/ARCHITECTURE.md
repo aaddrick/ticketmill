@@ -256,6 +256,20 @@ tooling: this repo sets `[".claude/workflows/ticketmill.js"]`, since
 sync instead of undoing an incidental restore, so any drift on that path is
 left for `lint-engine`'s byte-compare to catch on its own.
 
+Checkout alone doesn't cover every case. `git checkout origin/<TARGET> --
+<path>` fails with "pathspec did not match any file(s)" on a path absent
+from the baseline: a file created fresh on the branch. Checkout restores
+from a baseline copy, and a created file has none. So the diff probe also
+returns `added_files`, from a second `--diff-filter=A` command, and
+`runEngineOwnedGate` partitions `revertFiles` against that list:
+`createdFiles` get `git rm`, `existingFiles` still go through checkout, and
+both commands land in the same revert commit. An older or degraded probe
+response can omit `added_files`, since the schema field is optional.
+`createdFiles` then stays empty, and every path falls into the checkout
+group, reproducing the prior behavior: checkout fails on the missing
+pathspec, and the gate degrades to a recorded `ctx.deferred` follow-up
+instead of blocking the issue.
+
 `scopeGuard()` carries a fourth, advisory layer on top of the two gates
 above: a clause appended to every stage prompt, unconditionally, telling the
 agent never to stage, commit, or restore an engine-owned path outside these

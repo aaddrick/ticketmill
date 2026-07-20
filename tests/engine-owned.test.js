@@ -426,6 +426,86 @@ test('runEngineOwnedGate: regime (c) — not intentional, reverts ONLY the engin
   assert.ok(ctx.deferred[0].indexOf('dedicated issue') !== -1)
 })
 
+test('runEngineOwnedGate: regime (c) — a newly-created engine-owned file is git-rm\'d, not checked out, while a co-changed existing one is still checked out (issue #28)', async function () {
+  // '.claude/agents/new-role.md' is absent from origin/TARGET (created on this
+  // branch) so `git checkout origin/TARGET -- <path>` would fail with 'pathspec
+  // did not match any file(s)' — added_files is how the probe surfaces that so
+  // the revert stage can git rm it instead. '.claude/ticketmill.json' is a
+  // co-changed EXISTING engine-owned file (in changed_files only, not
+  // added_files) and must still go through the checkout group exactly as before.
+  const context = harness.boot()
+  seedGate(context)
+  let revertPrompt = null
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label === '9:engine-owned-probe') {
+      return {
+        changed_files: ['.claude/ticketmill.json', '.claude/agents/new-role.md', 'src/index.js'],
+        added_files: ['.claude/agents/new-role.md'],
+      }
+    }
+    if (label === '9:engine-owned-revert') {
+      revertPrompt = prompt
+      return { status: 'success', commit: 'c0ffee00', files_changed: ['.claude/ticketmill.json', '.claude/agents/new-role.md'], summary: 'reverted' }
+    }
+    throw new Error('unexpected call: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 9, engineOwnedIntentional: false })
+  const result = await context.runEngineOwnedGate(ctx)
+
+  assert.strictEqual(result.ok, true)
+  // the created path is git rm'd...
+  assert.ok(revertPrompt.indexOf('git -C ' + ctx.worktree + ' rm ".claude/agents/new-role.md"') !== -1,
+    'the newly-created path must be git rm\'d')
+  // ...and the checkout command names ONLY the existing path, never the created one.
+  const checkoutIdx = revertPrompt.indexOf('checkout origin/Batch_fixture -- ')
+  assert.ok(checkoutIdx !== -1, 'the checkout command must still be present for the existing path')
+  const checkoutLine = revertPrompt.slice(checkoutIdx, revertPrompt.indexOf('\n', checkoutIdx))
+  assert.ok(checkoutLine.indexOf('".claude/ticketmill.json"') !== -1, 'the existing path must be in the checkout command')
+  assert.ok(checkoutLine.indexOf('new-role.md') === -1, 'the created path must NOT be in the checkout command')
+  assert.strictEqual(ctx.deferred.length, 1)
+})
+
+test('runEngineOwnedGate: regime (c) safe-degrade — an omitted added_files routes a newly-created path into the checkout group exactly as today (issue #28)', async function () {
+  // Older/degraded probe responses omit added_files entirely (schema field is
+  // optional). createdFiles must then be empty and the created path falls
+  // through to the SAME checkout command as an existing path — reproducing
+  // today's known-safe failure mode (checkout errors on the missing pathspec,
+  // the revert stage returns status=error, the gate degrades to a recorded
+  // ctx.deferred follow-up) rather than silently changing behavior.
+  const context = harness.boot()
+  seedGate(context)
+  let revertPrompt = null
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label === '12:engine-owned-probe') {
+      return { changed_files: ['.claude/ticketmill.json', '.claude/agents/new-role.md'] } // no added_files
+    }
+    if (label === '12:engine-owned-revert') {
+      revertPrompt = prompt
+      return { status: 'error', summary: 'pathspec did not match any file(s)', error: 'checkout failed', commit: null, files_changed: [] }
+    }
+    throw new Error('unexpected call: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 12, engineOwnedIntentional: false })
+  const result = await context.runEngineOwnedGate(ctx)
+
+  assert.strictEqual(result.ok, true)
+  // no rm command at all — both paths are in the single checkout group
+  assert.ok(revertPrompt.indexOf(' rm "') === -1, 'no rm command should be issued when added_files is omitted')
+  const checkoutIdx = revertPrompt.indexOf('checkout origin/Batch_fixture -- ')
+  assert.ok(checkoutIdx !== -1)
+  const checkoutLine = revertPrompt.slice(checkoutIdx, revertPrompt.indexOf('\n', checkoutIdx))
+  assert.ok(checkoutLine.indexOf('".claude/ticketmill.json"') !== -1)
+  assert.ok(checkoutLine.indexOf('".claude/agents/new-role.md"') !== -1, 'the created path falls into the checkout group exactly as before this hardening')
+  // safe degrade: the revert stage (scripted to fail, matching real checkout
+  // behavior against a missing baseline pathspec) still never halts the run.
+  assert.strictEqual(ctx.deferred.length, 1)
+  assert.ok(ctx.deferred[0].indexOf('FAILED') !== -1)
+})
+
 test('runEngineOwnedGate: the revert stage prompt explicitly overrides scopeGuard\'s OUT-OF-SCOPE clause, resolving the self-contradiction (quality review, task 3 iteration 1)', async function () {
   // scopeGuard() unconditionally prepends an advisory clause telling the agent
   // never to stage/commit/restore engine-owned paths (see scope-guard.test.js).

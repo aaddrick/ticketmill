@@ -396,7 +396,14 @@ const UI_PROBE_SCHEMA = {
 // agent) does the ENGINE_OWNED filtering.
 const DIFF_PROBE_SCHEMA = {
   type: 'object', required: ['changed_files'],
-  properties: { changed_files: { type: 'array', items: { type: 'string' } } },
+  properties: {
+    changed_files: { type: 'array', items: { type: 'string' } },
+    // added_files: optional — files newly created on this branch (absent from
+    // origin/TARGET at baseline). Only runEngineOwnedGate's probe populates this
+    // (a second `--diff-filter=A` command); other DIFF_PROBE_SCHEMA callers omit
+    // it and get today's behavior unchanged (see the revert-stage partition).
+    added_files: { type: 'array', items: { type: 'string' } },
+  },
 }
 const CLAIM_SCHEMA = {
   type: 'object', required: ['issue', 'claimed'],
@@ -2104,6 +2111,10 @@ async function runEngineOwnedGate(ctx) {
     'READ-ONLY probe for issue #' + ctx.issue + ': list every file this issue\'s implementation changed. Run exactly:',
     'git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --name-only',
     'Return changed_files (the output lines as an array; empty array if none).',
+    '',
+    'Also run this second command to find files newly created on this branch (absent from the batch baseline):',
+    'git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --diff-filter=A --name-only',
+    'Return added_files (the output lines as an array; empty array if none).',
   ].join('\n'), stageOpts('probe'), DIFF_PROBE_SCHEMA)
   if (!probe) {
     log('#' + ctx.issue + ' engine-owned gate: diff probe died — degrading (recorded), not blocking the issue')
@@ -2126,7 +2137,35 @@ async function runEngineOwnedGate(ctx) {
   }
   if (!revertFiles.length) return { ok: true }
 
+  // Partition revertFiles: createdFiles are absent from origin/TARGET (git
+  // checkout errors 'pathspec did not match any file(s)' on these — they must
+  // be git rm'd instead); existingFiles are the rest, handled via checkout as
+  // before. added_files is optional (older/degraded probe responses omit it),
+  // in which case createdFiles is empty and behavior is unchanged from before
+  // this partition existed — checkout attempts the created path too, fails,
+  // and the stage degrades to a recorded ctx.deferred follow-up as it always did.
+  const addedFiles = probe.added_files || []
+  const createdFiles = revertFiles.filter(function (f) { return addedFiles.indexOf(f) !== -1 })
+  const existingFiles = revertFiles.filter(function (f) { return addedFiles.indexOf(f) === -1 })
+
   log('#' + ctx.issue + ' engine-owned gate: regime (c) incidental change — hard-reverting ' + revertFiles.join(', ') + ' to origin/' + TARGET)
+  const revertSteps = []
+  let stepNum = 1
+  if (existingFiles.length) {
+    revertSteps.push(
+      stepNum++ + '. git -C ' + ctx.worktree + ' checkout origin/' + TARGET + ' -- ' + existingFiles.map(function (f) { return '"' + f + '"' }).join(' ')
+    )
+  }
+  if (createdFiles.length) {
+    revertSteps.push(
+      stepNum++ + '. git -C ' + ctx.worktree + ' rm ' + createdFiles.map(function (f) { return '"' + f + '"' }).join(' ')
+    )
+  }
+  revertSteps.push(
+    stepNum++ + '. Confirm the revert is exact: git -C ' + ctx.worktree + ' diff origin/' + TARGET + ' -- ' + revertFiles.map(function (f) { return '"' + f + '"' }).join(' ') + ' (must be empty)',
+    stepNum++ + '. git -C ' + ctx.worktree + ' commit -m "revert(engine): drop incidental engine-owned change(s) (#' + ctx.issue + ')"',
+    stepNum++ + '. git -C ' + ctx.worktree + ' push origin ' + ctx.branch
+  )
   const revert = await stage(ctx, 'engine-owned-revert', [
     'The scope guard\'s OUT-OF-SCOPE clause above (engine-owned paths — do not stage, commit, or restore them) does NOT',
     'apply to this stage: this stage IS the deterministic guardrail acting on your behalf. Carry out the steps below.',
@@ -2138,14 +2177,15 @@ async function runEngineOwnedGate(ctx) {
     '',
     'Hard-revert EXACTLY these paths to the batch baseline, and touch NOTHING else:',
     revertFiles.map(function (f) { return '- ' + f }).join('\n'),
+    (createdFiles.length
+      ? '\nOf these, the following were newly created on this branch (absent from origin/' + TARGET + ') — git rm them' +
+        ' rather than checking them out:\n' + createdFiles.map(function (f) { return '- ' + f }).join('\n')
+      : ''),
     '',
-    '1. git -C ' + ctx.worktree + ' checkout origin/' + TARGET + ' -- ' + revertFiles.map(function (f) { return '"' + f + '"' }).join(' '),
-    '2. Confirm the revert is exact: git -C ' + ctx.worktree + ' diff origin/' + TARGET + ' -- ' + revertFiles.map(function (f) { return '"' + f + '"' }).join(' ') + ' (must be empty)',
-    '3. git -C ' + ctx.worktree + ' commit -m "revert(engine): drop incidental engine-owned change(s) (#' + ctx.issue + ')"',
-    '4. git -C ' + ctx.worktree + ' push origin ' + ctx.branch,
+    revertSteps.join('\n'),
     '',
-    'Restore ONLY via that checkout from origin/' + TARGET + ' — never from git log/reflog/history on this branch, and never by',
-    're-authoring the file yourself. Stage and commit nothing outside the listed paths.',
+    'Restore existing paths ONLY via checkout from origin/' + TARGET + ' — never from git log/reflog/history on this branch, and',
+    'never by re-authoring the file yourself. Stage and commit nothing outside the listed paths.',
     'Return status, commit, files_changed, summary.',
   ].join('\n'), stageOpts('fix'), FIX_SCHEMA, 1)
   if (!revert || revert.status === 'error') {
