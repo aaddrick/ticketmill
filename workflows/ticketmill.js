@@ -1538,8 +1538,8 @@ const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotch
 // ----- commit SHA integrity (retro found agents twice typing a fabricated/shortened
 // SHA into a posted comment instead of reading the real one, requiring a fixup edit) -----
 const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> log -1 --format=%H — it prints the ' +
-  'full 40-character SHA with no trailing newline (unlike a carelessly-piped `git rev-parse HEAD`). Paste that ' +
-  'literal command output verbatim in the comment. Never type, shorten, guess, or recall a SHA from memory.'
+  'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
+  'or recall a SHA from memory.'
 function collectNotes(ctx, from, r) {
   const arr = (r && r.notes_for_downstream) || []
   for (const n of arr) {
