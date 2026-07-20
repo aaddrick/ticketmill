@@ -259,6 +259,39 @@ case_unfetchable_base() {
     unset GH_STUB_TITLE
 }
 
+# --- case 6: empty slug (all-punctuation title) ------------------------------
+case_empty_slug() {
+    echo "--- case 6: empty slug (all-punctuation title) ---"
+    new_scratch
+    local issue=606
+
+    export GH_STUB_TITLE="!!!"
+    local out
+    out=$(run_script "$issue" "$BASE_BRANCH" "$REPO_ROOT" "$WORKTREES_DIR" "$REPO_SLUG")
+
+    assert_valid_json "$out" "case6: stdout is valid JSON"
+    assert_eq "success" "$(json_get "$out" status)" "case6: status is success"
+
+    local branch worktree
+    branch=$(json_get "$out" branch)
+    worktree=$(json_get "$out" worktree)
+
+    assert_eq "issue-${issue}-untitled" "$branch" \
+        "case6: branch falls back to untitled for an all-punctuation title"
+    assert_true "case6: branch has no trailing dash" \
+        "[[ \"$branch\" != *- ]]"
+    assert_true "case6: branch matches the issue-<N>-* prefix" \
+        "[[ \"$branch\" == issue-${issue}-* ]]"
+
+    assert_true "case6: worktree directory exists" "[[ -d \"$worktree\" ]]"
+
+    local actual_branch
+    actual_branch=$(git -C "$worktree" branch --show-current)
+    assert_eq "$branch" "$actual_branch" "case6: worktree is checked out on the reported branch"
+
+    unset GH_STUB_TITLE
+}
+
 # --- run ---------------------------------------------------------------------
 echo "=== setup-worktree.sh test suite ==="
 run_shellcheck
@@ -267,6 +300,7 @@ case_idempotent_reuse
 case_stale_replacement
 case_missing_args
 case_unfetchable_base
+case_empty_slug
 
 echo
 echo "=== $PASS passed, $FAIL failed ==="
