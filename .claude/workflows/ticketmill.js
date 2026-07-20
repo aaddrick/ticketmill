@@ -929,6 +929,22 @@ function sortLanesByLowestIndex(lanes) {
   return lanes
 }
 
+// laneMemberIssues: flatten-and-dedup the member issue numbers across every unit
+// in a lane, using memberIssues() so a lane's reported issue list matches the
+// semantics every other member-issue call site already uses (a consolidated
+// group unit contributes ALL its members, not just its primary issue). Extracted
+// as a named helper — rather than inlined at its one call site (the DRY_RUN
+// lanesPreviewOut composition, further down) — specifically so it sits before
+// the TICKETMILL-TEST-HARNESS-SPLIT marker and is directly unit-testable; the
+// lanesPreviewOut block itself lives after the split and is unreachable by
+// tests/harness.js.
+function laneMemberIssues(units, unitIndices) {
+  return unitIndices.reduce(function (acc, i) {
+    memberIssues(units[i]).forEach(function (n) { if (acc.indexOf(n) === -1) acc.push(n) })
+    return acc
+  }, [])
+}
+
 // computeLanes: pure reducer (issue #1, lane scheduling) that groups deriveUnits()'s
 // output into lanes — sets of unit INDICES that must run serially (one worker
 // draining the lane in order) instead of racing. Reuses globToRe/matchesGlobs
@@ -4009,7 +4025,7 @@ if (DRY_RUN) {
   })
   const lanesPreviewOut = previewLanes.map(function (l) {
     return {
-      issues: l.unitIndices.reduce(function (acc, i) { memberIssues(previewUnits[i]).forEach(function (n) { if (acc.indexOf(n) === -1) acc.push(n) }); return acc }, []),
+      issues: laneMemberIssues(previewUnits, l.unitIndices),
       predicted_files: l.predicted_files,
       provenance: l.unitIndices.length < 2 ? 'none' : (previewTrustedKeys[laneKey(l.unitIndices)] ? 'trusted' : 'heuristic'),
     }

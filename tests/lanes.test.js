@@ -333,3 +333,60 @@ test('applyRealRunCollapseGuard: a trusted lane (depends_on) is kept even when t
   assert.strictEqual(guard.dissolvedCount, 0, 'a trusted lane must never be dissolved by this guard, no matter its path cohesion')
   assert.strictEqual(guard.lanes, lanes)
 })
+
+// ---- laneMemberIssues (issue #25) ----
+//
+// laneMemberIssues(units, unitIndices) is the extracted flatten-and-dedup
+// composition the DRY_RUN lanesPreviewOut block (workflows/ticketmill.js,
+// ~line 4012 — after the harness split, so not directly reachable) calls to
+// build each previewed lane's `issues` array. Extracting it here closes the
+// exact gap flagged in the #25 test-quality review: previously
+// `l.unitIndices.map(i => previewUnits[i].issue)` silently dropped every
+// non-primary member of a consolidated group unit from the preview.
+
+// groupUnit: a consolidated-group unit whose `members` list holds more than
+// just its own primary issue — the shape memberIssues() must flatten through.
+function groupUnit(primaryIssue, memberIssueNumbers) {
+  return { issue: primaryIssue, members: memberIssueNumbers.map(function (n) { return { issue: n } }) }
+}
+
+test('laneMemberIssues: singleton units flatten to their own issue numbers, in unitIndices order', function () {
+  const context = bootLanes()
+  const units = [laneUnit(5, []), laneUnit(6, []), laneUnit(7, [])]
+  // Array.from() normalizes the vm-realm array to a host-realm array — the
+  // engine runs in a separate vm context, so its native Array.prototype is a
+  // distinct object from this test file's, and deepStrictEqual treats that as
+  // a structural mismatch even when every element compares equal (matches the
+  // Array.from() convention used throughout this file's other assertions).
+  assert.deepStrictEqual(Array.from(context.laneMemberIssues(units, [0, 1, 2])), [5, 6, 7])
+})
+
+test('laneMemberIssues: a consolidated group unit contributes ALL its members, not just its primary issue', function () {
+  const context = bootLanes()
+  // Group unit's primary/display issue is 10, but it consolidates 10, 11, and 12.
+  const units = [groupUnit(10, [10, 11, 12])]
+  const issues = Array.from(context.laneMemberIssues(units, [0]))
+  assert.deepStrictEqual(issues, [10, 11, 12], 'must include the non-primary members (11, 12), not just previewUnits[i].issue (10)')
+})
+
+test('laneMemberIssues: dedups an issue number shared across multiple units in the same lane', function () {
+  const context = bootLanes()
+  // Two units in one lane whose member lists overlap on issue 11 (e.g. a group
+  // unit and a singleton that also names one of that group's members) — the
+  // lane's issues array must report 11 once, not twice.
+  const units = [groupUnit(10, [10, 11]), laneUnit(11, [])]
+  const issues = Array.from(context.laneMemberIssues(units, [0, 1]))
+  assert.deepStrictEqual(issues, [10, 11])
+})
+
+test('laneMemberIssues: dedup keeps the first-seen occurrence order across unitIndices', function () {
+  const context = bootLanes()
+  const units = [laneUnit(20, []), groupUnit(21, [21, 20, 22])]
+  const issues = Array.from(context.laneMemberIssues(units, [0, 1]))
+  assert.deepStrictEqual(issues, [20, 21, 22], 'issue 20 was already seen from unit 0; unit 1 must not re-append it')
+})
+
+test('laneMemberIssues: an empty unitIndices list produces an empty issues array', function () {
+  const context = bootLanes()
+  assert.deepStrictEqual(Array.from(context.laneMemberIssues([laneUnit(1, [])], [])), [])
+})
