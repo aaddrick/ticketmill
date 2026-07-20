@@ -265,7 +265,7 @@ load-bearing fields:
 | `verify_notes` | Environment preconditions injected into test/fix prompts (required services, seed data) |
 | `roles` | Role-to-agent map; `implementers` is the list the planner assigns tasks to |
 | `simplify_globs`, `docblock_globs`, `docs_dir` | Gate the simplify, docblock, and tech-docs stages; `null` skips |
-| `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes) |
+| `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes). Also accepts optional `lock_path` (default `/tmp/ticketmill-browser-lock`), `stale_seconds` (default `1800`), `poll_seconds` (default `15`), `port_span` (default `900`), and `artifact_dir` (default `/tmp/ticketmill-issue-{issue}`, `{issue}`-templated like `serve_command`'s `{port}`) |
 | `models` | Per-stage model/effort overrides |
 | `consolidation` | Default `true`. Set `false` to disable the Select-phase consolidation gate entirely (a resumed run still heals any group a prior run already committed to) |
 | `serialize_globs` | Optional, default `[]`. Patterns worth trusting as a lane-scheduling hint beyond predicted-file overlap alone: a shared schema, a magnet config, anything two issues could conflict on without their own predicted paths overlapping |

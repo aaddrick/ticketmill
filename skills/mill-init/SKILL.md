@@ -56,6 +56,15 @@ Field rules:
 - `browser`: OPT-IN. Only propose it for projects with a servable UI AND if the user
   wants live browser verification: `{ "serve_command": "... --port={port}",
   "build_command": null, "ui_globs": [...], "port_base": 8100, "notes": "..." }`.
+  Optional coordination overrides (each defaults to the value shown; only mention
+  them if the user needs to change one): `lock_path` (default
+  `/tmp/ticketmill-browser-lock`, the shared cross-agent browser lock directory),
+  `stale_seconds` (default `1800`, how long before a held lock is considered dead
+  and stolen), `poll_seconds` (default `15`, wait interval between lock-acquire
+  retries), `port_span` (default `900`, the modulus `port_base` is spread over per
+  issue number), and `artifact_dir` (default `/tmp/ticketmill-issue-{issue}`,
+  `{issue}`-templated like `serve_command`'s `{port}`, where browser-verify
+  screenshots/artifacts are written).
 - `lockstep_installed_paths`: only needed when the repo being onboarded keeps an
   installed copy of an engine-owned file in lockstep with a source-of-truth file
   elsewhere in the same repo, kept in sync by the repo's own tooling. List those
