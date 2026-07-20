@@ -26,6 +26,16 @@
 //     lockstep as a live smoke test of that contract — drift here means one
 //     copy was edited without the other.
 //
+// --fix mode: pass --fix to repair drift instead of just reporting it. Before
+// linting, it copies workflows/ticketmill.js (the source of truth) verbatim
+// over .claude/workflows/ticketmill.js — creating the copy if it's missing —
+// then runs the exact same sandbox-construct scan + byte-compare as check
+// mode and exits with that result. Direction is hardcoded source->copy; this
+// never reads .claude/workflows/ticketmill.js to decide what to write. Source
+// sandbox violations still exit 1 in --fix mode — fixing the copy never
+// silently absorbs a violation in the source itself. Default (no-flag)
+// invocation is unchanged, so test_command/CI behavior is untouched.
+//
 // Exit code: 0 = clean, 1 = one or more violations (printed as file:line: message).
 
 const fs = require('fs')
@@ -86,15 +96,26 @@ function lintEngineSource(filePath) {
 }
 
 function main() {
+  const fixMode = process.argv.indexOf('--fix') !== -1
+
   if (!fs.existsSync(ENGINE_PATH)) {
     console.error(path.relative(ROOT, ENGINE_PATH) + ' not found')
     process.exit(1)
   }
-  if (!fs.existsSync(CLAUDE_ENGINE_PATH)) {
+
+  if (fixMode) {
+    // Hardcoded source->copy: workflows/ticketmill.js is always the source
+    // of truth. This creates .claude/workflows/ticketmill.js if it's
+    // missing, so the check-mode hard error for a missing copy doesn't
+    // apply here.
+    fs.copyFileSync(ENGINE_PATH, CLAUDE_ENGINE_PATH)
+  } else if (!fs.existsSync(CLAUDE_ENGINE_PATH)) {
     console.error(path.relative(ROOT, CLAUDE_ENGINE_PATH) + ' not found')
     process.exit(1)
   }
 
+  // Same scan in both modes: a sandbox violation in the source must still
+  // fail --fix, not be silently carried into a freshly synced copy.
   const violations = lintEngineSource(ENGINE_PATH)
 
   const engineBuf = fs.readFileSync(ENGINE_PATH)
@@ -103,8 +124,8 @@ function main() {
     violations.push(
       path.relative(ROOT, CLAUDE_ENGINE_PATH) +
         ':1: out of sync with ' + path.relative(ROOT, ENGINE_PATH) +
-        ' — the two engine copies must be byte-identical; edit workflows/ticketmill.js ' +
-        'then copy it verbatim over .claude/workflows/ticketmill.js in the same change'
+        " — the two engine copies must be byte-identical; run 'node " +
+        "scripts/lint-engine.js --fix' to sync them"
     )
   }
 
