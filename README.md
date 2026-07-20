@@ -74,7 +74,7 @@ it from your request; these are the knobs it can turn:
 | `no_assignee` | With `labels`: select only issues nobody is assigned to |
 | `concurrency` | Issue pipelines running in parallel: 1-5, default 2 |
 | `dry_run` | Read-only preview: probes every issue and reports the routing plan |
-| `run_label` | Tag for claims and report filenames. Pass today's date so reports don't collide |
+| `run_label` (alias `date`) | Tag for claims and report filenames. Pass today's date so reports don't collide |
 | `batch_branch` | Resume a prior run by reusing its `Batch_<timestamp>` branch |
 | `root`, `repo` | Auto-discovered from git and gh; pass explicitly if the bootstrap probe fails |
 
@@ -215,6 +215,33 @@ limit, the API has an outage. The engine treats all of them as expected weather.
 - **Every halted issue tells you where it stopped.** The halt comment names the
   failed stage and repeats the resume instructions.
 
+## Troubleshooting
+
+- **"Workflow tool unavailable" hard-stop.** The `mill` skill refuses to fake the
+  pipeline inline. See Requirements above for why an imitation run isn't safe.
+  Fix: enable the `Workflow` tool in Claude Code, then retry.
+- **Bootstrap probe failed.** The engine couldn't auto-discover your repo root or
+  `owner/name` slug from git/gh. Fix: pass `root` and `repo` explicitly, per the
+  Run options table above.
+- **Doctor pass fails during `mill-init`.** Your install commands or test suite
+  don't run cleanly in a scratch worktree, so `mill-init` refuses to write a
+  profile. Fix: get the toolchain working locally first, then re-run
+  `mill-init`. See Quickstart above.
+- **Lost the batch branch name.** It survives in three places: `git branch -r`
+  (pushed at run start), the run report under the logs dir, and the
+  `## Ticketmill Claimed` comment on any issue the run claimed. See Resuming an
+  interrupted run above.
+- **Stale browser lock after a hard kill.** A run that dies mid-browser-stage can
+  leave the host-global lock at `/tmp/ticketmill-browser-lock` held. You usually
+  don't need to do anything: the next run's poll steals it once it clears the
+  30-minute default (`stale_seconds`). Delete the lock file by hand if you want
+  it cleared sooner. Both the path and the staleness window are configurable via
+  `profile.browser.lock_path` and `profile.browser.stale_seconds`.
+- **A run skips your issue with no error.** Another batch claimed it less than
+  12 hours ago. Either wait out the staleness window and re-run, or read the
+  `## Ticketmill Claimed` comment on the issue to find the owning run's batch
+  branch and host.
+
 ## How agents work
 
 Ticketmill thinks in roles. Your profile's `roles` map assigns each role to an
@@ -265,10 +292,16 @@ load-bearing fields:
 | `verify_notes` | Environment preconditions injected into test/fix prompts (required services, seed data) |
 | `roles` | Role-to-agent map; `implementers` is the list the planner assigns tasks to |
 | `simplify_globs`, `docblock_globs`, `docs_dir` | Gate the simplify, docblock, and tech-docs stages; `null` skips |
-| `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes) |
-| `models` | Per-stage model/effort overrides |
+| `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes). Also accepts optional `lock_path` (default `/tmp/ticketmill-browser-lock`), `stale_seconds` (default `1800`), `poll_seconds` (default `15`), `port_span` (default `900`), and `artifact_dir` (default `/tmp/ticketmill-issue-{issue}`, `{issue}`-templated like `serve_command`'s `{port}`) |
+| `models` | Per-stage model/effort overrides. Valid stage keys are enumerated in the header schema comment (`workflows/ticketmill.js`), adjacent to the `M` map that is their source of truth |
 | `consolidation` | Default `true`. Set `false` to disable the Select-phase consolidation gate entirely (a resumed run still heals any group a prior run already committed to) |
+| `release` | Optional, default `null` (Report-phase release stage skipped entirely). Set `{ version_files: [...] }` to opt in to a once-per-batch CHANGELOG entry and version bump on the canonical version file(s), landed before the batch PR. Also accepts optional `changelog` (default `CHANGELOG.md`) and `bump` (`"major"\|"minor"\|"patch"` override; unset derives `feat` -> minor, else patch, from the batch's shipped commit types) |
 | `serialize_globs` | Optional, default `[]`. Patterns worth trusting as a lane-scheduling hint beyond predicted-file overlap alone: a shared schema, a magnet config, anything two issues could conflict on without their own predicted paths overlapping |
+| `warn_base_branches` | Optional, default `[]`. Base branch names that trigger a Select-phase warning when a batch targets one of them (PRs normally target the working branch, not a branch that auto-deploys on push). Unset/`[]` = no warning |
+| `claim_label` | GitHub label applied to an issue when a run claims it (cross-run coordination; see header schema) |
+| `engine_owned_globs` | Optional, default `[]`. Extends the built-in engine-owned path set (`.claude/ticketmill.json`, `.claude/agents/**`, `.claude/workflows/ticketmill.js`, `.claude/scripts/ticketmill/**`), read-only during a run |
+| `lockstep_installed_paths` | Optional, default `[]`. Engine-owned paths that are a deliberate installed copy of a source-of-truth file elsewhere in this repo, exempted from the post-implement hard-revert gate |
+| `logs_dir` | Directory for run summaries and retrospective learnings |
 
 ## Repo layout
 
@@ -277,14 +310,19 @@ load-bearing fields:
 workflows/         ticketmill.js, the engine (invoked via Workflow scriptPath)
 skills/            mill (launch), mill-init (onboarding), forge-agent (agent generation)
 templates/         agents/contrarian.md, copied into repos that lack one
-scripts/           setup-worktree.sh, deterministic worktree creation
+scripts/           setup-worktree.sh (worktree creation), lint-engine.js (sandbox/lockstep gate)
+tests/             the test suite gating every run
 docs/              ARCHITECTURE.md
+.claude/           this repo's own ticketmill profile, workflows/, and agents/ — it self-hosts its mill runs
 ```
 
 Note: workflow scripts are not a registered Claude Code plugin component, which is
 why `mill-init` copies the engine into your repo's `.claude/workflows/` and the
 `mill` skill invokes it by `scriptPath`. A plain git clone of this repo works too;
-the plugin install just adds the namespaced skills.
+the plugin install just adds the namespaced skills. This repo runs `mill` on itself: it
+carries its own `.claude/ticketmill.json` profile plus a `.claude/workflows/ticketmill.js`
+lockstep-installed copy of `workflows/ticketmill.js` (see `lockstep_installed_paths` above)
+and `.claude/agents/*.md`, the forged agent personas that do the work.
 
 ## Author
 

@@ -57,6 +57,41 @@ export const meta = {
 //                                        // predicted-file overlap drive lanes.
 //     "docblock_globs": ["app/**/*.php"],// files needing docblocks; null = skip stage
 //     "docs_dir": "docs",                // tech-docs stage target; null = skip stage
+//     "release": null,                   // OPTIONAL, default null (stage skipped
+//                                        // entirely, no agent call): batch-level
+//                                        // CHANGELOG + version-file bump, owned by the
+//                                        // Report phase, run ONCE per batch immediately
+//                                        // before the batch PR agent — so the bump
+//                                        // lands inside the human-reviewed TARGET->BASE
+//                                        // diff by construction. Per-issue stages must
+//                                        // NOT bump versions themselves.
+//                                        // { "version_files": [".claude-plugin/plugin.json"],
+//                                        //   "changelog": "CHANGELOG.md",  // default shown
+//                                        //   "bump": null }               // "major"|"minor"|"patch" override;
+//                                        //                                // unset = derive from shipped
+//                                        //                                // commit types (any "feat" -> minor,
+//                                        //                                // else patch) — see deriveReleaseVersion().
+//                                        // version_files: JSON file(s) with a top-level "version"
+//                                        // string key, bumped in place. Name the CANONICAL file only —
+//                                        // never a path also listed in lockstep_installed_paths; that
+//                                        // file's own mirroring tooling keeps it in sync, a second bump
+//                                        // commit would just fight it. marketplace.json carries no
+//                                        // version field of its own — never add one here or anywhere else.
+//                                        // The next version is always computed from origin/BASE's
+//                                        // version_files[0] (never TARGET), so a resumed/healing pass
+//                                        // regenerates the identical version + CHANGELOG section in place
+//                                        // instead of double-bumping. CAVEAT: two batch PRs open
+//                                        // concurrently against the same BASE both compute BASE+bump to
+//                                        // the same next version and collide on version_files/changelog at
+//                                        // the second human merge — a git conflict at the human merge gate
+//                                        // (pre-existing under manual bumps, not made worse), not silent
+//                                        // corruption. The generated CHANGELOG entry is an explicit draft;
+//                                        // the human reviewer refines wording inside the batch PR.
+//     "consolidation": true,             // OPTIONAL, default true: Select-phase gate
+//                                        // that groups issues cheaper to resolve as
+//                                        // one unit. false disables the gate entirely
+//                                        // (no gate agent call); see
+//                                        // consolidationEnabled().
 //     "logs_dir": "logs/ticketmill",
 //     "claim_label": "ticketmill",
 //     "verify_notes": ["tests need the pgvector container: podman start ncl_test"],
@@ -72,10 +107,41 @@ export const meta = {
 //                                        // post-implement hard-revert gate; see
 //                                        // isHardRevertPath. This repo sets
 //                                        // [".claude/workflows/ticketmill.js"].
+//     "warn_base_branches": [],          // OPTIONAL (issue #36), default []: base
+//                                        // branch names that trigger a Select-phase
+//                                        // WARNING when a batch's target branch looks
+//                                        // like a CI/CD deploy-trigger branch (PRs
+//                                        // normally target the working branch, not a
+//                                        // branch that auto-deploys on push). Unset/[]
+//                                        // = no warning; the engine bakes in no
+//                                        // project-shaped branch names of its own.
+//     "contrarian_max_iterations": 3,    // OPTIONAL, default 3: caps the approach/plan
+//                                        // (and consolidation) contrarian challenge
+//                                        // gates' iterations before proceeding with
+//                                        // unresolved caveats (recorded in the batch
+//                                        // PR's Verification Gaps). Must be an integer
+//                                        // >= 1 if set. 'trivial'-complexity issues get
+//                                        // min(2, this value) per gate regardless.
 //     "browser": null,                   // OPT-IN browser verification:
 //     // { "serve_command": "php artisan serve --port={port}", "build_command": null,
-//     //   "ui_globs": ["resources/views/**"], "port_base": 8100, "notes": "..." }
-//     "models": { "plan": { "model": "opus", "effort": "high" } }, // per-stage overrides
+//     //   "ui_globs": ["resources/views/**"], "port_base": 8100, "notes": "...",
+//     //   "port_span": 900, "lock_path": "/tmp/ticketmill-browser-lock",
+//     //   "stale_seconds": 1800, "poll_seconds": 15,
+//     //   "artifact_dir": "/tmp/ticketmill-issue-{issue}" }
+//     // All five of port_span/lock_path/stale_seconds/poll_seconds/artifact_dir are
+//     // optional and default to the values shown above; artifact_dir substitutes
+//     // {issue} if present (like serve_command's {port}), else appends -<issue>.
+//     "models": { "plan": { "model": "opus", "effort": "high" } }, // OPTIONAL per-stage
+//                                        // model/effort overrides, keyed by stage name.
+//                                        // Valid keys (25): probe, setup, research,
+//                                        // evaluate, consolidation, contrarian, plan,
+//                                        // implement, taskReview, simplify, qReview,
+//                                        // fix, testRun, testValidate, browser,
+//                                        // docblock, pr, specReview, codeReview,
+//                                        // techDocs, merge, release, report, retro,
+//                                        // learnings.
+//                                        // The `M` map below is the source of truth
+//                                        // for these keys and their defaults.
 //     "roles": {
 //       "implementers": ["laravel-backend-developer", "frontend-developer"],
 //       "default_implementer": "laravel-backend-developer",
@@ -126,9 +192,10 @@ export const meta = {
 //   through a chained mutex; probes and fix stages run outside the lock. Each
 //   pass boots profile.browser.serve_command (with {port} substituted per issue).
 //   Two-layer locking: the JS mutex only orders stages THIS SCRIPT schedules, so
-//   a host-global mkdir lock (/tmp/ticketmill-browser-lock, owner file, 30-min
-//   stale-steal) additionally guards the browser itself; ad-hoc agent use goes
-//   through the same lock.
+//   a host-global mkdir lock (default /tmp/ticketmill-browser-lock, owner file,
+//   default 30-min stale-steal, default 15s poll — all overridable via
+//   profile.browser.lock_path/stale_seconds/poll_seconds) additionally guards the
+//   browser itself; ad-hoc agent use goes through the same lock.
 //
 // RESTARTABLE (two independent paths)
 //   1. Same session, exact resume: Workflow({ scriptPath, resumeFromRunId: 'wf_...' })
@@ -200,7 +267,7 @@ const CONCURRENCY = Math.max(1, Math.min(5, Number(A.concurrency) || 2))
 const DRY_RUN = !!A.dry_run
 
 // ----- caps -----
-const MAX_CONTRARIAN_ITERATIONS = 3
+let MAX_CONTRARIAN_ITERATIONS = 3 // overridable via profile.contrarian_max_iterations (see __seed / Select)
 const MAX_TASK_REVIEW_ATTEMPTS = 3
 const MAX_QUALITY_ITERATIONS = 5
 const MAX_TEST_ITERATIONS = 10
@@ -248,6 +315,7 @@ const M = {
   codeReview:   { model: 'opus', effort: 'high' },
   techDocs:     { model: 'sonnet' },
   merge:        { model: 'sonnet' },
+  release:      { model: 'sonnet' }, // Report-phase batch release stage (gated on profile.release)
   report:       { model: 'sonnet', effort: 'low' },
   retro:        { model: 'sonnet' },
   learnings:    { model: 'sonnet', effort: 'low' },
@@ -276,6 +344,8 @@ let TEST_CMD
 let LOGS = null                 // ROOT + '/' + profile.logs_dir
 let CLAIM_LABEL = 'ticketmill'
 let BROWSER = null              // profile.browser or null
+let RELEASE = null              // profile.release or null (normalized: version_files
+                                 // as strings, changelog defaulted to 'CHANGELOG.md')
 let VERIFY_SKIPS = []           // human-visible verification gaps -> batch PR body
 // ENGINE_OWNED / LOCKSTEP_INSTALLED_PATHS (issue #3): populated at Select from
 // ENGINE_OWNED_GLOBS (~line 1244, declared after this point — assigned via
@@ -528,6 +598,25 @@ const TECH_DOCS_SCHEMA = {
 const PR_SCHEMA = {
   type: 'object', required: ['status'],
   properties: { status: { enum: ['success', 'error'] }, pr_number: { type: ['integer', 'null'] }, pr_url: { type: 'string' }, error: { type: ['string', 'null'] } },
+}
+// ----- Report-phase release stage schemas (gated on profile.release) -----
+const RELEASE_PROBE_SCHEMA = {
+  type: 'object', required: ['base_version', 'commit_types'],
+  properties: {
+    base_version: { type: ['string', 'null'] },
+    commit_types: { type: 'array', items: { type: 'string' } },
+  },
+}
+const RELEASE_SCHEMA = {
+  type: 'object', required: ['status'],
+  properties: {
+    status: { enum: ['success', 'error'] },
+    version: { type: ['string', 'null'] },
+    commit: { type: ['string', 'null'] },
+    pushed: { type: ['boolean', 'null'] },
+    summary: { type: 'string' },
+    error: { type: ['string', 'null'] },
+  },
 }
 const MERGE_SCHEMA = {
   type: 'object', required: ['status'],
@@ -791,6 +880,18 @@ function batchClosesIssues(results) {
     }
   }
   return out
+}
+
+// resolveIssueNumbers (issue #33): normalizes args.issues into deduped positive
+// integers in first-seen order. Without this, a repeated issue number (typo or a
+// stale resume command passing issues:[701,701]) survives the old inline
+// map(Number).filter(n>0) untouched and produces two preflights/claims/processIssue
+// units racing on the same worktree/branch for the same issue. Only the explicit
+// A.issues path needs this: the A.labels path lists issues via `gh issue list`,
+// which cannot return the same number twice. Pure and placed above the
+// TICKETMILL-TEST-HARNESS-SPLIT marker so tests/harness.js can drive it directly.
+function resolveIssueNumbers(raw) {
+  return [...new Set((Array.isArray(raw) ? raw : []).map(Number).filter(function (n) { return n > 0 }))]
 }
 
 // worktreeAnchor: the issue number passed to setup-worktree.sh as the physical
@@ -1250,17 +1351,35 @@ function applyRealRunCollapseGuard(units, lanes, concurrency, serializeGlobs) {
 // ----- batch state -----
 const STOP = { tripped: false, reason: '' }
 const BATCH = { failures: 0, consecutiveDeaths: 0 }
+// STAGE_TOKENS: region-boundary token buckets for Select-phase orchestration
+// spend that has no per-issue ctx to attribute to (see aggregateTokens' byStage
+// param above). Populated by addStage() (below, near spentTokens()) bracketing
+// four run-body regions — never inside runPool(), the only concurrent region,
+// so every addStage() delta is exact regardless of CONCURRENCY. Plain literal,
+// sandbox-safe (mirrors STOP/BATCH here, not a class).
+const STAGE_TOKENS = { preflight: 0, select: 0 }
 let LEARN = null // category digests distilled from process-retrospective.md (Select phase)
 
 function tripStop(reason) {
   if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; log('STOP: ' + reason) }
 }
 
-// isBudgetExhaustedError: budget/ceiling errors are fatal for the whole run
-// (tripStop), not a per-attempt death — shared by stage() and
-// consolidationAgent() so the two call sites can't drift on what counts as one.
+// isBudgetExhaustedError: only a real budget/token-exhaustion signature is
+// fatal for the whole run (tripStop), not a per-attempt death — shared by
+// stage() and consolidationAgent() so the two call sites can't drift on what
+// counts as one. Requires a budget/token/ceiling NOUN to co-occur with an
+// exhaust/exceed/deplete/ran-out/overrun-shaped/limit-reached VERB; either
+// alone is not enough, so a target repo's own domain error that merely names
+// "budget" (no exhaustion verb) or merely exceeds something unrelated (no
+// budget noun) is left to the ordinary per-attempt retry + recordAgentDeath()
+// path instead of halting the whole run. The "over" family is deliberately
+// anchored to overrun-shaped phrasing (overrun/overage/went over/ran over/
+// over budget/over the limit) rather than the bare word "over", which shows
+// up in ordinary prose ("budget review is over") without meaning exhaustion.
 function isBudgetExhaustedError(msg) {
-  if (!/budget|token target|ceiling/i.test(msg)) return false
+  const hasBudgetNoun = /\b(?:budget|token|ceiling)\b/i.test(msg)
+  const hasExhaustionVerb = /\b(?:exhaust(?:ed|ion|s)?|exceed(?:ed|s|ing)?|deplete(?:d|s)?|ran\s+out|over[\s-]?(?:run|age)\b|went\s+over|ran\s+over|over\s+budget|over\s+the\s+limit|limit[\s-]?reached)\b/i.test(msg)
+  if (!hasBudgetNoun || !hasExhaustionVerb) return false
   tripStop('token budget exhausted (' + msg + ')')
   return true
 }
@@ -1292,6 +1411,27 @@ function spentTokens() {
     return isFiniteNumber(v) ? v : null
   } catch (e) {
     return null
+  }
+}
+
+// addStage: DRY region-boundary bracketing helper for STAGE_TOKENS (above).
+// Callers sample `before = spentTokens()` immediately before a sequential
+// run-body region, then call addStage(bucket, before) immediately after —
+// this reads `after = spentTokens()` and accumulates a guarded
+// Math.max(0, after - before) into STAGE_TOKENS[bucket]. Isolated in its own
+// try/catch, mirroring stage()'s finally block below, so a tracking failure
+// (e.g. budget.spent() misbehaving) can never affect run-body control flow.
+// Exact regardless of CONCURRENCY as long as the bracketed region itself never
+// overlaps runPool() (the only concurrent region) — every call site below is
+// sequential, strictly before runPool() drains.
+function addStage(bucket, before) {
+  try {
+    const after = spentTokens()
+    if (isFiniteNumber(before) && isFiniteNumber(after)) {
+      STAGE_TOKENS[bucket] += Math.max(0, after - before)
+    }
+  } catch (e) {
+    // never let tracking failures affect run-body control flow
   }
 }
 
@@ -1332,7 +1472,7 @@ function scopeGuard(ctx) {
         'End every comment body you post with this exact marker line: <!-- ticketmill ' + REPO + '#' + ctx.issue + ' -->',
       ]
   if (BROWSER) {
-    lines.push('The shared verification browser is lock-guarded (' + BW_LOCK + '): only use it if your prompt includes the')
+    lines.push('The shared verification browser is lock-guarded (' + bwLock() + '): only use it if your prompt includes the')
     lines.push('"live browser feedback" protocol block — without that block, do NOT open the browser.')
   }
   // Engine-owned advisory clause (issue #3): a deterministic post-implement
@@ -1454,6 +1594,11 @@ function settledBlock(ctx) {
 const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotchas that later agents will need ' +
   '(test/env setup, shifted line numbers after deletes, tooling oddities), also return notes_for_downstream ' +
   '(1-3 short strings); otherwise return it empty.'
+
+// ----- commit SHA integrity (retro found agents twice typing a fabricated/shortened SHA into a posted comment instead of reading the real one, requiring a fixup edit) -----
+const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> log -1 --format=%H — it prints the ' +
+  'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
+  'or recall a SHA from memory.'
 function collectNotes(ctx, from, r) {
   const arr = (r && r.notes_for_downstream) || []
   for (const n of arr) {
@@ -1495,29 +1640,53 @@ function timeline(ctx) {
   })
 }
 
-// Pure aggregation of per-issue/per-stage token deltas into per-issue and
-// per-model subtotals, plus a finished markdown "## Token Usage" section — all
-// math done here in JS, never delegated to an LLM. Takes no globals; harness-
-// testable in isolation.
+// Display labels for aggregateTokens' 4th (byStage) param's known keys — the
+// STAGE_TOKENS region-boundary buckets (preflight/select-phase orchestration
+// spend, sampled outside the per-issue pool — see STAGE_TOKENS). An unknown
+// key still renders (key + ' (orchestration)'), so a future bucket doesn't
+// silently vanish from the table just because this map wasn't updated.
+const STAGE_LABELS = { preflight: 'preflight (orchestration)', select: 'select-phase (orchestration)' }
+
+// Pure aggregation of per-issue/per-stage token deltas into per-issue,
+// per-model, and per-stage subtotals, plus a finished markdown "## Token
+// Usage" section — all math done here in JS, never delegated to an LLM.
+// Takes no globals; harness-testable in isolation.
 //   results      - the run's per-issue result array. Entries lacking a `.tokens`
 //                  field entirely (skipped/not_started — never got a ctx) or
 //                  carrying `.tokens.tracked === false` (ctx existed but no stage
 //                  ever sampled a usable budget.spent() pair) both render
 //                  "not tracked", never a false zero.
 //   spent        - the guarded, run-wide budget.spent() total (Number or null).
-//   concurrency  - CONCURRENCY. Selects the reconciliation story:
-//     === 1: stage deltas cannot overlap, so they're an exact partition of the
-//       run; an "orchestration/unattributed" remainder row (max(0, spent - sum
-//       of deltas)) is appended so the table sums exactly to `spent`
-//       (reconciles: true).
+//   concurrency  - CONCURRENCY. Only per-issue rows are affected by it:
+//     === 1: per-issue stage deltas cannot overlap, so they're an exact
+//       partition of that portion of the run (reconciles: true, given spent
+//       and some tracked data).
 //     > 1: multiple issues' stages run side by side against ONE shared
 //       monotonic counter — agent() returns schema content only, never a
 //       per-call usage figure, so there is no way to split budget.spent()'s
 //       movement between concurrent callers. Overlapping stages each see (and
-//       get attributed) the same movement, so deltas over-count and the whole
-//       breakdown is labelled approximate (reconciles: false).
-function aggregateTokens(results, spent, concurrency) {
+//       get attributed) the same movement, so per-issue deltas over-count and
+//       the whole breakdown is labelled approximate (reconciles: false).
+//   byStage      - optional (normalizes to {}, so existing 3-arg callers are
+//                  unaffected): a flat { preflight, select, ... } map of
+//                  region-bracketed orchestration spend sampled OUTSIDE the
+//                  concurrent per-issue pool (see STAGE_TOKENS), so it's exact
+//                  regardless of `concurrency`. Every nonzero bucket folds
+//                  into sumDeltas exactly once and renders as its own labeled
+//                  row (STAGE_LABELS) — never absorbed silently into the
+//                  remainder below, and never double-counted by it. A run
+//                  where every per-issue result is untracked but the stage
+//                  buckets are populated (e.g. a resumed run) still counts as
+//                  "tracked" and still renders a breakdown, via anyStage.
+// remainder (whatever budget.spent() counted that no per-issue row or stage
+// bucket attributed — max(0, spent - sumDeltas)) is computed and rendered as
+// its own "orchestration/unattributed" row whenever `spent` is available,
+// regardless of concurrency/reconciles — including the approximate
+// concurrency>1 case, so that spend is never left implicit — since the stage
+// buckets are already folded into sumDeltas, it is never double-counted.
+function aggregateTokens(results, spent, concurrency, byStage) {
   const list = results || []
+  const stages = byStage || {}
   const byIssue = []
   const byModel = {}
   let sumDeltas = 0
@@ -1539,14 +1708,31 @@ function aggregateTokens(results, spent, concurrency) {
     }
   }
 
+  // Stage buckets fold into sumDeltas exactly once (below) so the remainder
+  // row never double-counts them; zero-valued buckets are kept in by_stage
+  // (the returned JSON) but omitted from the rendered table rows.
+  const byStageOut = {}
+  const stageRows = []
+  for (const key in stages) {
+    if (!Object.prototype.hasOwnProperty.call(stages, key)) continue
+    const v = stages[key] || 0
+    byStageOut[key] = v
+    if (v) {
+      sumDeltas += v
+      stageRows.push({ label: STAGE_LABELS[key] || (key + ' (orchestration)'), total: v })
+    }
+  }
+  const anyStage = stageRows.length > 0
+
   const hasSpent = isFiniteNumber(spent)
   // run_total must agree with the markdown's "Run total" line, which only ever
   // renders the guarded budget.spent() figure or "not tracked" — never a
   // sumDeltas fallback (see CHANGELOG for the Quality Review finding this fixes).
   const runTotal = hasSpent ? spent : null
-  const tracked = anyTracked || hasSpent
-  const reconciles = concurrency === 1 && hasSpent && anyTracked
-  const remainder = reconciles ? Math.max(0, spent - sumDeltas) : null
+  const trackedAny = anyTracked || anyStage
+  const tracked = trackedAny || hasSpent
+  const reconciles = concurrency === 1 && hasSpent && trackedAny
+  const remainder = hasSpent ? Math.max(0, spent - sumDeltas) : null
   const models = Object.keys(byModel).sort()
 
   const lines = []
@@ -1557,13 +1743,23 @@ function aggregateTokens(results, spent, concurrency) {
     : 'Run total: not tracked (budget.spent() unavailable this run)')
   lines.push('')
 
-  if (!anyTracked) {
+  if (!tracked) {
     lines.push('Per-issue / per-model breakdown: not tracked (no stage in this run reported a usable token delta).')
   } else {
-    if (concurrency > 1) {
+    if (!trackedAny) {
+      // hasSpent is true here (tracked === trackedAny || hasSpent, trackedAny is
+      // false) but no per-issue row or stage bucket attributed any of it — the
+      // degenerate case this fix closes. Still render the table (all rows "not
+      // tracked") so the remainder row below carries the full run total instead
+      // of it vanishing into a "not tracked" line that contradicts "Run total: N".
+      lines.push('_no per-issue or stage data attributed any spend this run — the "orchestration/unattributed" row ' +
+        'below carries the full run total instead of leaving it implicit._')
+    } else if (concurrency > 1) {
       lines.push('_approximate - overlapping concurrent stages over-count and do NOT reconcile to the run total._')
       lines.push('(A single shared monotonic counter cannot be split per concurrent call — agent() returns schema ' +
-        'content only, no per-call usage — so simultaneous issues each see the same counter movement.)')
+        'content only, no per-call usage — so simultaneous issues each see the same counter movement. The stage ' +
+        'rows below are exact even so — they are sampled outside the concurrent per-issue pool — only the ' +
+        'per-issue rows above them over-count.)')
     } else if (reconciles) {
       lines.push('_Reconciles exactly to the run total above — the "orchestration/unattributed" row below absorbs ' +
         'whatever budget.spent() counted that no stage attributed._')
@@ -1582,12 +1778,16 @@ function aggregateTokens(results, spent, concurrency) {
       cells.push(row.tracked ? String(row.total) : 'not tracked')
       lines.push('| ' + cells.join(' | ') + ' |')
     }
-    if (reconciles) {
+    for (const sr of stageRows) {
+      const cells = [sr.label].concat(models.map(function () { return '' })).concat([String(sr.total)])
+      lines.push('| ' + cells.join(' | ') + ' |')
+    }
+    if (hasSpent) {
       const remCells = ['orchestration/unattributed'].concat(models.map(function () { return '' })).concat([String(remainder)])
       lines.push('| ' + remCells.join(' | ') + ' |')
     }
     const totalCells = ['**Total**'].concat(models.map(function (m) { return '**' + byModel[m] + '**' }))
-    totalCells.push('**' + (reconciles ? spent : sumDeltas) + '**')
+    totalCells.push('**' + (hasSpent ? spent : sumDeltas) + '**')
     lines.push('| ' + totalCells.join(' | ') + ' |')
   }
 
@@ -1595,6 +1795,8 @@ function aggregateTokens(results, spent, concurrency) {
     run_total: runTotal,
     by_issue: byIssue,
     by_model: byModel,
+    by_stage: byStageOut,
+    remainder: remainder,
     tracked: tracked,
     reconciles: reconciles,
     markdown: lines.join('\n'),
@@ -1877,6 +2079,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
         'If you changed anything, post an issue comment "## Simplify Pass (' + stepLabel + ', iteration ' + iter + ')" with',
         'the commit SHA and 2-4 lines on what was simplified (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ');',
         'skip the comment entirely if you made no changes.',
+        COMMIT_SHA_ASK,
         HANDOFF_ASK,
         'Return status, commit, files_changed, summary.',
       ].join('\n'), stageOpts('simplify'), IMPL_SCHEMA)
@@ -1920,6 +2123,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       '',
       'After committing, post an issue comment "## Quality Fix (' + stepLabel + ', iteration ' + iter + ')" with the',
       'commit SHA and the fixes applied in 2-4 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+      COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
       'Fix the issues and commit. Return status, commit, files_changed, fixes_applied, summary.',
@@ -1954,9 +2158,13 @@ function withBrowser(fn) {
   BW_QUEUE = run.then(function () {}, function () {}) // keep the chain alive past failures
   return run
 }
-function bwPort(issue) { return ((BROWSER && BROWSER.port_base) || 8100) + (issue % 900) }
+function bwPort(issue) { return ((BROWSER && BROWSER.port_base) || 8100) + (issue % ((BROWSER && BROWSER.port_span) || 900)) }
 function serveCmd(issue) {
   return String((BROWSER && BROWSER.serve_command) || '').replace(/\{port\}/g, String(bwPort(issue)))
+}
+function bwArtifactDir(issue) {
+  const tmpl = (BROWSER && BROWSER.artifact_dir) || '/tmp/ticketmill-issue-{issue}'
+  return /\{issue\}/.test(tmpl) ? tmpl.replace(/\{issue\}/g, String(issue)) : tmpl + '-' + issue
 }
 
 // Host-global browser lock. The JS mutex above only serializes stages THIS SCRIPT
@@ -1964,25 +2172,29 @@ function serveCmd(issue) {
 // browser use (implement/fix/review agents wanting live feedback) needs a lock
 // that works from inside any agent's shell. flock can't span separate Bash tool
 // calls (each call is its own process), so the lock is an atomic mkdir directory
-// with an owner file and a 30-minute stale-steal. Scheduled verification stages
-// acquire the SAME lock, so ad-hoc use and the verification pipeline stay
-// mutually serial.
-const BW_LOCK = '/tmp/ticketmill-browser-lock'
+// with an owner file and a 30-minute stale-steal (both configurable via
+// profile.browser). Scheduled verification stages acquire the SAME lock, so
+// ad-hoc use and the verification pipeline stay mutually serial.
+function bwLock() { return (BROWSER && BROWSER.lock_path) || '/tmp/ticketmill-browser-lock' }
 function bwAcquire(who) {
+  const lock = bwLock()
+  const staleSeconds = parseInt((BROWSER && BROWSER.stale_seconds), 10) || 1800
+  const pollSeconds = parseInt((BROWSER && BROWSER.poll_seconds), 10) || 15
   return [
     'Acquire the global browser lock (bounded wait; NEVER touch the browser without it):',
-    '  until mkdir ' + BW_LOCK + ' 2>/dev/null; do',
-    '    s=$(cat ' + BW_LOCK + '/started 2>/dev/null || echo 0); now=$(date +%s)',
-    '    if [ $((now - s)) -gt 1800 ]; then rm -rf ' + BW_LOCK + '; fi   # steal stale locks (dead holder)',
-    '    sleep 15',
+    '  until mkdir ' + lock + ' 2>/dev/null; do',
+    '    s=$(cat ' + lock + '/started 2>/dev/null || echo 0); now=$(date +%s)',
+    '    if [ $((now - s)) -gt ' + staleSeconds + ' ]; then rm -rf ' + lock + '; fi   # steal stale locks (dead holder)',
+    '    sleep ' + pollSeconds,
     '  done',
-    '  echo ' + who + ' > ' + BW_LOCK + '/owner; date +%s > ' + BW_LOCK + '/started',
+    '  echo ' + who + ' > ' + lock + '/owner; date +%s > ' + lock + '/started',
     '(Bound the wait to ~15 minutes of looping. If holding the lock across a long step — a build, a fix —',
-    'release it first and re-acquire after; re-touch ' + BW_LOCK + '/started if a browser session runs long.)',
+    'release it first and re-acquire after; re-touch ' + lock + '/started if a browser session runs long.)',
   ].join('\n')
 }
 function bwRelease(who) {
-  return 'Release the lock ONLY if you own it: grep -qx "' + who + '" ' + BW_LOCK + '/owner 2>/dev/null && rm -rf ' + BW_LOCK
+  const lock = bwLock()
+  return 'Release the lock ONLY if you own it: grep -qx "' + who + '" ' + lock + '/owner 2>/dev/null && rm -rf ' + lock
 }
 // Optional live-feedback offer for implement/fix/review prompts. Empty when the
 // profile has no browser config — the offer must not exist for non-UI projects.
@@ -2053,7 +2265,7 @@ async function runBrowserCheck(ctx, where) {
         '3. In the browser, exercise the SPECIFIC UI behaviors this issue changes — the affected flow end-to-end,',
         '   not a generic smoke test. Follow the target project\'s CLAUDE.md guidance for selectors/login/theme quirks.',
         BROWSER.notes ? '   Project notes: ' + BROWSER.notes : '',
-        '4. Artifact discipline: save any screenshots/traces/scratch files ONLY under /tmp/ticketmill-issue-' + ctx.issue,
+        '4. Artifact discipline: save any screenshots/traces/scratch files ONLY under ' + bwArtifactDir(ctx.issue),
         '   — never inside the worktree (they would pollute commits and the PR diff).',
         '5. result=passed only if every exercised behavior works; failed with concrete failures (what you did,',
         '   what you saw, what was expected) otherwise; skipped ONLY if nothing here is actually verifiable in a',
@@ -2071,7 +2283,7 @@ async function runBrowserCheck(ctx, where) {
         'Cleanup after a browser verification pass (idempotent; repo-safe — touch NO files in ' + ctx.worktree + '):',
         '1. Kill any server listening on port ' + port + ': fuser -k ' + port + '/tcp 2>/dev/null || true',
         '2. Load the browser MCP tools via ToolSearch and close the browser (ignore errors if nothing is open).',
-        '3. rm -rf /tmp/ticketmill-issue-' + ctx.issue + ' || true',
+        '3. rm -rf ' + bwArtifactDir(ctx.issue) + ' || true',
         '4. ' + bwRelease('issue-' + ctx.issue + '-verify'),
         '   (owner-guarded on purpose: if the verifier died BEFORE acquiring, the lock belongs to someone else — leave it)',
         'Return posted=true when done.',
@@ -2099,6 +2311,7 @@ async function runBrowserCheck(ctx, where) {
       'Fix the real defect — do NOT hide the symptom (e.g. removing the interaction that fails).',
       'After committing, post an issue comment "## Browser Fix (' + where + ', iteration ' + iter + ')" with the commit',
       'SHA and what was fixed (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+      COMMIT_SHA_ASK,
       HANDOFF_ASK,
       'Commit' + (where === 'pre-merge' ? ' and push: git -C ' + ctx.worktree + ' push origin ' + ctx.branch : '') + '. Return status, commit, files_changed, fixes_applied, summary.',
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
@@ -2305,6 +2518,7 @@ async function runTestLoop(ctx, forced) {
         'Fix the real defect — do NOT delete or weaken assertions just to make the failure disappear.',
         'After committing, post an issue comment "## Test Fix (iteration ' + iter + ')" with the commit SHA and which',
         'failures were addressed (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+        COMMIT_SHA_ASK,
         HANDOFF_ASK,
         'Fix the issues and commit. Return status, commit, files_changed, fixes_applied, summary.',
       ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
@@ -2347,6 +2561,7 @@ async function runTestLoop(ctx, forced) {
       fixContext(ctx, null),
       'After committing, post an issue comment "## Test Quality Fix (iteration ' + iter + ')" with the commit SHA and',
       'what was added/strengthened (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+      COMMIT_SHA_ASK,
       HANDOFF_ASK,
       'Add missing assertions, remove TODOs, add edge-case tests, etc. Commit. Return status, commit, files_changed, fixes_applied, summary.',
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
@@ -3010,8 +3225,8 @@ async function implementIssue(ctx) {
   // the revision cycle entirely; the full cap on a docs-only issue burns opus time
   // re-litigating settled trade-offs.
   const complexity = evalR.complexity || 'standard'
-  const challengeCap = complexity === 'trivial' ? 2 : MAX_CONTRARIAN_ITERATIONS
-  if (complexity === 'trivial') log('#' + ctx.issue + ' classified trivial — contrarian caps reduced to 2 iterations per gate')
+  const challengeCap = contrarianCapFor(complexity)
+  if (complexity === 'trivial') log('#' + ctx.issue + ' classified trivial — contrarian caps reduced to ' + challengeCap + ' iteration(s) per gate')
 
   const misfiledCheck = [
     'MISFILED-COMMENT CHECK: workflow comments end with a marker line "<!-- ticketmill <repo>#<issue> -->".',
@@ -3075,6 +3290,7 @@ async function implementIssue(ctx) {
           ctx.unresolved.push('[approach gate, ' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
         }
       }
+      VERIFY_SKIPS.push('#' + ctx.issue + ': approach challenge capped at ' + challengeCap + ' iterations with unresolved caveats: ' + oneLine(ch.summary || '').slice(0, 200))
       const capNote = await stage(ctx, 'cap-note-approach', [
         'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (gh issue comment).',
         'Title line: "## Proceeding After Contrarian Cap (Approach)"',
@@ -3215,6 +3431,7 @@ async function implementIssue(ctx) {
           ctx.unresolved.push('[plan gate, ' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
         }
       }
+      VERIFY_SKIPS.push('#' + ctx.issue + ': plan challenge capped at ' + challengeCap + ' iterations with unresolved caveats: ' + oneLine(ch.summary || '').slice(0, 200))
       const capNote = await stage(ctx, 'cap-note-plan', [
         'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (gh issue comment).',
         'Title line: "## Proceeding After Contrarian Cap (Plan)"',
@@ -3276,6 +3493,7 @@ async function implementIssue(ctx) {
       'After committing, post an issue comment (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ') titled',
       '"## Task ' + task.id + ' Implemented" with the commit SHA and a 2-3 line summary — this keeps the issue',
       'audit trail alive during the implementation phase.',
+      COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
       'Return status, commit (SHA), files_changed, summary.',
@@ -3327,6 +3545,7 @@ async function implementIssue(ctx) {
         fixContext(ctx, task.description),
         'After committing, post an issue comment "## Task ' + task.id + ' Review Fix (attempt ' + attempt + ')" with the',
         'commit SHA and what was addressed in 2-4 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+        COMMIT_SHA_ASK,
         bwFeedback(ctx),
         HANDOFF_ASK,
         'Address the issues and commit. Return status, commit, files_changed, fixes_applied, summary.',
@@ -3485,6 +3704,7 @@ async function reviewAndMerge(ctx) {
       fixContext(ctx, null),
       'After pushing, post a PR comment "## PR Review Fix (iteration ' + iter + ')" with the commit SHA and the fixes',
       'applied in 2-4 lines (gh pr comment ' + ctx.pr + ' --repo ' + REPO + ').',
+      COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
       'Fix the issues, commit, and push: git -C ' + ctx.worktree + ' push origin ' + ctx.branch,
@@ -3569,7 +3789,7 @@ async function reviewAndMerge(ctx) {
     '   First check for existing duplicates — do not re-file.',
     releaseClaimStep,
     '7. Cleanup (non-blocking): ' + (BROWSER ? 'fuser -k ' + bwPort(ctx.issue) + '/tcp 2>/dev/null || true;' : '') ,
-    '   rm -rf /tmp/ticketmill-issue-' + ctx.issue + ' || true;',
+    '   rm -rf ' + bwArtifactDir(ctx.issue) + ' || true;',
     '   git -C ' + ROOT + ' worktree remove ' + ctx.worktree + ' --force; git -C ' + ROOT + ' worktree prune',
     '',
     'Deferred suggestions collected during implementation:',
@@ -3780,6 +4000,20 @@ async function runPool(items, limit, fn, lanes) {
   return results
 }
 
+// shouldWarnBaseBranch (issue #36): true when `base` is a member of the
+// profile's OPTIONAL warn_base_branches list — a CI/CD deploy-trigger branch
+// name the target repo wants a Select-phase heads-up on (PRs normally target
+// the working branch, not a branch that auto-deploys on push). Default []
+// when the field is absent/non-array, same normalization idiom as
+// LOCKSTEP_INSTALLED_PATHS/mergeEngineOwnedGlobs. Pure and placed above the
+// TICKETMILL-TEST-HARNESS-SPLIT marker (unlike the `if (...) log(...)` call
+// site below, which needs the real PROFILE/BASE populated at Select) so
+// tests can exercise it without seeding module state.
+function shouldWarnBaseBranch(profile, base) {
+  const list = profile && Array.isArray(profile.warn_base_branches) ? profile.warn_base_branches.map(String) : []
+  return list.indexOf(base) !== -1
+}
+
 // =============================================================================
 // MAIN
 // =============================================================================
@@ -3802,6 +4036,63 @@ function __seed(o) {
   if ('ROOT' in o) ROOT = o.ROOT
   if ('ENGINE_OWNED' in o) ENGINE_OWNED = o.ENGINE_OWNED
   if ('LOCKSTEP_INSTALLED_PATHS' in o) LOCKSTEP_INSTALLED_PATHS = o.LOCKSTEP_INSTALLED_PATHS
+  if ('MAX_CONTRARIAN_ITERATIONS' in o) MAX_CONTRARIAN_ITERATIONS = o.MAX_CONTRARIAN_ITERATIONS
+}
+
+// contrarianCapFor: proportional adversarial depth (see the comment at its call
+// site) — trivial issues get at most 2 challenge iterations per gate even when a
+// profile raises MAX_CONTRARIAN_ITERATIONS higher; a profile lowering the cap below
+// 2 tightens trivial issues too. Pure and placed above the TICKETMILL-TEST-HARNESS-
+// SPLIT marker so tests can exercise it without seeding module state.
+function contrarianCapFor(complexity) {
+  return complexity === 'trivial' ? Math.min(2, MAX_CONTRARIAN_ITERATIONS) : MAX_CONTRARIAN_ITERATIONS
+}
+
+// releaseEnabled: profile.release is OPTIONAL (default null/absent — the Report-
+// phase release stage never runs, no agent call at all; see "release" in the
+// profile comment block above). An explicit object naming at least one
+// version_files entry opts in. Pure and placed above the TICKETMILL-TEST-HARNESS-
+// SPLIT marker, like consolidationEnabled/shouldWarnBaseBranch, so tests can
+// exercise the gating predicate without seeding module state.
+function releaseEnabled(profile) {
+  return !!(profile && profile.release && Array.isArray(profile.release.version_files) && profile.release.version_files.length)
+}
+
+// deriveReleaseVersion: the release stage's pure bump-derivation helper.
+// BASE-anchored on purpose — `baseVersion` must come from origin/BASE's
+// version_files[0] (read by a read-only probe agent), NEVER from TARGET, so a
+// resumed/healing Report pass recomputes the exact same next version instead of
+// double-bumping a version TARGET already carries from a prior pass. Bump choice:
+// profile.release.bump ("major"|"minor"|"patch") overrides when set; otherwise any
+// "feat" commit type shipped this batch bumps minor, everything else (fix, chore,
+// docs, ...) bumps patch — a batch is exactly one bump regardless of how many
+// distinct commit types it contains. Throws on a non-semver baseVersion (the call
+// site treats that as a non-fatal, logged release-stage skip — see Report phase).
+// Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+function deriveReleaseVersion(baseVersion, commitTypes, profile) {
+  const override = profile && profile.release && profile.release.bump
+  const bump = ['major', 'minor', 'patch'].indexOf(override) !== -1
+    ? override
+    : ((Array.isArray(commitTypes) ? commitTypes : []).indexOf('feat') !== -1 ? 'minor' : 'patch')
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(baseVersion || '').trim())
+  if (!m) throw new Error('deriveReleaseVersion: base version is not a valid semver string: ' + JSON.stringify(baseVersion))
+  let major = Number(m[1]); let minor = Number(m[2]); let patch = Number(m[3])
+  if (bump === 'major') { major += 1; minor = 0; patch = 0 }
+  else if (bump === 'minor') { minor += 1; patch = 0 }
+  else { patch += 1 }
+  return { version: major + '.' + minor + '.' + patch, bump: bump }
+}
+
+// releaseChangelogAnchor: the single, date-independent heading the release stage
+// looks for (and regenerates in place) in the batch's CHANGELOG.md — anchored to
+// the computed version and RUN_TAG, never to a wall-clock date. RUN_TAG is fixed
+// once at run start (args.run_label/args.date, or 'run' — see its declaration
+// above), so calling this with the SAME (version, runTag) pair on a Report pass
+// that resumes after midnight yields the IDENTICAL string as the pass before
+// midnight: the section is found and overwritten in place, never duplicated.
+// Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+function releaseChangelogAnchor(version, runTag) {
+  return '## [' + String(version) + '] - ' + String(runTag)
 }
 
 // ---- TICKETMILL-TEST-HARNESS-SPLIT: tests/harness.js truncates the source at this
@@ -3842,11 +4133,27 @@ if (!Object.prototype.hasOwnProperty.call(PROFILE, 'test_command')) {
 }
 TEST_CMD = PROFILE.test_command === null ? null : String(PROFILE.test_command)
 if (TEST_CMD !== null && !TEST_CMD.trim()) throw new Error('profile.test_command is an empty string — use a real command or an explicit null')
+if (Object.prototype.hasOwnProperty.call(PROFILE, 'contrarian_max_iterations')) {
+  const cmi = PROFILE.contrarian_max_iterations
+  if (!Number.isInteger(cmi) || cmi < 1) throw new Error('profile.contrarian_max_iterations must be an integer >= 1, got: ' + JSON.stringify(cmi))
+  MAX_CONTRARIAN_ITERATIONS = cmi
+}
 REPO = PROFILE.repo || REPO
 LOGS = ROOT + '/' + String(PROFILE.logs_dir || 'logs/ticketmill').replace(/^\/+|\/+$/g, '')
 CLAIM_LABEL = String(PROFILE.claim_label || 'ticketmill')
 BROWSER = PROFILE.browser || null
 if (BROWSER && !BROWSER.serve_command) throw new Error('profile.browser is set but has no serve_command — browser verification cannot boot the app')
+RELEASE = PROFILE.release || null
+if (RELEASE) {
+  if (!Array.isArray(RELEASE.version_files) || !RELEASE.version_files.length) {
+    throw new Error('profile.release is set but has no non-empty version_files array — the release stage needs at least one JSON file with a "version" key to bump')
+  }
+  RELEASE.version_files = RELEASE.version_files.map(String)
+  if (RELEASE.bump != null && ['major', 'minor', 'patch'].indexOf(RELEASE.bump) === -1) {
+    throw new Error('profile.release.bump must be "major"|"minor"|"patch" if set, got: ' + JSON.stringify(RELEASE.bump))
+  }
+  RELEASE.changelog = RELEASE.changelog ? String(RELEASE.changelog) : 'CHANGELOG.md'
+}
 ENGINE_OWNED = mergeEngineOwnedGlobs(PROFILE)
 LOCKSTEP_INSTALLED_PATHS = Array.isArray(PROFILE.lockstep_installed_paths) ? PROFILE.lockstep_installed_paths.map(String) : []
 
@@ -3888,7 +4195,7 @@ if (referencedAgents.length) {
 // Timestamp comes from a `date` probe (Date.now() is unavailable in workflow
 // scripts), which also makes the name resume-stable: journal replay returns the
 // cached branch. Dry runs never create the branch.
-if (BASE === 'deploy-prod' || BASE === 'deploy-dev') log('WARNING: base branch "' + BASE + '" looks like a CI/CD trigger branch. PRs normally target the working branch.')
+if (shouldWarnBaseBranch(PROFILE, BASE)) log('WARNING: base branch "' + BASE + '" looks like a CI/CD trigger branch. PRs normally target the working branch.')
 if (!TARGET) {
   if (DRY_RUN) {
     TARGET = BASE // read-only probes only; noted in the dry-run output
@@ -3912,8 +4219,7 @@ log('ticketmill: root=' + ROOT + ' repo=' + REPO + ' base=' + BASE + ' target=' 
 // ---- Select: resolve the issue list ----
 let issueList = []
 if (Array.isArray(A.issues) && A.issues.length) {
-  issueList = A.issues.map(Number).filter(function (n) { return n > 0 })
-    .map(function (n) { return { number: n, title: '' } })
+  issueList = resolveIssueNumbers(A.issues).map(function (n) { return { number: n, title: '' } })
 } else if (Array.isArray(A.labels) && A.labels.length) {
   const labelFlags = A.labels.map(function (l) { return '--label "' + String(l).replace(/"/g, '') + '"' }).join(' ')
   const sel = await agent([
@@ -3935,6 +4241,12 @@ log('Selected ' + issueList.length + ' issue(s): ' + issueList.map(function (i) 
 // so it runs concurrently with the probes). Category sections are injected into
 // stage prompts: plan gets agent_selection+workflow, contrarians get
 // quality_loop+performance, test stages get test_loop.
+// STAGE_TOKENS.preflight R1: brackets the whole region from just before
+// learnPromise fires to just after it is awaited below — this deliberately
+// spans (never sub-brackets) the fire-and-forget learnPromise itself, plus
+// targetFetch and the preflight Promise.all in between, all of which run
+// strictly sequentially before runPool() (see addStage()'s module comment).
+const preflightR1Before = spentTokens()
 const learnPromise = agent([
   'Read ' + LOGS + '/process-retrospective.md (READ-ONLY).',
   'If the file does not exist, return found=false with all categories as empty strings.',
@@ -4049,6 +4361,7 @@ preflights = engineSkip.preflights
 if (engineSkip.flagged.length) log('engine-owned guardrail: root working tree dirty under an engine-owned path targeted by issue(s) ' + engineSkip.flagged.join(', ') + ' — routed to select-skip (regime a)')
 
 const learnR = await learnPromise
+addStage('preflight', preflightR1Before) // STAGE_TOKENS.preflight R1 close — see the bracket comment above learnPromise
 if (learnR && learnR.found) {
   LEARN = learnR
   log('prior-run learnings digested: ' + ['agent_selection', 'quality_loop', 'test_loop', 'performance', 'error_patterns', 'workflow']
@@ -4077,7 +4390,14 @@ if (learnR && learnR.found) {
 // under DRY_RUN: the marker-heal and opus proposal both run (gh reads only); the
 // comment-posting contrarian challenge is skipped entirely.
 const consolidationCandidates = preflights
+// STAGE_TOKENS.select sub-bracket 1: the whole proposeConsolidation() call
+// (internally sequential — propose/revise/challenge) has no per-issue ctx to
+// attribute its spend to, hence the synthetic .select bucket (see the
+// STAGE_TOKENS module comment). Runs under DRY_RUN too (read-only there), but
+// aggregateTokens() never runs on a dry run, so the partial bucket never renders.
+const selectBefore1 = spentTokens()
 const consolidationMap = await proposeConsolidation(consolidationCandidates)
+addStage('select', selectBefore1)
 
 if (DRY_RUN) {
   // ---- lane-scheduling preview (issue #1) — read-only, mirrors the real-run
@@ -4181,6 +4501,10 @@ if (DRY_RUN) {
 const toClaim = preflights.filter(function (p) { return p.resume_point !== 'skip' })
 const HELD_CLAIMS = [] // issues this run successfully claimed — released at Report
 if (toClaim.length) {
+  // STAGE_TOKENS.preflight R2: brackets the claims Promise.all and its settle
+  // loop below — real-run only (DRY_RUN already returned above), sequential,
+  // strictly before runPool() — see the STAGE_TOKENS module comment.
+  const preflightR2Before = spentTokens()
   const claims = await Promise.all(toClaim.map(function (p) {
     return agent([
       'Claim GitHub issue #' + p.issue + ' of ' + REPO + ' for this ticketmill run (batch branch: ' + TARGET + ', run tag: ' + RUN_TAG + ').',
@@ -4222,6 +4546,7 @@ if (toClaim.length) {
       if (c.reason && /died/.test(c.reason)) log('#' + c.issue + ' claim: ' + c.reason)
     }
   }
+  addStage('preflight', preflightR2Before) // STAGE_TOKENS.preflight R2 close — see the bracket comment above
   log('claims: ' + HELD_CLAIMS.length + '/' + toClaim.length + ' held by this run')
 }
 
@@ -4249,7 +4574,14 @@ if (groupUnitCount) log('consolidation: ' + groupUnitCount + ' group unit(s) mat
 // earlier could name a member that never actually joins the live unit). DRY_RUN
 // already returned above, so this line is only ever reached for a real run — the
 // explicit guard documents that no marker is ever posted for a preview.
-if (!DRY_RUN) await postConsolidationMarkers(units)
+// STAGE_TOKENS.select sub-bracket 2: postConsolidationMarkers, real-run only
+// (the guard above is already redundant with the DRY_RUN early-return, but
+// kept explicit here too) — see the STAGE_TOKENS module comment.
+if (!DRY_RUN) {
+  const selectBefore2 = spentTokens()
+  await postConsolidationMarkers(units)
+  addStage('select', selectBefore2)
+}
 
 // ---- Process: lane scheduling (issue #1) — group `units` into lanes that must
 // run serially (predicted-file overlap, a serialize_globs pattern hit, or a
@@ -4318,7 +4650,7 @@ if (HELD_CLAIMS.length) {
 }
 
 // ---- Token usage: JS-computed aggregation (no LLM math), injected verbatim below ----
-const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY)
+const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY, STAGE_TOKENS)
 
 // ---- Merge auto-resolution: JS-computed run-level rollup, injected verbatim below ----
 const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
@@ -4340,6 +4672,105 @@ const shippedGroups = finalGroups.filter(function (g) {
   return shippedIssues.indexOf(g.primary) !== -1
 })
 if (shippedIssues.length) {
+  // ---- RELEASE (non-fatal; gated on profile.release) — batch-level CHANGELOG +
+  // version bump, run ONCE per batch, BEFORE the batch-PR agent so the bump lands
+  // inside the human-reviewed TARGET -> BASE diff by construction. See "release"
+  // in the profile comment block above for the field shape and the concurrent-
+  // batch-collision caveat. Runs as the doc_writer role in an EPHEMERAL worktree
+  // (ROOT itself is never checked out/mutated; the engine's own installed copy at
+  // .claude/workflows/ticketmill.js is never touched by this stage).
+  if (releaseEnabled(PROFILE)) {
+    const versionFile = RELEASE.version_files[0]
+    const releaseProbe = await agent([
+      'READ-ONLY release probe for batch ' + TARGET + ' -> ' + BASE + ' in ' + REPO + '. Make no changes.',
+      '1. git fetch origin ' + BASE + ' ' + TARGET,
+      '2. Read the version currently on origin/' + BASE + ': git show origin/' + BASE + ':' + versionFile,
+      '   Extract the "version" field. If the file does not exist on origin/' + BASE + ' or has no such field,',
+      '   return base_version=null.',
+      '3. List distinct conventional-commit type prefixes shipped in this batch:',
+      '   git log origin/' + BASE + '..origin/' + TARGET + ' --pretty=%s | grep -oE \'^[a-z]+\' | sort -u',
+      '   (empty output is fine — return commit_types=[])',
+      'Return base_version (string or null) and commit_types (array of distinct prefixes found, e.g. ["feat","fix"]).',
+    ].join('\n'), { label: 'release-probe', phase: 'Report', schema: RELEASE_PROBE_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+      .catch(function (e) { log('release probe threw (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
+    if (!releaseProbe || !releaseProbe.base_version) {
+      log('release stage skipped (non-fatal) — could not read a "version" field from origin/' + BASE + ':' + versionFile)
+      VERIFY_SKIPS.push('release stage skipped — could not read the current version from origin/' + BASE + ':' + versionFile)
+    } else {
+      let derived = null
+      try {
+        derived = deriveReleaseVersion(releaseProbe.base_version, releaseProbe.commit_types, PROFILE)
+      } catch (e) {
+        log('release stage skipped (non-fatal): ' + String((e && e.message) || e).slice(0, 200))
+        VERIFY_SKIPS.push('release stage skipped — ' + String((e && e.message) || e).slice(0, 200))
+      }
+      if (derived) {
+        const anchor = releaseChangelogAnchor(derived.version, RUN_TAG)
+        const entryLines = shippedIssues.map(function (n) {
+          const r = results.filter(function (x) { return x.issue === n })[0]
+          return '- ' + (r && r.title ? r.title : ('issue #' + n)) + ' (#' + n + ')'
+        }).join('\n')
+        const releaseWorktree = WORKTREES + '/release-' + TARGET
+        let relWrite = null
+        try {
+          relWrite = await agent([
+            roleBlock('doc_writer'),
+            '',
+            'Batch release bump for ' + TARGET + ' -> ' + BASE + ' in ' + REPO + '. Target version: ' + derived.version +
+              ' (bump: ' + derived.bump + ', computed from origin/' + BASE + '\'s ' + versionFile + ' — NEVER from ' +
+              TARGET + ', so a resumed pass recomputes this exact same version instead of double-bumping).',
+            '',
+            '1. Ephemeral checkout — ROOT itself (' + ROOT + ') is never touched:',
+            '   git -C ' + ROOT + ' worktree add ' + releaseWorktree + ' origin/' + TARGET,
+            '2. In ' + releaseWorktree + ', bump the "version" field to exactly "' + derived.version + '" in EACH of:',
+            '   ' + RELEASE.version_files.join(', '),
+            '3. Regenerate-in-place the ONE batch CHANGELOG section in ' + RELEASE.changelog + ':',
+            '   - The section heading is EXACTLY: ' + JSON.stringify(anchor),
+            '   - If a heading matching that EXACT text already exists (a prior pass of THIS batch already wrote a',
+            '     draft section), REPLACE its body (everything up to the next "## " heading or EOF) with the list',
+            '     below — do not create a second section for the same batch.',
+            '   - If it does not exist yet, insert a new section with that exact heading (placed after the',
+            '     top-level title, before the first existing "## " entry — newest first) containing exactly this list:',
+            entryLines,
+            '   This is an explicit DRAFT for the human reviewer to refine (wording/voice) inside the batch PR —',
+            '   do not agonize over prose polish.',
+            '4. git -C ' + releaseWorktree + ' add -A',
+            '5. git -C ' + releaseWorktree + ' commit -m "chore(release): v' + derived.version + '"',
+            '   (if there is nothing to commit — e.g. a resumed pass regenerated byte-identical content — treat that',
+            '   as status=success with commit=null, not an error)',
+            '6. Push (non-fatal — if this fails, log it and return pushed=false; do NOT throw or retry):',
+            '   git -C ' + releaseWorktree + ' push origin HEAD:' + TARGET,
+            '',
+            'Return status (success|error), version, commit (exact SHA or null), pushed (boolean), summary, error.',
+          ].join('\n'), { label: 'release', phase: 'Report', schema: RELEASE_SCHEMA, model: M.release.model, effort: M.release.effort })
+            .catch(function (e) { log('release write agent threw (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
+        } finally {
+          // Cleanup runs REGARDLESS of the write agent's outcome — an ephemeral
+          // worktree must never linger. Idempotent (safe if worktree add itself
+          // never happened or already failed).
+          const relCleanup = await agent([
+            'Cleanup the ephemeral release worktree (idempotent — safe if it is already gone):',
+            'git -C ' + ROOT + ' worktree remove --force ' + releaseWorktree + ' 2>/dev/null || true',
+            'git -C ' + ROOT + ' worktree prune',
+            'rm -rf ' + releaseWorktree + ' || true',
+            'Return posted=true when done.',
+          ].join('\n'), { label: 'release-cleanup', phase: 'Report', schema: NOTE_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+            .catch(function () { return null })
+          if (!relCleanup || !relCleanup.posted) log('release-cleanup incomplete — ' + releaseWorktree + ' may need manual `git worktree remove --force`')
+        }
+        if (!relWrite || relWrite.status !== 'success') {
+          log('release stage degraded (non-fatal): ' + ((relWrite && relWrite.error) || 'agent died'))
+          VERIFY_SKIPS.push('release stage did not complete — CHANGELOG/version bump for this batch may need a manual follow-up')
+        } else if (relWrite.pushed === false) {
+          log('release commit made but push to ' + TARGET + ' failed (non-fatal) — push manually before merging the batch PR')
+          VERIFY_SKIPS.push('release commit (' + (relWrite.commit || 'unknown SHA') + ') did not push to ' + TARGET + ' — push manually before merging the batch PR')
+        } else {
+          log('release: bumped to v' + derived.version + ' (' + derived.bump + ') on ' + TARGET + (relWrite.commit ? ' — commit ' + relWrite.commit : ' (no-op, already up to date)'))
+        }
+      }
+    }
+  }
+
   const bp = await agent([
     'Create (or update) the batch integration PR for this run — DO NOT MERGE IT under any circumstances;',
     'a human reviews and merges this PR.',
@@ -4382,8 +4813,8 @@ if (shippedIssues.length) {
 // ---- Report ----
 const resultsJson = JSON.stringify({
   state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts,
-  verification_gaps: VERIFY_SKIPS, tokens_spent: budget.spent(),
-  tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
+  verification_gaps: VERIFY_SKIPS, tokens_spent: spentTokens(),
+  tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, by_stage: TOKEN_AGG.by_stage, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
   merge_auto_resolve: { resolved_count: MERGE_RESOLVE_AGG.resolved_count, resolved_issues: MERGE_RESOLVE_AGG.resolved_issues, thrash_count: MERGE_RESOLVE_AGG.thrash_count, thrash_issues: MERGE_RESOLVE_AGG.thrash_issues },
   consolidation_groups: finalGroups,
   results: results,

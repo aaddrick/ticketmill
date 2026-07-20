@@ -1,0 +1,145 @@
+'use strict'
+
+// Unit tests for issue #35's tightened isBudgetExhaustedError(): a
+// budget/token/ceiling NOUN must now co-occur with an exhaustion/exceedance
+// VERB (exhaust/exceed/deplete/ran out/over/limit-reached) in a caught stage
+// error's message before the whole-run STOP trips. Either alone is not
+// enough — a target repo's own domain error that merely names a budget noun,
+// or merely exceeds something unrelated, must fall through to the ordinary
+// per-attempt retry + recordAgentDeath() path instead of halting the run.
+//
+// Drives both the predicate directly (context.isBudgetExhaustedError(msg))
+// and end-to-end through context.stage() with a scripted throwing agent(),
+// mirroring tests/token-tracking.test.js's harness-driven style.
+
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const harness = require('./harness')
+
+// ---- context.isBudgetExhaustedError(msg): direct predicate ----
+
+test('isBudgetExhaustedError: true-exhaustion message (budget noun + exhaustion verb) returns true and trips STOP', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('token budget exhausted')
+  assert.strictEqual(result, true)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+})
+
+test('isBudgetExhaustedError: domain error with a budget/ceiling noun but no exhaustion verb returns false and leaves STOP untripped', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('the ceiling value for the monthly budget feature is 5')
+  assert.strictEqual(result, false)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+})
+
+test('isBudgetExhaustedError: domain error with an exhaustion verb but no budget/token/ceiling noun returns false and leaves STOP untripped', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('upload exceeded the max file size')
+  assert.strictEqual(result, false)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+})
+
+// Regression case for commit 81ee1cb ("anchor isBudgetExhaustedError's 'over'
+// verb to overrun phrasing"): a budget noun co-occurring with the bare,
+// standalone word "over" (not shaped like overrun/overage/went over/ran
+// over/over budget/over the limit) must NOT trip STOP. Confirmed this string
+// trips the pre-fix bare over(?:run|age)? regex (mutation-tested by reverting
+// just the verb alternation locally) and is exactly the false-positive class
+// the fix commit's own message cites.
+test('isBudgetExhaustedError: domain error with a budget noun and the bare standalone word "over" (not an overrun-shaped phrase) returns false and leaves STOP untripped', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('the budget review is over for this cycle')
+  assert.strictEqual(result, false)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+})
+
+// Distinct from the case above: "over" as a mid-word substring (inside
+// "recover") must never match the \b-bounded verb regex at all, regardless of
+// the overrun-anchoring fix — this pins the word-boundary behavior itself.
+test('isBudgetExhaustedError: domain error with a budget noun and "over" only as a mid-word substring (inside "recover") returns false and leaves STOP untripped', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('failed to recover the budget ledger')
+  assert.strictEqual(result, false)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+})
+
+// Every alternative in hasExhaustionVerb's regex gets its own true-positive
+// case here, each paired with a budget noun. A typo in any one alternative
+// (e.g. "ran\s+out" losing its \s+) would silently disable detection for
+// that phrasing with no other test catching it, since the earlier
+// true-exhaustion case above only exercises the exhaust(ed) family.
+const exhaustionVerbTruePositives = [
+  ['exceed', 'the token ceiling was exceeded'],
+  ['deplete', 'the budget has been depleted'],
+  ['ran out', 'we ran out of budget'],
+  ['overrun', 'budget overrun detected'],
+  ['overage', 'token overage this cycle'],
+  ['went over', 'we went over budget this month'],
+  ['ran over', 'the run ran over the token ceiling'],
+  ['over budget', 'the run is over budget'],
+  ['over the limit', 'token usage is over the limit'],
+  ['limit reached', 'budget limit reached'],
+]
+
+for (const [label, msg] of exhaustionVerbTruePositives) {
+  test('isBudgetExhaustedError: "' + label + '" verb family co-occurring with a budget noun returns true and trips STOP', function () {
+    const context = harness.boot()
+    const result = context.isBudgetExhaustedError(msg)
+    assert.strictEqual(result, true)
+    assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+  })
+}
+
+// ---- context.stage(): harness-driven, scripted throwing agent ----
+
+test('stage(): a true-exhaustion throw trips STOP and returns null on the first throw, without consuming a retry', async function () {
+  const context = harness.boot()
+  let calls = 0
+  harness.installScriptedAgent(context, function () {
+    calls++
+    throw new Error('token budget exhausted')
+  })
+
+  const ctx = harness.makeCtx({ issue: 1 })
+  const r = await context.stage(ctx, 'some-stage', 'do the thing', {}, {})
+
+  assert.strictEqual(r, null)
+  assert.strictEqual(calls, 1, 'a true budget-exhaustion throw must short-circuit the retry loop on the first attempt')
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+})
+
+test('stage(): a false-positive domain error (budget/ceiling noun, no exhaustion verb) is retried STAGE_TRIES times, leaves STOP untripped, and counts as one consecutive death', async function () {
+  const context = harness.boot()
+  const STAGE_TRIES = harness.readGlobal(context, 'STAGE_TRIES')
+  let calls = 0
+  harness.installScriptedAgent(context, function () {
+    calls++
+    throw new Error('the ceiling value for the monthly budget feature is 5')
+  })
+
+  const ctx = harness.makeCtx({ issue: 2 })
+  const r = await context.stage(ctx, 'some-stage', 'do the thing', {}, {})
+
+  assert.strictEqual(r, null)
+  assert.strictEqual(calls, STAGE_TRIES, 'ordinary retry behavior — every attempt gets a fresh scripted call')
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+  assert.strictEqual(harness.readGlobal(context, 'BATCH.consecutiveDeaths'), 1)
+})
+
+test('stage(): a contrarian-recommended domain error (exhaustion verb, no budget/token/ceiling noun) leaves STOP untripped', async function () {
+  const context = harness.boot()
+  const STAGE_TRIES = harness.readGlobal(context, 'STAGE_TRIES')
+  let calls = 0
+  harness.installScriptedAgent(context, function () {
+    calls++
+    throw new Error('upload exceeded the max file size')
+  })
+
+  const ctx = harness.makeCtx({ issue: 3 })
+  const r = await context.stage(ctx, 'some-stage', 'do the thing', {}, {})
+
+  assert.strictEqual(r, null)
+  assert.strictEqual(calls, STAGE_TRIES, 'ordinary retry behavior — an exhaustion-shaped verb alone must not short-circuit the loop')
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+  assert.strictEqual(harness.readGlobal(context, 'BATCH.consecutiveDeaths'), 1)
+})

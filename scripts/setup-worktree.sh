@@ -58,6 +58,8 @@ if [[ -z "$branch" ]]; then
         | sed 's/[^a-z0-9]/-/g; s/-\{2,\}/-/g; s/^-//; s/-$//' \
         | cut -c1-50)
 
+    [[ -z "$slug" ]] && slug="untitled"
+
     branch="issue-${ISSUE_NUMBER}-${slug}"
 fi
 

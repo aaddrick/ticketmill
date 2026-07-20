@@ -36,6 +36,9 @@ every profile field. Show the user the proposal and confirm the load-bearing one
   "logs_dir": "logs/ticketmill",
   "claim_label": "ticketmill",
   "verify_notes": [],
+  "warn_base_branches": [],
+  "consolidation": true,
+  "engine_owned_globs": [],
   "browser": null,
   "models": {},
   "roles": { }
@@ -55,6 +58,15 @@ Field rules:
 - `browser`: OPT-IN. Only propose it for projects with a servable UI AND if the user
   wants live browser verification: `{ "serve_command": "... --port={port}",
   "build_command": null, "ui_globs": [...], "port_base": 8100, "notes": "..." }`.
+  Optional coordination overrides (each defaults to the value shown; only mention
+  them if the user needs to change one): `lock_path` (default
+  `/tmp/ticketmill-browser-lock`, the shared cross-agent browser lock directory),
+  `stale_seconds` (default `1800`, how long before a held lock is considered dead
+  and stolen), `poll_seconds` (default `15`, wait interval between lock-acquire
+  retries), `port_span` (default `900`, the modulus `port_base` is spread over per
+  issue number), and `artifact_dir` (default `/tmp/ticketmill-issue-{issue}`,
+  `{issue}`-templated like `serve_command`'s `{port}`, where browser-verify
+  screenshots/artifacts are written).
 - `lockstep_installed_paths`: only needed when the repo being onboarded keeps an
   installed copy of an engine-owned file in lockstep with a source-of-truth file
   elsewhere in the same repo, kept in sync by the repo's own tooling. List those
@@ -71,6 +83,21 @@ Field rules:
   sets don't otherwise overlap. Leave it `[]` unless the user names such a file;
   propose it only when the stack detection in Step 2 surfaces an obvious
   candidate (e.g. a single central routes/config file every feature touches).
+- `warn_base_branches`: OPTIONAL, default `[]`. Base branch names that should trigger
+  a Select-phase warning when a batch targets one (a signal the run may be pointed at
+  a branch that auto-deploys on push rather than the intended working branch). Leave
+  it `[]` unless the user names CI/CD-trigger branches for this repo (e.g. a
+  `deploy-prod`/`deploy-dev` convention) — never propose a default on your own.
+- `consolidation`: OPTIONAL, default `true`. Leave it `true` unless the user asks to
+  disable the Select-phase consolidation gate that groups issues cheaper to resolve
+  as one unit; set `false` to skip that gate agent call entirely.
+- `engine_owned_globs`: OPTIONAL, default `[]`. Extends the built-in engine-owned
+  path set with repo-specific read-only paths, beyond `lockstep_installed_paths`
+  above. Leave it `[]` unless the user names additional paths a run must never touch.
+- `models`: OPTIONAL, default `{}`. Per-stage model/effort overrides. The valid stage
+  keys are enumerated in the header schema comment of `workflows/ticketmill.js`,
+  adjacent to the `M` map that is their source of truth — do not re-derive or
+  duplicate that list here.
 
 ## Step 3 — Map project agents onto pipeline roles
 

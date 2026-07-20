@@ -52,7 +52,7 @@ flowchart TD
 
     subgraph REP["Report"]
         direction LR
-        RL["Release<br/>held claims"] --> BP["Batch PR to BASE<br/>never auto-merged<br/>Verification Gaps"] --> RO["Run report<br/>JSON + markdown"] --> RT["Retrospective<br/>process-retrospective.md"]
+        RL["Release<br/>held claims"] --> RVB["Release stage<br/>gated: CHANGELOG + version bump"] --> BP["Batch PR to BASE<br/>never auto-merged<br/>Verification Gaps"] --> RO["Run report<br/>JSON + markdown"] --> RT["Retrospective<br/>process-retrospective.md"]
     end
 
     REP -.->|"learnings feed the next run"| NEXT(("next run"))
@@ -85,9 +85,10 @@ untested work behind a green-looking batch PR.
 
 So: no profile, no run. `test_command` must be present as a key; `null` is legal
 only as an explicit decision recorded by mill-init after asking the human. Every
-skipped verification (null tests, missing agents, skipped browser checks) is
-accumulated in `VERIFY_SKIPS` and rendered as a Verification Gaps section in the
-batch PR body, which is the one artifact the reviewing human actually reads.
+skipped verification (null tests, missing agents, skipped browser checks,
+contrarian cap-outs) is accumulated in `VERIFY_SKIPS` and rendered as a
+Verification Gaps section in the batch PR body, which is the one artifact the
+reviewing human actually reads.
 
 ### mill-init owns environment proof
 
@@ -111,8 +112,9 @@ than not running.
 Because the engine now exists as two files that must stay byte-identical
 (`workflows/ticketmill.js`, the source, and `.claude/workflows/ticketmill.js`,
 the copy mill-init drops into target repos), `scripts/lint-engine.js` byte-compares
-them on every test run and fails loud on drift. Edit only the source and copy it
-over the `.claude` copy in the same commit; the two are never meant to diverge.
+them on every test run and fails loud on drift. Edit only the source, then run
+`node scripts/lint-engine.js --fix` in the same commit to copy it verbatim
+over the `.claude` copy; the two are never meant to diverge.
 
 ### Sandbox lint: catching rules `node --check` can't see
 
@@ -168,6 +170,76 @@ same `shippedIssues` set now drives the batch PR's create/update gate, the
 title's issue count, and the "## Consolidated Groups" section as well as the
 Closes lines, so a resumed pass can't rebuild one of those four pieces
 in a way that disagrees with the other three.
+
+### Release stage: batch-level CHANGELOG and version bump, gated
+
+A batch of real engine changes once merged to BASE with the CHANGELOG and
+`.claude-plugin/plugin.json` version left stale (PR #56). Nothing in the
+pipeline ever bumped them; every stage assumed some other stage did. Fixing
+the stale state took a manual repair commit. The Report phase now owns this
+job as its own optional stage, gated on `profile.release`. Left unset (the
+default), the stage never runs and never calls an agent.
+
+`releaseEnabled(profile)` requires an explicit `profile.release.version_files`
+array with at least one entry. Setting it opts a repo in; it names the JSON
+file(s) carrying a top-level `"version"` key, plus an optional `changelog`
+path (default `CHANGELOG.md`) and an optional `bump` override
+(`"major"|"minor"|"patch"`). `version_files` should name only the canonical
+copy: a path also listed in `profile.lockstep_installed_paths` has its own
+mirroring tooling keeping it in sync, so bumping it here too would just fight
+that sync. `marketplace.json` carries no version field of its own and should
+never be listed.
+
+The stage runs once per batch, immediately before the batch-PR agent, and
+only when `shippedIssues.length` is nonzero. Running it there rather than
+per-issue is deliberate: a batch-level bump lands inside the human-reviewed
+TARGET -> BASE diff by construction, instead of scattering version churn
+across every per-issue PR that merges into the batch branch.
+
+**BASE-anchored derivation, never TARGET.** `deriveReleaseVersion(baseVersion,
+commitTypes, profile)` computes the next version from the version currently
+committed on `origin/BASE`, read by a read-only probe agent, never from
+`origin/TARGET`. A resumed or healing Report pass recomputes the identical
+next version instead of bumping a version TARGET already carries from an
+earlier pass. `commitTypes` comes from the batch's own commit log
+(`git log BASE..TARGET --pretty=%s`); any `feat` prefix shipped bumps minor,
+otherwise the bump is patch, unless `profile.release.bump` overrides it. A
+non-semver `baseVersion` makes the function throw, and the call site treats
+that as a non-fatal, logged skip rather than failing the run.
+
+**Idempotent CHANGELOG anchor.** `releaseChangelogAnchor(version, runTag)`
+builds the one heading the write agent looks for and regenerates in place:
+`## [<version>] - <runTag>`. It's anchored to the computed version and the
+run's fixed `RUN_TAG`, never to a wall-clock date, so calling it twice with
+the same batch produces the same string even if the second call happens after
+midnight. A prior pass's draft section gets its body replaced, not
+duplicated.
+
+**Ephemeral worktree, root never touched.** The write agent runs the
+`doc_writer` persona in a fresh `git worktree add` checked out from
+`origin/TARGET`, bumps the version file(s), regenerates the CHANGELOG
+section, commits, and pushes back to TARGET. `ROOT` itself is never checked
+out or mutated, and the worktree is removed in a `finally` block regardless
+of whether the write agent succeeded, so a dead agent can't leave it behind.
+A push failure is logged and pushed onto `VERIFY_SKIPS` rather than retried
+or treated as fatal: the commit still exists locally-to-the-worktree-run and
+can be pushed by hand before the batch PR merges.
+
+**Known collision, not corruption.** Two batch PRs open concurrently against
+the same BASE both compute BASE-plus-bump to the same next version, and
+collide on the version file and CHANGELOG section at the second human merge.
+That surfaces as an ordinary git conflict at the human merge gate. Manual
+version bumps carried the same exposure already; this stage doesn't add a
+new failure mode.
+
+**Adopting this repo's own profile is a follow-up, not part of this
+change.** `.claude/ticketmill.json` is engine-owned and out of this issue's
+scope, so `profile.release` here stays unset for now. Two agent charters
+still describe per-issue release discipline (`.claude/agents/
+ticketmill-implementer.md` and `ticketmill-code-reviewer.md`, both
+engine-owned) and will need realignment once this repo's own profile turns
+the stage on: an implementer should stop bumping per-issue, and the code
+reviewer should stop flagging a per-issue PR for a missing bump.
 
 ### Merge auto-resolve: one mechanical recovery attempt before needs_human
 
@@ -328,6 +400,27 @@ otherwise-green issue.
 | Claim protocol with label-safety rules | A claim agent once replaced an issue's full label set |
 | Browser lock (mkdir + owner + stale-steal) | Concurrent agents hijacked each other's browser tabs |
 | Degrade windows + circuit breakers | Distinguish one flaky stage from a systemic failure worth stopping for |
+| `isBudgetExhaustedError` noun+verb match | A bare keyword sweep on "budget"/"ceiling" matched a target repo's own domain errors, misreporting an ordinary agent death as token exhaustion and halting every remaining issue |
+| `COMMIT_SHA_ASK` guard | Twice, an agent typed a fabricated or shortened commit SHA into a posted comment instead of reading the real one, requiring a fixup edit |
+| `VERIFY_SKIPS` entry on a contrarian cap-out | An approach or plan gate's cap-out reached only `ctx.unresolved`, never the batch PR's Verification Gaps section, so a caveat worth a human's attention could ship and merge unseen |
+| Report-phase release stage (`releaseEnabled`, `deriveReleaseVersion`) | A batch of real engine changes (PR #56) merged with the CHANGELOG and version file left stale, because the pipeline had always assumed some later stage bumped them and no stage ever did |
+
+### Commit SHA integrity: read it, don't recall it
+
+Every stage prompt that asks an agent to post a comment with a commit SHA
+appends `COMMIT_SHA_ASK`. It tells the agent to run
+`git -C <worktree> log -1 --format=%H` and paste that output exactly, with
+no edits. The instruction rules out typing, shortening, guessing, or
+recalling a SHA from memory.
+
+The rule exists because agents did exactly that. Twice, a posted comment
+carried a SHA the agent invented rather than one it read from git, and a
+later stage had to post a fixup comment with the correct value.
+
+`COMMIT_SHA_ASK` is declared once and reused across eight stage prompts:
+simplify, quality fix, browser fix, test fix, test quality fix, task
+implementation, task review fix, and PR review fix. Sharing one constant
+keeps the wording in sync across all of them if it changes later.
 
 ### Model policy
 
@@ -335,6 +428,31 @@ Judgment gates (evaluate, plan, contrarian challenges, final code review) defaul
 to opus at high effort; workhorse implementation and reviews run sonnet;
 mechanical probes and the test runner are haiku at low effort. Override any stage
 via `profile.models`.
+
+### Contrarian cap depth is profile-configurable, and cap-outs are never silent
+
+`MAX_CONTRARIAN_ITERATIONS` was a hardcoded `3`. It's now a `let`, defaulting
+to `3` but overridable per repo through the optional
+`profile.contrarian_max_iterations` (any integer >= 1, validated at Select
+time and rejected otherwise). A repo whose issues run deep and contentious
+can raise the ceiling. One that wants faster turnaround can lower it.
+
+A trivial-complexity issue never gets the full ceiling, whatever the profile
+sets. `contrarianCapFor(complexity)` floors its per-gate cap at
+`Math.min(2, MAX_CONTRARIAN_ITERATIONS)`. A docs-only fix shouldn't burn opus
+time re-litigating a settled call, and a profile that drops the ceiling
+below 2 tightens trivial issues along with everything else. The function is
+pure and declared above the harness split marker, so tests exercise it
+directly instead of seeding module state.
+
+Hitting the cap on the approach or plan gate still lets the issue proceed
+with the gate's unresolved caveats, the same fallback the engine has always
+used. That cap-out now also pushes an entry onto `VERIFY_SKIPS`. Previously
+it landed only in `ctx.unresolved`, which feeds the first implementation
+task's prompt but never reaches the batch PR body. A caveat worth a human's
+attention could ship, merge, and never appear in the one artifact a reviewer
+actually reads. Every cap-out on either gate now lands in the batch PR's
+Verification Gaps section beside the other skipped-verification kinds.
 
 ### Token tracking: instrumentation, never a gate
 
@@ -347,23 +465,85 @@ outright, can never change `stage()`'s retry, STOP, or return behavior. This
 is instrumentation, not a gate: a run with no working counter still ships,
 just with "not tracked" standing in for the numbers instead of a false zero.
 
-`aggregateTokens(results, spent, concurrency)` turns those per-issue deltas
-into a "## Token Usage" section in plain JS. The pipeline injects the finished
-markdown into the batch PR and run report prompts verbatim, so no subagent is
-ever asked to sum or double-check the arithmetic. At concurrency 1, stage
-deltas can't overlap, so they're an exact partition of the run: an
-"orchestration/unattributed" remainder row (`spent` minus the summed deltas)
-makes the table reconcile exactly to the run total. Above concurrency 1,
-several issues' stages run against the same shared monotonic counter, and
-`agent()` returns schema content only, never a per-call usage figure. There is
-no way to split a shared counter's movement across concurrent callers, so the
-whole breakdown is labeled approximate rather than claiming a precision it
-doesn't have. Per-issue PR bodies get one line of the same figures (that
-issue's stages only, not the run total).
+Not every token spend has a `ctx` to attribute to. Preflight's learnings
+read, the claims Promise.all, and the Select-phase consolidation gate
+(`proposeConsolidation()` and `postConsolidationMarkers()`) all run before or
+between per-issue stages, outside any issue's context. `STAGE_TOKENS` (a
+`{ preflight, select }` map) and its `addStage(bucket, before)` helper
+bracket those four run-body regions the same way `stage()` brackets a retry
+loop: sample `spentTokens()` immediately before the region, then again right
+after, and accumulate the guarded delta. `addStage()` runs in its own
+try/catch, so a tracking failure there can't touch run-body control flow
+either. Every bracketed region sits strictly before `runPool()`, the only
+concurrent region in the engine, so these deltas stay exact regardless of
+`CONCURRENCY` even when the per-issue breakdown below them doesn't.
+
+`aggregateTokens(results, spent, concurrency, byStage)` turns the per-issue
+deltas, plus that `STAGE_TOKENS` map, into a "## Token Usage" section in plain
+JS. The pipeline injects the finished markdown into the batch PR and run
+report prompts verbatim, so no subagent is ever asked to sum or double-check
+the arithmetic. `byStage` is optional and defaults to `{}`, so 3-arg callers
+still work; each nonzero bucket folds into the running sum exactly once and
+renders as its own labeled row ("preflight (orchestration)", "select-phase
+(orchestration)"), never silently absorbed into the remainder row below it.
+
+Only the per-issue rows are affected by concurrency. At concurrency 1, an
+issue's stage deltas can't overlap, so they're an exact partition of that
+issue's run: `reconciles: true` when `spent` and some tracked data both
+exist. Above concurrency 1, several issues' stages run against the same
+shared monotonic counter, and `agent()` returns schema content only, never a
+per-call usage figure. There is no way to split a shared counter's movement
+across concurrent callers, so the per-issue rows over-count and the whole
+breakdown is labeled approximate (`reconciles: false`) rather than claiming a
+precision it doesn't have. The `STAGE_TOKENS` rows stay exact even then,
+since they're sampled outside the concurrent pool; only the per-issue rows
+above them over-count.
+
+The "orchestration/unattributed" remainder row (`spent` minus the summed
+per-issue and stage deltas, floored at 0) renders whenever `budget.spent()`
+is available at all, not only when the table reconciles. A Quality Review
+finding caught the earlier version hiding this: a resumed run where no
+per-issue row and no stage bucket ever attributed a delta, but
+`budget.spent()` was still a real nonzero number, fell through to "Per-issue
+/ per-model breakdown: not tracked" while the "Run total" line above it still
+showed the true spend — the table and the summary line disagreed. The
+remainder row now carries that full, otherwise-invisible spend instead, and
+the breakdown renders (with per-issue cells reading "not tracked") as long as
+either `spent` or a stage/per-issue delta is available. Per-issue PR bodies
+get one line of the same figures (that issue's stages only, not the run
+total or the stage buckets).
 
 Tokens only, never dollars: price varies by model and shifts over time, so no
 currency figure appears anywhere in the engine, profile, or output. The
 per-model-tier breakdown is what lets a human run that math outside the tool.
+
+### Budget-exhaustion detection: a noun+verb match, not a keyword sweep
+
+`isBudgetExhaustedError(msg)` decides what a caught stage error means: real
+runtime token exhaustion, which trips the whole-run `tripStop()`, or an
+ordinary per-attempt death, which retries and then falls through to
+`recordAgentDeath()`. It used to fire on a bare keyword sweep: any message
+containing "budget", "token target", or "ceiling" tripped the whole run.
+That caught more than exhaustion. A target repo's own domain error, a
+"budget" feature or a "ceiling" config value, matched the same sweep with
+nothing to do with tokens. An ordinary agent death got misreported as
+exhaustion, and the whole batch halted with every remaining issue left
+unstarted.
+
+The check now requires a budget/token/ceiling noun to co-occur with an
+exhaustion-shaped verb: exhaust, exceed, deplete, ran out, overrun/overage,
+went over, ran over, over budget, over the limit, or limit reached. Either
+alone isn't enough. The "over" family is anchored to those overrun-shaped
+phrases rather than the bare word "over", which turns up in ordinary prose
+("budget review is over") without meaning exhaustion.
+
+Anchoring to the runtime's exact exhaustion error string was rejected: that
+text isn't documented anywhere accessible, and the runtime's budget object
+exposes only `.spent()`, no `.remaining()` and no structured error field. A
+wrong guess would silently disable real exhaustion detection, so the match
+stays semantic instead. `recordAgentDeath()`'s existing three-consecutive-
+death circuit breaker is the backstop for any true exhaustion the tightened
+match still misses.
 
 ### Claims interop
 

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.29 (2026-07-20)
+
+- Release stage (#57): the pipeline used to defer the CHANGELOG entry and
+  `.claude-plugin/plugin.json` version bump to "the docblocks/PR-consolidation
+  stage," but no stage ever actually performed it — Batch 2026-07-19-e (PR
+  #56) merged real engine changes to main with the version and CHANGELOG left
+  stale, requiring a manual repair commit (v0.1.28). Adds an OPTIONAL,
+  profile-gated `release` field (`version_files`, `changelog`, `bump`)
+  and a Report-phase batch release stage that runs once per batch, before the
+  batch-PR agent, so the bump lands inside the human-reviewed diff by
+  construction. The stage regenerates a single CHANGELOG section in place
+  (idempotent across resumes) and bumps the configured version file(s) in an
+  ephemeral `git worktree` — the run root is never mutated, and a push
+  failure is non-fatal-but-logged. The `release` field is defined in the
+  engine; activating it in this repo's own `.claude/ticketmill.json` was
+  attempted, then deferred/reverted per the engine-owned-paths scope guard
+  (`.claude/ticketmill.json` is out of scope for this issue), so profile
+  activation is a follow-up. The new stage will not fire for this batch
+  regardless, since the running engine at the run root predates it — so
+  this entry and the version bump (0.1.28 -> 0.1.29) are done by hand this
+  one time.
+
+  Deferred follow-up (out of scope for this issue): `.claude/agents/
+  ticketmill-implementer.md` and `ticketmill-code-reviewer.md` still read as
+  if release discipline were per-issue ("every change updates CHANGELOG.md
+  and bumps the version... with a conventional commit"). Now that the bump is
+  batch-level and owned by the Report-phase release stage, both charters need
+  realignment: implementers should not bump per-issue, and the code reviewer
+  should not flag a per-issue PR for a missing bump. `.claude/agents/**` is
+  engine-owned and out of scope for this issue.
+
 ## 0.1.28 (2026-07-19)
 
 Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
