@@ -114,7 +114,7 @@ test('aggregateTokens: results with no .tokens field at all (skipped/not_started
   for (const row of untracked) {
     assert.strictEqual(row.total, null)
     assert.strictEqual(row.tracked, false)
-    assert.strictEqual(Object.keys(row.byModel).length, 0)
+    assert.strictEqual(Object.keys(row.by_model).length, 0)
   }
   assert.ok(agg.markdown.includes('| #2 | not tracked | not tracked |'))
   assert.ok(agg.markdown.includes('| #3 | not tracked | not tracked |'))
