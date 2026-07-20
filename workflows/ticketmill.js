@@ -3911,7 +3911,8 @@ if (referencedAgents.length) {
 // Timestamp comes from a `date` probe (Date.now() is unavailable in workflow
 // scripts), which also makes the name resume-stable: journal replay returns the
 // cached branch. Dry runs never create the branch.
-if (BASE === 'deploy-prod' || BASE === 'deploy-dev') log('WARNING: base branch "' + BASE + '" looks like a CI/CD trigger branch. PRs normally target the working branch.')
+const WARN_BASE_BRANCHES = Array.isArray(PROFILE.warn_base_branches) ? PROFILE.warn_base_branches.map(String) : []
+if (WARN_BASE_BRANCHES.indexOf(BASE) !== -1) log('WARNING: base branch "' + BASE + '" looks like a CI/CD trigger branch. PRs normally target the working branch.')
 if (!TARGET) {
   if (DRY_RUN) {
     TARGET = BASE // read-only probes only; noted in the dry-run output
