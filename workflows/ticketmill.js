@@ -793,6 +793,18 @@ function batchClosesIssues(results) {
   return out
 }
 
+// resolveIssueNumbers (issue #33): normalizes args.issues into deduped positive
+// integers in first-seen order. Without this, a repeated issue number (typo or a
+// stale resume command passing issues:[701,701]) survives the old inline
+// map(Number).filter(n>0) untouched and produces two preflights/claims/processIssue
+// units racing on the same worktree/branch for the same issue. Only the explicit
+// A.issues path needs this: the A.labels path lists issues via `gh issue list`,
+// which cannot return the same number twice. Pure and placed above the
+// TICKETMILL-TEST-HARNESS-SPLIT marker so tests/harness.js can drive it directly.
+function resolveIssueNumbers(raw) {
+  return [...new Set((Array.isArray(raw) ? raw : []).map(Number).filter(function (n) { return n > 0 }))]
+}
+
 // worktreeAnchor: the issue number passed to setup-worktree.sh as the physical
 // worktree/branch anchor. A group's worktree/branch/PR identity is bound to its
 // STABLE groupId (the lowest issue number ever proposed as a member — see
@@ -3912,8 +3924,7 @@ log('ticketmill: root=' + ROOT + ' repo=' + REPO + ' base=' + BASE + ' target=' 
 // ---- Select: resolve the issue list ----
 let issueList = []
 if (Array.isArray(A.issues) && A.issues.length) {
-  issueList = A.issues.map(Number).filter(function (n) { return n > 0 })
-    .map(function (n) { return { number: n, title: '' } })
+  issueList = resolveIssueNumbers(A.issues).map(function (n) { return { number: n, title: '' } })
 } else if (Array.isArray(A.labels) && A.labels.length) {
   const labelFlags = A.labels.map(function (l) { return '--label "' + String(l).replace(/"/g, '') + '"' }).join(' ')
   const sel = await agent([
