@@ -85,9 +85,10 @@ untested work behind a green-looking batch PR.
 
 So: no profile, no run. `test_command` must be present as a key; `null` is legal
 only as an explicit decision recorded by mill-init after asking the human. Every
-skipped verification (null tests, missing agents, skipped browser checks) is
-accumulated in `VERIFY_SKIPS` and rendered as a Verification Gaps section in the
-batch PR body, which is the one artifact the reviewing human actually reads.
+skipped verification (null tests, missing agents, skipped browser checks,
+contrarian cap-outs) is accumulated in `VERIFY_SKIPS` and rendered as a
+Verification Gaps section in the batch PR body, which is the one artifact the
+reviewing human actually reads.
 
 ### mill-init owns environment proof
 
@@ -331,6 +332,7 @@ otherwise-green issue.
 | Degrade windows + circuit breakers | Distinguish one flaky stage from a systemic failure worth stopping for |
 | `isBudgetExhaustedError` noun+verb match | A bare keyword sweep on "budget"/"ceiling" matched a target repo's own domain errors, misreporting an ordinary agent death as token exhaustion and halting every remaining issue |
 | `COMMIT_SHA_ASK` guard | Twice, an agent typed a fabricated or shortened commit SHA into a posted comment instead of reading the real one, requiring a fixup edit |
+| `VERIFY_SKIPS` entry on a contrarian cap-out | An approach or plan gate's cap-out reached only `ctx.unresolved`, never the batch PR's Verification Gaps section, so a caveat worth a human's attention could ship and merge unseen |
 
 ### Commit SHA integrity: read it, don't recall it
 
@@ -355,6 +357,31 @@ Judgment gates (evaluate, plan, contrarian challenges, final code review) defaul
 to opus at high effort; workhorse implementation and reviews run sonnet;
 mechanical probes and the test runner are haiku at low effort. Override any stage
 via `profile.models`.
+
+### Contrarian cap depth is profile-configurable, and cap-outs are never silent
+
+`MAX_CONTRARIAN_ITERATIONS` was a hardcoded `3`. It's now a `let`, defaulting
+to `3` but overridable per repo through the optional
+`profile.contrarian_max_iterations` (any integer >= 1, validated at Select
+time and rejected otherwise). A repo whose issues run deep and contentious
+can raise the ceiling. One that wants faster turnaround can lower it.
+
+A trivial-complexity issue never gets the full ceiling, whatever the profile
+sets. `contrarianCapFor(complexity)` floors its per-gate cap at
+`Math.min(2, MAX_CONTRARIAN_ITERATIONS)`. A docs-only fix shouldn't burn opus
+time re-litigating a settled call, and a profile that drops the ceiling
+below 2 tightens trivial issues along with everything else. The function is
+pure and declared above the harness split marker, so tests exercise it
+directly instead of seeding module state.
+
+Hitting the cap on the approach or plan gate still lets the issue proceed
+with the gate's unresolved caveats, the same fallback the engine has always
+used. That cap-out now also pushes an entry onto `VERIFY_SKIPS`. Previously
+it landed only in `ctx.unresolved`, which feeds the first implementation
+task's prompt but never reaches the batch PR body. A caveat worth a human's
+attention could ship, merge, and never appear in the one artifact a reviewer
+actually reads. Every cap-out on either gate now lands in the batch PR's
+Verification Gaps section beside the other skipped-verification kinds.
 
 ### Token tracking: instrumentation, never a gate
 
