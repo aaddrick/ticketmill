@@ -1270,6 +1270,13 @@ function applyRealRunCollapseGuard(units, lanes, concurrency, serializeGlobs) {
 // ----- batch state -----
 const STOP = { tripped: false, reason: '' }
 const BATCH = { failures: 0, consecutiveDeaths: 0 }
+// STAGE_TOKENS: region-boundary token buckets for Select-phase orchestration
+// spend that has no per-issue ctx to attribute to (see aggregateTokens' byStage
+// param above). Populated by addStage() (below, near spentTokens()) bracketing
+// four run-body regions — never inside runPool(), the only concurrent region,
+// so every addStage() delta is exact regardless of CONCURRENCY. Plain literal,
+// sandbox-safe (mirrors STOP/BATCH here, not a class).
+const STAGE_TOKENS = { preflight: 0, select: 0 }
 let LEARN = null // category digests distilled from process-retrospective.md (Select phase)
 
 function tripStop(reason) {
@@ -1323,6 +1330,27 @@ function spentTokens() {
     return isFiniteNumber(v) ? v : null
   } catch (e) {
     return null
+  }
+}
+
+// addStage: DRY region-boundary bracketing helper for STAGE_TOKENS (above).
+// Callers sample `before = spentTokens()` immediately before a sequential
+// run-body region, then call addStage(bucket, before) immediately after —
+// this reads `after = spentTokens()` and accumulates a guarded
+// Math.max(0, after - before) into STAGE_TOKENS[bucket]. Isolated in its own
+// try/catch, mirroring stage()'s finally block below, so a tracking failure
+// (e.g. budget.spent() misbehaving) can never affect run-body control flow.
+// Exact regardless of CONCURRENCY as long as the bracketed region itself never
+// overlaps runPool() (the only concurrent region) — every call site below is
+// sequential, strictly before runPool() drains.
+function addStage(bucket, before) {
+  try {
+    const after = spentTokens()
+    if (isFiniteNumber(before) && isFiniteNumber(after)) {
+      STAGE_TOKENS[bucket] += Math.max(0, after - before)
+    }
+  } catch (e) {
+    // never let tracking failures affect run-body control flow
   }
 }
 
@@ -1526,29 +1554,53 @@ function timeline(ctx) {
   })
 }
 
-// Pure aggregation of per-issue/per-stage token deltas into per-issue and
-// per-model subtotals, plus a finished markdown "## Token Usage" section — all
-// math done here in JS, never delegated to an LLM. Takes no globals; harness-
-// testable in isolation.
+// Display labels for aggregateTokens' 4th (byStage) param's known keys — the
+// STAGE_TOKENS region-boundary buckets (preflight/select-phase orchestration
+// spend, sampled outside the per-issue pool — see STAGE_TOKENS). An unknown
+// key still renders (key + ' (orchestration)'), so a future bucket doesn't
+// silently vanish from the table just because this map wasn't updated.
+const STAGE_LABELS = { preflight: 'preflight (orchestration)', select: 'select-phase (orchestration)' }
+
+// Pure aggregation of per-issue/per-stage token deltas into per-issue,
+// per-model, and per-stage subtotals, plus a finished markdown "## Token
+// Usage" section — all math done here in JS, never delegated to an LLM.
+// Takes no globals; harness-testable in isolation.
 //   results      - the run's per-issue result array. Entries lacking a `.tokens`
 //                  field entirely (skipped/not_started — never got a ctx) or
 //                  carrying `.tokens.tracked === false` (ctx existed but no stage
 //                  ever sampled a usable budget.spent() pair) both render
 //                  "not tracked", never a false zero.
 //   spent        - the guarded, run-wide budget.spent() total (Number or null).
-//   concurrency  - CONCURRENCY. Selects the reconciliation story:
-//     === 1: stage deltas cannot overlap, so they're an exact partition of the
-//       run; an "orchestration/unattributed" remainder row (max(0, spent - sum
-//       of deltas)) is appended so the table sums exactly to `spent`
-//       (reconciles: true).
+//   concurrency  - CONCURRENCY. Only per-issue rows are affected by it:
+//     === 1: per-issue stage deltas cannot overlap, so they're an exact
+//       partition of that portion of the run (reconciles: true, given spent
+//       and some tracked data).
 //     > 1: multiple issues' stages run side by side against ONE shared
 //       monotonic counter — agent() returns schema content only, never a
 //       per-call usage figure, so there is no way to split budget.spent()'s
 //       movement between concurrent callers. Overlapping stages each see (and
-//       get attributed) the same movement, so deltas over-count and the whole
-//       breakdown is labelled approximate (reconciles: false).
-function aggregateTokens(results, spent, concurrency) {
+//       get attributed) the same movement, so per-issue deltas over-count and
+//       the whole breakdown is labelled approximate (reconciles: false).
+//   byStage      - optional (normalizes to {}, so existing 3-arg callers are
+//                  unaffected): a flat { preflight, select, ... } map of
+//                  region-bracketed orchestration spend sampled OUTSIDE the
+//                  concurrent per-issue pool (see STAGE_TOKENS), so it's exact
+//                  regardless of `concurrency`. Every nonzero bucket folds
+//                  into sumDeltas exactly once and renders as its own labeled
+//                  row (STAGE_LABELS) — never absorbed silently into the
+//                  remainder below, and never double-counted by it. A run
+//                  where every per-issue result is untracked but the stage
+//                  buckets are populated (e.g. a resumed run) still counts as
+//                  "tracked" and still renders a breakdown, via anyStage.
+// remainder (whatever budget.spent() counted that no per-issue row or stage
+// bucket attributed — max(0, spent - sumDeltas)) is computed and rendered as
+// its own "orchestration/unattributed" row whenever `spent` is available,
+// regardless of concurrency/reconciles — including the approximate
+// concurrency>1 case, so that spend is never left implicit — since the stage
+// buckets are already folded into sumDeltas, it is never double-counted.
+function aggregateTokens(results, spent, concurrency, byStage) {
   const list = results || []
+  const stages = byStage || {}
   const byIssue = []
   const byModel = {}
   let sumDeltas = 0
@@ -1570,14 +1622,31 @@ function aggregateTokens(results, spent, concurrency) {
     }
   }
 
+  // Stage buckets fold into sumDeltas exactly once (below) so the remainder
+  // row never double-counts them; zero-valued buckets are kept in by_stage
+  // (the returned JSON) but omitted from the rendered table rows.
+  const byStageOut = {}
+  const stageRows = []
+  for (const key in stages) {
+    if (!Object.prototype.hasOwnProperty.call(stages, key)) continue
+    const v = stages[key] || 0
+    byStageOut[key] = v
+    if (v) {
+      sumDeltas += v
+      stageRows.push({ label: STAGE_LABELS[key] || (key + ' (orchestration)'), total: v })
+    }
+  }
+  const anyStage = stageRows.length > 0
+
   const hasSpent = isFiniteNumber(spent)
   // run_total must agree with the markdown's "Run total" line, which only ever
   // renders the guarded budget.spent() figure or "not tracked" — never a
   // sumDeltas fallback (see CHANGELOG for the Quality Review finding this fixes).
   const runTotal = hasSpent ? spent : null
-  const tracked = anyTracked || hasSpent
-  const reconciles = concurrency === 1 && hasSpent && anyTracked
-  const remainder = reconciles ? Math.max(0, spent - sumDeltas) : null
+  const trackedAny = anyTracked || anyStage
+  const tracked = trackedAny || hasSpent
+  const reconciles = concurrency === 1 && hasSpent && trackedAny
+  const remainder = hasSpent ? Math.max(0, spent - sumDeltas) : null
   const models = Object.keys(byModel).sort()
 
   const lines = []
@@ -1588,13 +1657,23 @@ function aggregateTokens(results, spent, concurrency) {
     : 'Run total: not tracked (budget.spent() unavailable this run)')
   lines.push('')
 
-  if (!anyTracked) {
+  if (!tracked) {
     lines.push('Per-issue / per-model breakdown: not tracked (no stage in this run reported a usable token delta).')
   } else {
-    if (concurrency > 1) {
+    if (!trackedAny) {
+      // hasSpent is true here (tracked === trackedAny || hasSpent, trackedAny is
+      // false) but no per-issue row or stage bucket attributed any of it — the
+      // degenerate case this fix closes. Still render the table (all rows "not
+      // tracked") so the remainder row below carries the full run total instead
+      // of it vanishing into a "not tracked" line that contradicts "Run total: N".
+      lines.push('_no per-issue or stage data attributed any spend this run — the "orchestration/unattributed" row ' +
+        'below carries the full run total instead of leaving it implicit._')
+    } else if (concurrency > 1) {
       lines.push('_approximate - overlapping concurrent stages over-count and do NOT reconcile to the run total._')
       lines.push('(A single shared monotonic counter cannot be split per concurrent call — agent() returns schema ' +
-        'content only, no per-call usage — so simultaneous issues each see the same counter movement.)')
+        'content only, no per-call usage — so simultaneous issues each see the same counter movement. The stage ' +
+        'rows below are exact even so — they are sampled outside the concurrent per-issue pool — only the ' +
+        'per-issue rows above them over-count.)')
     } else if (reconciles) {
       lines.push('_Reconciles exactly to the run total above — the "orchestration/unattributed" row below absorbs ' +
         'whatever budget.spent() counted that no stage attributed._')
@@ -1613,12 +1692,16 @@ function aggregateTokens(results, spent, concurrency) {
       cells.push(row.tracked ? String(row.total) : 'not tracked')
       lines.push('| ' + cells.join(' | ') + ' |')
     }
-    if (reconciles) {
+    for (const sr of stageRows) {
+      const cells = [sr.label].concat(models.map(function () { return '' })).concat([String(sr.total)])
+      lines.push('| ' + cells.join(' | ') + ' |')
+    }
+    if (hasSpent) {
       const remCells = ['orchestration/unattributed'].concat(models.map(function () { return '' })).concat([String(remainder)])
       lines.push('| ' + remCells.join(' | ') + ' |')
     }
     const totalCells = ['**Total**'].concat(models.map(function (m) { return '**' + byModel[m] + '**' }))
-    totalCells.push('**' + (reconciles ? spent : sumDeltas) + '**')
+    totalCells.push('**' + (hasSpent ? spent : sumDeltas) + '**')
     lines.push('| ' + totalCells.join(' | ') + ' |')
   }
 
@@ -1626,6 +1709,8 @@ function aggregateTokens(results, spent, concurrency) {
     run_total: runTotal,
     by_issue: byIssue,
     by_model: byModel,
+    by_stage: byStageOut,
+    remainder: remainder,
     tracked: tracked,
     reconciles: reconciles,
     markdown: lines.join('\n'),
@@ -3979,6 +4064,12 @@ log('Selected ' + issueList.length + ' issue(s): ' + issueList.map(function (i) 
 // so it runs concurrently with the probes). Category sections are injected into
 // stage prompts: plan gets agent_selection+workflow, contrarians get
 // quality_loop+performance, test stages get test_loop.
+// STAGE_TOKENS.preflight R1: brackets the whole region from just before
+// learnPromise fires to just after it is awaited below — this deliberately
+// spans (never sub-brackets) the fire-and-forget learnPromise itself, plus
+// targetFetch and the preflight Promise.all in between, all of which run
+// strictly sequentially before runPool() (see addStage()'s module comment).
+const preflightR1Before = spentTokens()
 const learnPromise = agent([
   'Read ' + LOGS + '/process-retrospective.md (READ-ONLY).',
   'If the file does not exist, return found=false with all categories as empty strings.',
@@ -4093,6 +4184,7 @@ preflights = engineSkip.preflights
 if (engineSkip.flagged.length) log('engine-owned guardrail: root working tree dirty under an engine-owned path targeted by issue(s) ' + engineSkip.flagged.join(', ') + ' — routed to select-skip (regime a)')
 
 const learnR = await learnPromise
+addStage('preflight', preflightR1Before) // STAGE_TOKENS.preflight R1 close — see the bracket comment above learnPromise
 if (learnR && learnR.found) {
   LEARN = learnR
   log('prior-run learnings digested: ' + ['agent_selection', 'quality_loop', 'test_loop', 'performance', 'error_patterns', 'workflow']
@@ -4121,7 +4213,14 @@ if (learnR && learnR.found) {
 // under DRY_RUN: the marker-heal and opus proposal both run (gh reads only); the
 // comment-posting contrarian challenge is skipped entirely.
 const consolidationCandidates = preflights
+// STAGE_TOKENS.select sub-bracket 1: the whole proposeConsolidation() call
+// (internally sequential — propose/revise/challenge) has no per-issue ctx to
+// attribute its spend to, hence the synthetic .select bucket (see the
+// STAGE_TOKENS module comment). Runs under DRY_RUN too (read-only there), but
+// aggregateTokens() never runs on a dry run, so the partial bucket never renders.
+const selectBefore1 = spentTokens()
 const consolidationMap = await proposeConsolidation(consolidationCandidates)
+addStage('select', selectBefore1)
 
 if (DRY_RUN) {
   // ---- lane-scheduling preview (issue #1) — read-only, mirrors the real-run
@@ -4225,6 +4324,10 @@ if (DRY_RUN) {
 const toClaim = preflights.filter(function (p) { return p.resume_point !== 'skip' })
 const HELD_CLAIMS = [] // issues this run successfully claimed — released at Report
 if (toClaim.length) {
+  // STAGE_TOKENS.preflight R2: brackets the claims Promise.all and its settle
+  // loop below — real-run only (DRY_RUN already returned above), sequential,
+  // strictly before runPool() — see the STAGE_TOKENS module comment.
+  const preflightR2Before = spentTokens()
   const claims = await Promise.all(toClaim.map(function (p) {
     return agent([
       'Claim GitHub issue #' + p.issue + ' of ' + REPO + ' for this ticketmill run (batch branch: ' + TARGET + ', run tag: ' + RUN_TAG + ').',
@@ -4266,6 +4369,7 @@ if (toClaim.length) {
       if (c.reason && /died/.test(c.reason)) log('#' + c.issue + ' claim: ' + c.reason)
     }
   }
+  addStage('preflight', preflightR2Before) // STAGE_TOKENS.preflight R2 close — see the bracket comment above
   log('claims: ' + HELD_CLAIMS.length + '/' + toClaim.length + ' held by this run')
 }
 
@@ -4293,7 +4397,14 @@ if (groupUnitCount) log('consolidation: ' + groupUnitCount + ' group unit(s) mat
 // earlier could name a member that never actually joins the live unit). DRY_RUN
 // already returned above, so this line is only ever reached for a real run — the
 // explicit guard documents that no marker is ever posted for a preview.
-if (!DRY_RUN) await postConsolidationMarkers(units)
+// STAGE_TOKENS.select sub-bracket 2: postConsolidationMarkers, real-run only
+// (the guard above is already redundant with the DRY_RUN early-return, but
+// kept explicit here too) — see the STAGE_TOKENS module comment.
+if (!DRY_RUN) {
+  const selectBefore2 = spentTokens()
+  await postConsolidationMarkers(units)
+  addStage('select', selectBefore2)
+}
 
 // ---- Process: lane scheduling (issue #1) — group `units` into lanes that must
 // run serially (predicted-file overlap, a serialize_globs pattern hit, or a
@@ -4362,7 +4473,7 @@ if (HELD_CLAIMS.length) {
 }
 
 // ---- Token usage: JS-computed aggregation (no LLM math), injected verbatim below ----
-const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY)
+const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY, STAGE_TOKENS)
 
 // ---- Merge auto-resolution: JS-computed run-level rollup, injected verbatim below ----
 const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
@@ -4427,7 +4538,7 @@ if (shippedIssues.length) {
 const resultsJson = JSON.stringify({
   state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts,
   verification_gaps: VERIFY_SKIPS, tokens_spent: spentTokens(),
-  tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
+  tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, by_stage: TOKEN_AGG.by_stage, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
   merge_auto_resolve: { resolved_count: MERGE_RESOLVE_AGG.resolved_count, resolved_issues: MERGE_RESOLVE_AGG.resolved_issues, thrash_count: MERGE_RESOLVE_AGG.thrash_count, thrash_issues: MERGE_RESOLVE_AGG.thrash_issues },
   consolidation_groups: finalGroups,
   results: results,

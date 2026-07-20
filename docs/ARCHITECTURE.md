@@ -348,19 +348,53 @@ outright, can never change `stage()`'s retry, STOP, or return behavior. This
 is instrumentation, not a gate: a run with no working counter still ships,
 just with "not tracked" standing in for the numbers instead of a false zero.
 
-`aggregateTokens(results, spent, concurrency)` turns those per-issue deltas
-into a "## Token Usage" section in plain JS. The pipeline injects the finished
-markdown into the batch PR and run report prompts verbatim, so no subagent is
-ever asked to sum or double-check the arithmetic. At concurrency 1, stage
-deltas can't overlap, so they're an exact partition of the run: an
-"orchestration/unattributed" remainder row (`spent` minus the summed deltas)
-makes the table reconcile exactly to the run total. Above concurrency 1,
-several issues' stages run against the same shared monotonic counter, and
-`agent()` returns schema content only, never a per-call usage figure. There is
-no way to split a shared counter's movement across concurrent callers, so the
-whole breakdown is labeled approximate rather than claiming a precision it
-doesn't have. Per-issue PR bodies get one line of the same figures (that
-issue's stages only, not the run total).
+Not every token spend has a `ctx` to attribute to. Preflight's learnings
+read, the claims Promise.all, and the Select-phase consolidation gate
+(`proposeConsolidation()` and `postConsolidationMarkers()`) all run before or
+between per-issue stages, outside any issue's context. `STAGE_TOKENS` (a
+`{ preflight, select }` map) and its `addStage(bucket, before)` helper
+bracket those four run-body regions the same way `stage()` brackets a retry
+loop: sample `spentTokens()` immediately before the region, then again right
+after, and accumulate the guarded delta. `addStage()` runs in its own
+try/catch, so a tracking failure there can't touch run-body control flow
+either. Every bracketed region sits strictly before `runPool()`, the only
+concurrent region in the engine, so these deltas stay exact regardless of
+`CONCURRENCY` even when the per-issue breakdown below them doesn't.
+
+`aggregateTokens(results, spent, concurrency, byStage)` turns the per-issue
+deltas, plus that `STAGE_TOKENS` map, into a "## Token Usage" section in plain
+JS. The pipeline injects the finished markdown into the batch PR and run
+report prompts verbatim, so no subagent is ever asked to sum or double-check
+the arithmetic. `byStage` is optional and defaults to `{}`, so 3-arg callers
+still work; each nonzero bucket folds into the running sum exactly once and
+renders as its own labeled row ("preflight (orchestration)", "select-phase
+(orchestration)"), never silently absorbed into the remainder row below it.
+
+Only the per-issue rows are affected by concurrency. At concurrency 1, an
+issue's stage deltas can't overlap, so they're an exact partition of that
+issue's run: `reconciles: true` when `spent` and some tracked data both
+exist. Above concurrency 1, several issues' stages run against the same
+shared monotonic counter, and `agent()` returns schema content only, never a
+per-call usage figure. There is no way to split a shared counter's movement
+across concurrent callers, so the per-issue rows over-count and the whole
+breakdown is labeled approximate (`reconciles: false`) rather than claiming a
+precision it doesn't have. The `STAGE_TOKENS` rows stay exact even then,
+since they're sampled outside the concurrent pool; only the per-issue rows
+above them over-count.
+
+The "orchestration/unattributed" remainder row (`spent` minus the summed
+per-issue and stage deltas, floored at 0) renders whenever `budget.spent()`
+is available at all, not only when the table reconciles. A Quality Review
+finding caught the earlier version hiding this: a resumed run where no
+per-issue row and no stage bucket ever attributed a delta, but
+`budget.spent()` was still a real nonzero number, fell through to "Per-issue
+/ per-model breakdown: not tracked" while the "Run total" line above it still
+showed the true spend — the table and the summary line disagreed. The
+remainder row now carries that full, otherwise-invisible spend instead, and
+the breakdown renders (with per-issue cells reading "not tracked") as long as
+either `spent` or a stage/per-issue delta is available. Per-issue PR bodies
+get one line of the same figures (that issue's stages only, not the run
+total or the stage buckets).
 
 Tokens only, never dollars: price varies by model and shifts over time, so no
 currency figure appears anywhere in the engine, profile, or output. The
