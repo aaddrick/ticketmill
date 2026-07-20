@@ -5,7 +5,9 @@
 // `BROWSER` let (workflows/ticketmill.js), falling back to the historical
 // hardcoded values when profile.browser is unset (BROWSER === null) or a given
 // key is omitted. bwAcquire() also substitutes profile.browser.stale_seconds /
-// poll_seconds into the generated lock-wait shell snippet.
+// poll_seconds into the generated lock-wait shell snippet, and bwRelease() (like
+// bwAcquire) calls bwLock() rather than the old BW_LOCK constant, so it too must
+// pick up a configured lock_path.
 //
 // All four functions are declared above the TICKETMILL-TEST-HARNESS-SPLIT marker,
 // so they're reachable via harness.boot(). BROWSER itself is only assigned from
@@ -74,4 +76,20 @@ test('bwAcquire: command string carries configured stale_seconds/poll_seconds', 
   assert.ok(cmd.includes('sleep 5'))
   assert.ok(!cmd.includes('-gt 1800 '))
   assert.ok(!cmd.includes('sleep 15'))
+})
+
+test('bwRelease: default command string targets /tmp/ticketmill-browser-lock when profile.browser is unset', function () {
+  const context = harness.boot()
+  const cmd = context.bwRelease('issue-39')
+  assert.ok(cmd.includes('/tmp/ticketmill-browser-lock/owner'))
+  assert.ok(cmd.includes('rm -rf /tmp/ticketmill-browser-lock'))
+})
+
+test('bwRelease: command string targets profile.browser.lock_path when set', function () {
+  const context = harness.boot()
+  harness.readGlobal(context, "BROWSER = { serve_command: 'x', lock_path: '/mnt/shared/ticketmill-browser-lock' }")
+  const cmd = context.bwRelease('issue-39')
+  assert.ok(cmd.includes('/mnt/shared/ticketmill-browser-lock/owner'))
+  assert.ok(cmd.includes('rm -rf /mnt/shared/ticketmill-browser-lock'))
+  assert.ok(!cmd.includes('/tmp/ticketmill-browser-lock'))
 })
