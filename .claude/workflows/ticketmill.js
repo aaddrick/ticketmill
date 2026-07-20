@@ -1535,8 +1535,7 @@ const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotch
   '(test/env setup, shifted line numbers after deletes, tooling oddities), also return notes_for_downstream ' +
   '(1-3 short strings); otherwise return it empty.'
 
-// ----- commit SHA integrity (retro found agents twice typing a fabricated/shortened
-// SHA into a posted comment instead of reading the real one, requiring a fixup edit) -----
+// ----- commit SHA integrity (retro found agents twice typing a fabricated/shortened SHA into a posted comment instead of reading the real one, requiring a fixup edit) -----
 const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> log -1 --format=%H — it prints the ' +
   'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
   'or recall a SHA from memory.'
