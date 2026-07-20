@@ -1268,11 +1268,22 @@ function tripStop(reason) {
   if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; log('STOP: ' + reason) }
 }
 
-// isBudgetExhaustedError: budget/ceiling errors are fatal for the whole run
-// (tripStop), not a per-attempt death — shared by stage() and
-// consolidationAgent() so the two call sites can't drift on what counts as one.
+// isBudgetExhaustedError: only a real budget/token-exhaustion signature is
+// fatal for the whole run (tripStop), not a per-attempt death — shared by
+// stage() and consolidationAgent() so the two call sites can't drift on what
+// counts as one. Requires a budget/token/ceiling NOUN to co-occur with an
+// exhaust/exceed/deplete/ran-out/overrun-shaped/limit-reached VERB; either
+// alone is not enough, so a target repo's own domain error that merely names
+// "budget" (no exhaustion verb) or merely exceeds something unrelated (no
+// budget noun) is left to the ordinary per-attempt retry + recordAgentDeath()
+// path instead of halting the whole run. The "over" family is deliberately
+// anchored to overrun-shaped phrasing (overrun/overage/went over/ran over/
+// over budget/over the limit) rather than the bare word "over", which shows
+// up in ordinary prose ("budget review is over") without meaning exhaustion.
 function isBudgetExhaustedError(msg) {
-  if (!/budget|token target|ceiling/i.test(msg)) return false
+  const hasBudgetNoun = /\b(?:budget|token|ceiling)\b/i.test(msg)
+  const hasExhaustionVerb = /\b(?:exhaust(?:ed|ion|s)?|exceed(?:ed|s|ing)?|deplete(?:d|s)?|ran\s+out|over[\s-]?(?:run|age)\b|went\s+over|ran\s+over|over\s+budget|over\s+the\s+limit|limit[\s-]?reached)\b/i.test(msg)
+  if (!hasBudgetNoun || !hasExhaustionVerb) return false
   tripStop('token budget exhausted (' + msg + ')')
   return true
 }
