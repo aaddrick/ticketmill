@@ -37,6 +37,8 @@ every profile field. Show the user the proposal and confirm the load-bearing one
   "claim_label": "ticketmill",
   "verify_notes": [],
   "warn_base_branches": [],
+  "consolidation": true,
+  "engine_owned_globs": [],
   "browser": null,
   "models": {},
   "roles": { }
@@ -86,6 +88,16 @@ Field rules:
   a branch that auto-deploys on push rather than the intended working branch). Leave
   it `[]` unless the user names CI/CD-trigger branches for this repo (e.g. a
   `deploy-prod`/`deploy-dev` convention) — never propose a default on your own.
+- `consolidation`: OPTIONAL, default `true`. Leave it `true` unless the user asks to
+  disable the Select-phase consolidation gate that groups issues cheaper to resolve
+  as one unit; set `false` to skip that gate agent call entirely.
+- `engine_owned_globs`: OPTIONAL, default `[]`. Extends the built-in engine-owned
+  path set with repo-specific read-only paths, beyond `lockstep_installed_paths`
+  above. Leave it `[]` unless the user names additional paths a run must never touch.
+- `models`: OPTIONAL, default `{}`. Per-stage model/effort overrides. The valid stage
+  keys are enumerated in the header schema comment of `workflows/ticketmill.js`,
+  adjacent to the `M` map that is their source of truth — do not re-derive or
+  duplicate that list here.
 
 ## Step 3 — Map project agents onto pipeline roles
 

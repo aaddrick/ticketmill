@@ -57,6 +57,11 @@ export const meta = {
 //                                        // predicted-file overlap drive lanes.
 //     "docblock_globs": ["app/**/*.php"],// files needing docblocks; null = skip stage
 //     "docs_dir": "docs",                // tech-docs stage target; null = skip stage
+//     "consolidation": true,             // OPTIONAL, default true: Select-phase gate
+//                                        // that groups issues cheaper to resolve as
+//                                        // one unit. false disables the gate entirely
+//                                        // (no gate agent call); see
+//                                        // consolidationEnabled().
 //     "logs_dir": "logs/ticketmill",
 //     "claim_label": "ticketmill",
 //     "verify_notes": ["tests need the pgvector container: podman start ncl_test"],
@@ -89,7 +94,16 @@ export const meta = {
 //     // All five of port_span/lock_path/stale_seconds/poll_seconds/artifact_dir are
 //     // optional and default to the values shown above; artifact_dir substitutes
 //     // {issue} if present (like serve_command's {port}), else appends -<issue>.
-//     "models": { "plan": { "model": "opus", "effort": "high" } }, // per-stage overrides
+//     "models": { "plan": { "model": "opus", "effort": "high" } }, // OPTIONAL per-stage
+//                                        // model/effort overrides, keyed by stage name.
+//                                        // Valid keys (24): probe, setup, research,
+//                                        // evaluate, consolidation, contrarian, plan,
+//                                        // implement, taskReview, simplify, qReview,
+//                                        // fix, testRun, testValidate, browser,
+//                                        // docblock, pr, specReview, codeReview,
+//                                        // techDocs, merge, report, retro, learnings.
+//                                        // The `M` map below is the source of truth
+//                                        // for these keys and their defaults.
 //     "roles": {
 //       "implementers": ["laravel-backend-developer", "frontend-developer"],
 //       "default_implementer": "laravel-backend-developer",
