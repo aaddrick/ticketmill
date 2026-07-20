@@ -54,6 +54,21 @@ test('aggregateTokens: concurrency===1 appends an orchestration/unattributed rem
   assert.strictEqual(agg.by_model.sonnet, 200)
   assert.strictEqual(agg.by_model.opus, 50)
   assert.strictEqual(Object.keys(agg.by_model).length, 2)
+
+  // Direct assertions on the tracked by_issue[] rows themselves, not just the
+  // aggregate above: the tracked-write path (.claude/workflows/ticketmill.js:1532)
+  // populates each row's by_model via Object.assign({}, t.byModel || {}), and
+  // until now that field was only checked indirectly through ambiguous markdown
+  // substring matches (other rows can share the same numeric cell). Field-by-field
+  // here, same vm-realm prototype reasoning as above — never deepStrictEqual.
+  assert.strictEqual(agg.by_issue[0].issue, 1)
+  assert.strictEqual(agg.by_issue[0].by_model.sonnet, 100)
+  assert.strictEqual(Object.keys(agg.by_issue[0].by_model).length, 1)
+
+  assert.strictEqual(agg.by_issue[1].issue, 2)
+  assert.strictEqual(agg.by_issue[1].by_model.sonnet, 100)
+  assert.strictEqual(agg.by_issue[1].by_model.opus, 50)
+  assert.strictEqual(Object.keys(agg.by_issue[1].by_model).length, 2)
 })
 
 test('aggregateTokens: concurrency===1 with spent exactly equal to summed deltas still reconciles (zero remainder)', function () {
