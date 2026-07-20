@@ -1470,13 +1470,13 @@ function aggregateTokens(results, spent, concurrency) {
       anyTracked = true
       const total = t.total || 0
       sumDeltas += total
-      byIssue.push({ issue: r.issue, total: total, byModel: Object.assign({}, t.byModel || {}), tracked: true })
+      byIssue.push({ issue: r.issue, total: total, by_model: Object.assign({}, t.byModel || {}), tracked: true })
       const models = t.byModel || {}
       for (const m in models) {
         if (Object.prototype.hasOwnProperty.call(models, m)) byModel[m] = (byModel[m] || 0) + models[m]
       }
     } else {
-      byIssue.push({ issue: r && r.issue, total: null, byModel: {}, tracked: false })
+      byIssue.push({ issue: r && r.issue, total: null, by_model: {}, tracked: false })
     }
   }
 
@@ -1518,7 +1518,7 @@ function aggregateTokens(results, spent, concurrency) {
     lines.push('|' + header.map(function () { return ' --- ' }).join('|') + '|')
     for (const row of byIssue) {
       const cells = ['#' + row.issue].concat(models.map(function (m) {
-        return row.tracked ? String(row.byModel[m] || 0) : 'not tracked'
+        return row.tracked ? String(row.by_model[m] || 0) : 'not tracked'
       }))
       cells.push(row.tracked ? String(row.total) : 'not tracked')
       lines.push('| ' + cells.join(' | ') + ' |')
