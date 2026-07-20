@@ -296,17 +296,14 @@ test('(g) [new] auto-resolve rebases and force-pushes clean (mar.resolved=true),
 // ---- shared responder plumbing ----
 
 // Installs a scripted agent keyed by exact stage key (see stageKeyOf above).
-// Any stage key not present in `byKey` throws immediately, so an
-// uninstrumented/unscripted stage is surfaced explicitly at this
-// responder-level guard rather than silently falling through to a canned
-// reply. Note this throw does not itself fail the test loudly once it
-// reaches stage(): per installScriptedAgent's contract (harness.js), a throw
-// whose message doesn't match /budget|token target|ceiling/i is caught and
-// retried the same as a null return, up to STAGE_TRIES times, then given up
-// on quietly. This message never matches that regex, so the real signal here
-// is the guard existing at all — it turns "which stage key did I forget to
-// script" into a readable error message during debugging, not a test
-// failure by itself.
+// Any stage key not present in `byKey` throws immediately, surfacing an
+// uninstrumented/unscripted stage at this responder-level guard rather than
+// silently falling through to a canned reply. That throw doesn't fail the
+// test loudly on its own: per installScriptedAgent's contract (harness.js),
+// a message not matching /budget|token target|ceiling/i is caught by
+// stage() and retried like a null return, up to STAGE_TRIES times, then
+// given up on quietly. The guard's value is a readable "which stage key did
+// I forget to script" error during debugging, not a guaranteed test failure.
 function installScriptedResponder(context, byKey) {
   return harness.installScriptedAgent(context, function (prompt, opts) {
     const label = (opts && opts.label) || ''
