@@ -85,6 +85,13 @@ export const meta = {
 //                                        // branch that auto-deploys on push). Unset/[]
 //                                        // = no warning; the engine bakes in no
 //                                        // project-shaped branch names of its own.
+//     "contrarian_max_iterations": 3,    // OPTIONAL, default 3: caps the approach/plan
+//                                        // (and consolidation) contrarian challenge
+//                                        // gates' iterations before proceeding with
+//                                        // unresolved caveats (recorded in the batch
+//                                        // PR's Verification Gaps). Must be an integer
+//                                        // >= 1 if set. 'trivial'-complexity issues get
+//                                        // min(2, this value) per gate regardless.
 //     "browser": null,                   // OPT-IN browser verification:
 //     // { "serve_command": "php artisan serve --port={port}", "build_command": null,
 //     //   "ui_globs": ["resources/views/**"], "port_base": 8100, "notes": "...",
@@ -229,7 +236,7 @@ const CONCURRENCY = Math.max(1, Math.min(5, Number(A.concurrency) || 2))
 const DRY_RUN = !!A.dry_run
 
 // ----- caps -----
-const MAX_CONTRARIAN_ITERATIONS = 3
+let MAX_CONTRARIAN_ITERATIONS = 3 // overridable via profile.contrarian_max_iterations (see __seed / Select)
 const MAX_TASK_REVIEW_ATTEMPTS = 3
 const MAX_QUALITY_ITERATIONS = 5
 const MAX_TEST_ITERATIONS = 10
@@ -3165,8 +3172,8 @@ async function implementIssue(ctx) {
   // the revision cycle entirely; the full cap on a docs-only issue burns opus time
   // re-litigating settled trade-offs.
   const complexity = evalR.complexity || 'standard'
-  const challengeCap = complexity === 'trivial' ? 2 : MAX_CONTRARIAN_ITERATIONS
-  if (complexity === 'trivial') log('#' + ctx.issue + ' classified trivial — contrarian caps reduced to 2 iterations per gate')
+  const challengeCap = contrarianCapFor(complexity)
+  if (complexity === 'trivial') log('#' + ctx.issue + ' classified trivial — contrarian caps reduced to ' + challengeCap + ' iteration(s) per gate')
 
   const misfiledCheck = [
     'MISFILED-COMMENT CHECK: workflow comments end with a marker line "<!-- ticketmill <repo>#<issue> -->".',
@@ -3230,6 +3237,7 @@ async function implementIssue(ctx) {
           ctx.unresolved.push('[approach gate, ' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
         }
       }
+      VERIFY_SKIPS.push('#' + ctx.issue + ': approach challenge capped at ' + challengeCap + ' iterations with unresolved caveats: ' + oneLine(ch.summary || '').slice(0, 200))
       const capNote = await stage(ctx, 'cap-note-approach', [
         'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (gh issue comment).',
         'Title line: "## Proceeding After Contrarian Cap (Approach)"',
@@ -3370,6 +3378,7 @@ async function implementIssue(ctx) {
           ctx.unresolved.push('[plan gate, ' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
         }
       }
+      VERIFY_SKIPS.push('#' + ctx.issue + ': plan challenge capped at ' + challengeCap + ' iterations with unresolved caveats: ' + oneLine(ch.summary || '').slice(0, 200))
       const capNote = await stage(ctx, 'cap-note-plan', [
         'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (gh issue comment).',
         'Title line: "## Proceeding After Contrarian Cap (Plan)"',
@@ -3974,6 +3983,16 @@ function __seed(o) {
   if ('ROOT' in o) ROOT = o.ROOT
   if ('ENGINE_OWNED' in o) ENGINE_OWNED = o.ENGINE_OWNED
   if ('LOCKSTEP_INSTALLED_PATHS' in o) LOCKSTEP_INSTALLED_PATHS = o.LOCKSTEP_INSTALLED_PATHS
+  if ('MAX_CONTRARIAN_ITERATIONS' in o) MAX_CONTRARIAN_ITERATIONS = o.MAX_CONTRARIAN_ITERATIONS
+}
+
+// contrarianCapFor: proportional adversarial depth (see the comment at its call
+// site) — trivial issues get at most 2 challenge iterations per gate even when a
+// profile raises MAX_CONTRARIAN_ITERATIONS higher; a profile lowering the cap below
+// 2 tightens trivial issues too. Pure and placed above the TICKETMILL-TEST-HARNESS-
+// SPLIT marker so tests can exercise it without seeding module state.
+function contrarianCapFor(complexity) {
+  return complexity === 'trivial' ? Math.min(2, MAX_CONTRARIAN_ITERATIONS) : MAX_CONTRARIAN_ITERATIONS
 }
 
 // ---- TICKETMILL-TEST-HARNESS-SPLIT: tests/harness.js truncates the source at this
@@ -4014,6 +4033,11 @@ if (!Object.prototype.hasOwnProperty.call(PROFILE, 'test_command')) {
 }
 TEST_CMD = PROFILE.test_command === null ? null : String(PROFILE.test_command)
 if (TEST_CMD !== null && !TEST_CMD.trim()) throw new Error('profile.test_command is an empty string — use a real command or an explicit null')
+if (Object.prototype.hasOwnProperty.call(PROFILE, 'contrarian_max_iterations')) {
+  const cmi = PROFILE.contrarian_max_iterations
+  if (!Number.isInteger(cmi) || cmi < 1) throw new Error('profile.contrarian_max_iterations must be an integer >= 1, got: ' + JSON.stringify(cmi))
+  MAX_CONTRARIAN_ITERATIONS = cmi
+}
 REPO = PROFILE.repo || REPO
 LOGS = ROOT + '/' + String(PROFILE.logs_dir || 'logs/ticketmill').replace(/^\/+|\/+$/g, '')
 CLAIM_LABEL = String(PROFILE.claim_label || 'ticketmill')
