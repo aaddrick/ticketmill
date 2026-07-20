@@ -26,6 +26,30 @@ test('scopeGuard: pins issue number, repo, and comment marker; no PR/browser lin
   assert.ok(!guard.includes('lock-guarded'))
 })
 
+test('scopeGuard: when BROWSER is set, the lock-guard line renders bwLock()\'s default lock path', function () {
+  const context = harness.boot()
+  context.__seed({ REPO: 'aaddrick/ticketmill-fixture' })
+  harness.readGlobal(context, "BROWSER = { serve_command: 'x' }")
+  const ctx = harness.makeCtx({ issue: 4, pr: null })
+
+  const guard = context.scopeGuard(ctx)
+
+  assert.strictEqual(context.bwLock(), '/tmp/ticketmill-browser-lock')
+  assert.ok(guard.includes('lock-guarded (/tmp/ticketmill-browser-lock)'))
+})
+
+test('scopeGuard: when BROWSER.lock_path is configured, the lock-guard line renders that path instead of the default', function () {
+  const context = harness.boot()
+  context.__seed({ REPO: 'aaddrick/ticketmill-fixture' })
+  harness.readGlobal(context, "BROWSER = { serve_command: 'x', lock_path: '/mnt/shared/ticketmill-browser-lock' }")
+  const ctx = harness.makeCtx({ issue: 4, pr: null })
+
+  const guard = context.scopeGuard(ctx)
+
+  assert.ok(guard.includes('lock-guarded (/mnt/shared/ticketmill-browser-lock)'))
+  assert.ok(!guard.includes('lock-guarded (/tmp/ticketmill-browser-lock)'))
+})
+
 test('scopeGuard: includes the PR number in both the identity line and the target line once a PR exists', function () {
   const context = harness.boot()
   context.__seed({ REPO: 'aaddrick/ticketmill-fixture' })
