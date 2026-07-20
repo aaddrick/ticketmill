@@ -72,6 +72,14 @@ export const meta = {
 //                                        // post-implement hard-revert gate; see
 //                                        // isHardRevertPath. This repo sets
 //                                        // [".claude/workflows/ticketmill.js"].
+//     "warn_base_branches": [],          // OPTIONAL (issue #36), default []: base
+//                                        // branch names that trigger a Select-phase
+//                                        // WARNING when a batch's target branch looks
+//                                        // like a CI/CD deploy-trigger branch (PRs
+//                                        // normally target the working branch, not a
+//                                        // branch that auto-deploys on push). Unset/[]
+//                                        // = no warning; the engine bakes in no
+//                                        // project-shaped branch names of its own.
 //     "browser": null,                   // OPT-IN browser verification:
 //     // { "serve_command": "php artisan serve --port={port}", "build_command": null,
 //     //   "ui_globs": ["resources/views/**"], "port_base": 8100, "notes": "..." }
@@ -3803,6 +3811,20 @@ async function runPool(items, limit, fn, lanes) {
   return results
 }
 
+// shouldWarnBaseBranch (issue #36): true when `base` is a member of the
+// profile's OPTIONAL warn_base_branches list — a CI/CD deploy-trigger branch
+// name the target repo wants a Select-phase heads-up on (PRs normally target
+// the working branch, not a branch that auto-deploys on push). Default []
+// when the field is absent/non-array, same normalization idiom as
+// LOCKSTEP_INSTALLED_PATHS/mergeEngineOwnedGlobs. Pure and placed above the
+// TICKETMILL-TEST-HARNESS-SPLIT marker (unlike the `if (...) log(...)` call
+// site below, which needs the real PROFILE/BASE populated at Select) so
+// tests can exercise it without seeding module state.
+function shouldWarnBaseBranch(profile, base) {
+  const list = profile && Array.isArray(profile.warn_base_branches) ? profile.warn_base_branches.map(String) : []
+  return list.indexOf(base) !== -1
+}
+
 // =============================================================================
 // MAIN
 // =============================================================================
@@ -3911,7 +3933,7 @@ if (referencedAgents.length) {
 // Timestamp comes from a `date` probe (Date.now() is unavailable in workflow
 // scripts), which also makes the name resume-stable: journal replay returns the
 // cached branch. Dry runs never create the branch.
-if (BASE === 'deploy-prod' || BASE === 'deploy-dev') log('WARNING: base branch "' + BASE + '" looks like a CI/CD trigger branch. PRs normally target the working branch.')
+if (shouldWarnBaseBranch(PROFILE, BASE)) log('WARNING: base branch "' + BASE + '" looks like a CI/CD trigger branch. PRs normally target the working branch.')
 if (!TARGET) {
   if (DRY_RUN) {
     TARGET = BASE // read-only probes only; noted in the dry-run output
