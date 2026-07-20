@@ -19,6 +19,11 @@
     "Node >= 22 required."
   ],
   "browser": null,
+  "release": {
+    "version_files": [".claude-plugin/plugin.json"],
+    "changelog_file": "CHANGELOG.md",
+    "bump": null
+  },
   "lockstep_installed_paths": [".claude/workflows/ticketmill.js"],
   "serialize_globs": ["workflows/ticketmill.js", ".claude/workflows/ticketmill.js"],
   "models": {},
