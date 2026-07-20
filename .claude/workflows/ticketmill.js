@@ -2407,7 +2407,7 @@ async function runMergeAutoResolve(ctx) {
     'That command exits 0 if origin/' + TARGET + ' IS an ancestor of HEAD (TARGET has not moved past what tests',
     'just verified — safe to push) and non-zero if it moved further (the just-tested state is now stale).',
     'Return moved (boolean: true if the command exited non-zero / TARGET moved further, false otherwise).',
-  ].join('\n'), stageOpts('probe'), MERGE_GUARD_SCHEMA, 1)
+  ].join('\n'), stageOpts('probe'), MERGE_GUARD_SCHEMA)
   if (!guard) return { ok: false, error: 'pre-force-push guard stage died' }
   if (guard.moved) {
     ctx.metrics.merge_thrash = (ctx.metrics.merge_thrash || 0) + 1
