@@ -111,8 +111,9 @@ than not running.
 Because the engine now exists as two files that must stay byte-identical
 (`workflows/ticketmill.js`, the source, and `.claude/workflows/ticketmill.js`,
 the copy mill-init drops into target repos), `scripts/lint-engine.js` byte-compares
-them on every test run and fails loud on drift. Edit only the source and copy it
-over the `.claude` copy in the same commit; the two are never meant to diverge.
+them on every test run and fails loud on drift. Edit only the source, then run
+`node scripts/lint-engine.js --fix` in the same commit to copy it verbatim
+over the `.claude` copy; the two are never meant to diverge.
 
 ### Sandbox lint: catching rules `node --check` can't see
 
