@@ -74,7 +74,7 @@ it from your request; these are the knobs it can turn:
 | `no_assignee` | With `labels`: select only issues nobody is assigned to |
 | `concurrency` | Issue pipelines running in parallel: 1-5, default 2 |
 | `dry_run` | Read-only preview: probes every issue and reports the routing plan |
-| `run_label` | Tag for claims and report filenames. Pass today's date so reports don't collide |
+| `run_label` (alias `date`) | Tag for claims and report filenames. Pass today's date so reports don't collide |
 | `batch_branch` | Resume a prior run by reusing its `Batch_<timestamp>` branch |
 | `root`, `repo` | Auto-discovered from git and gh; pass explicitly if the bootstrap probe fails |
 
@@ -266,10 +266,14 @@ load-bearing fields:
 | `roles` | Role-to-agent map; `implementers` is the list the planner assigns tasks to |
 | `simplify_globs`, `docblock_globs`, `docs_dir` | Gate the simplify, docblock, and tech-docs stages; `null` skips |
 | `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes). Also accepts optional `lock_path` (default `/tmp/ticketmill-browser-lock`), `stale_seconds` (default `1800`), `poll_seconds` (default `15`), `port_span` (default `900`), and `artifact_dir` (default `/tmp/ticketmill-issue-{issue}`, `{issue}`-templated like `serve_command`'s `{port}`) |
-| `models` | Per-stage model/effort overrides |
+| `models` | Per-stage model/effort overrides. Valid stage keys are enumerated in the header schema comment (`workflows/ticketmill.js`), adjacent to the `M` map that is their source of truth |
 | `consolidation` | Default `true`. Set `false` to disable the Select-phase consolidation gate entirely (a resumed run still heals any group a prior run already committed to) |
 | `serialize_globs` | Optional, default `[]`. Patterns worth trusting as a lane-scheduling hint beyond predicted-file overlap alone: a shared schema, a magnet config, anything two issues could conflict on without their own predicted paths overlapping |
 | `warn_base_branches` | Optional, default `[]`. Base branch names that trigger a Select-phase warning when a batch targets one of them (PRs normally target the working branch, not a branch that auto-deploys on push). Unset/`[]` = no warning |
+| `claim_label` | GitHub label applied to an issue when a run claims it (cross-run coordination; see header schema) |
+| `engine_owned_globs` | Optional, default `[]`. Extends the built-in engine-owned path set (`.claude/ticketmill.json`, `.claude/agents/**`, `.claude/workflows/ticketmill.js`, `.claude/scripts/ticketmill/**`), read-only during a run |
+| `lockstep_installed_paths` | Optional, default `[]`. Engine-owned paths that are a deliberate installed copy of a source-of-truth file elsewhere in this repo, exempted from the post-implement hard-revert gate |
+| `logs_dir` | Directory for run summaries and retrospective learnings |
 
 ## Repo layout
 
