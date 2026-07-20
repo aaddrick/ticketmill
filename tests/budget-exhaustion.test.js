@@ -39,7 +39,24 @@ test('isBudgetExhaustedError: domain error with an exhaustion verb but no budget
   assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
 })
 
-test('isBudgetExhaustedError: domain error with a budget noun and a bare "over"-substring word (not an overrun-shaped phrase) returns false and leaves STOP untripped', function () {
+// Regression case for commit 81ee1cb ("anchor isBudgetExhaustedError's 'over'
+// verb to overrun phrasing"): a budget noun co-occurring with the bare,
+// standalone word "over" (not shaped like overrun/overage/went over/ran
+// over/over budget/over the limit) must NOT trip STOP. Confirmed this string
+// trips the pre-fix bare over(?:run|age)? regex (mutation-tested by reverting
+// just the verb alternation locally) and is exactly the false-positive class
+// the fix commit's own message cites.
+test('isBudgetExhaustedError: domain error with a budget noun and the bare standalone word "over" (not an overrun-shaped phrase) returns false and leaves STOP untripped', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('the budget review is over for this cycle')
+  assert.strictEqual(result, false)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+})
+
+// Distinct from the case above: "over" as a mid-word substring (inside
+// "recover") must never match the \b-bounded verb regex at all, regardless of
+// the overrun-anchoring fix — this pins the word-boundary behavior itself.
+test('isBudgetExhaustedError: domain error with a budget noun and "over" only as a mid-word substring (inside "recover") returns false and leaves STOP untripped', function () {
   const context = harness.boot()
   const result = context.isBudgetExhaustedError('failed to recover the budget ledger')
   assert.strictEqual(result, false)
