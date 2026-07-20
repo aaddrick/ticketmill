@@ -1526,29 +1526,53 @@ function timeline(ctx) {
   })
 }
 
-// Pure aggregation of per-issue/per-stage token deltas into per-issue and
-// per-model subtotals, plus a finished markdown "## Token Usage" section — all
-// math done here in JS, never delegated to an LLM. Takes no globals; harness-
-// testable in isolation.
+// Display labels for aggregateTokens' 4th (byStage) param's known keys — the
+// STAGE_TOKENS region-boundary buckets (preflight/select-phase orchestration
+// spend, sampled outside the per-issue pool — see STAGE_TOKENS). An unknown
+// key still renders (key + ' (orchestration)'), so a future bucket doesn't
+// silently vanish from the table just because this map wasn't updated.
+const STAGE_LABELS = { preflight: 'preflight (orchestration)', select: 'select-phase (orchestration)' }
+
+// Pure aggregation of per-issue/per-stage token deltas into per-issue,
+// per-model, and per-stage subtotals, plus a finished markdown "## Token
+// Usage" section — all math done here in JS, never delegated to an LLM.
+// Takes no globals; harness-testable in isolation.
 //   results      - the run's per-issue result array. Entries lacking a `.tokens`
 //                  field entirely (skipped/not_started — never got a ctx) or
 //                  carrying `.tokens.tracked === false` (ctx existed but no stage
 //                  ever sampled a usable budget.spent() pair) both render
 //                  "not tracked", never a false zero.
 //   spent        - the guarded, run-wide budget.spent() total (Number or null).
-//   concurrency  - CONCURRENCY. Selects the reconciliation story:
-//     === 1: stage deltas cannot overlap, so they're an exact partition of the
-//       run; an "orchestration/unattributed" remainder row (max(0, spent - sum
-//       of deltas)) is appended so the table sums exactly to `spent`
-//       (reconciles: true).
+//   concurrency  - CONCURRENCY. Only per-issue rows are affected by it:
+//     === 1: per-issue stage deltas cannot overlap, so they're an exact
+//       partition of that portion of the run (reconciles: true, given spent
+//       and some tracked data).
 //     > 1: multiple issues' stages run side by side against ONE shared
 //       monotonic counter — agent() returns schema content only, never a
 //       per-call usage figure, so there is no way to split budget.spent()'s
 //       movement between concurrent callers. Overlapping stages each see (and
-//       get attributed) the same movement, so deltas over-count and the whole
-//       breakdown is labelled approximate (reconciles: false).
-function aggregateTokens(results, spent, concurrency) {
+//       get attributed) the same movement, so per-issue deltas over-count and
+//       the whole breakdown is labelled approximate (reconciles: false).
+//   byStage      - optional (normalizes to {}, so existing 3-arg callers are
+//                  unaffected): a flat { preflight, select, ... } map of
+//                  region-bracketed orchestration spend sampled OUTSIDE the
+//                  concurrent per-issue pool (see STAGE_TOKENS), so it's exact
+//                  regardless of `concurrency`. Every nonzero bucket folds
+//                  into sumDeltas exactly once and renders as its own labeled
+//                  row (STAGE_LABELS) — never absorbed silently into the
+//                  remainder below, and never double-counted by it. A run
+//                  where every per-issue result is untracked but the stage
+//                  buckets are populated (e.g. a resumed run) still counts as
+//                  "tracked" and still renders a breakdown, via anyStage.
+// remainder (whatever budget.spent() counted that no per-issue row or stage
+// bucket attributed — max(0, spent - sumDeltas)) is computed and rendered as
+// its own "orchestration/unattributed" row whenever `spent` is available,
+// regardless of concurrency/reconciles — including the approximate
+// concurrency>1 case, so that spend is never left implicit — since the stage
+// buckets are already folded into sumDeltas, it is never double-counted.
+function aggregateTokens(results, spent, concurrency, byStage) {
   const list = results || []
+  const stages = byStage || {}
   const byIssue = []
   const byModel = {}
   let sumDeltas = 0
@@ -1570,14 +1594,31 @@ function aggregateTokens(results, spent, concurrency) {
     }
   }
 
+  // Stage buckets fold into sumDeltas exactly once (below) so the remainder
+  // row never double-counts them; zero-valued buckets are kept in by_stage
+  // (the returned JSON) but omitted from the rendered table rows.
+  const byStageOut = {}
+  const stageRows = []
+  for (const key in stages) {
+    if (!Object.prototype.hasOwnProperty.call(stages, key)) continue
+    const v = stages[key] || 0
+    byStageOut[key] = v
+    if (v) {
+      sumDeltas += v
+      stageRows.push({ label: STAGE_LABELS[key] || (key + ' (orchestration)'), total: v })
+    }
+  }
+  const anyStage = stageRows.length > 0
+
   const hasSpent = isFiniteNumber(spent)
   // run_total must agree with the markdown's "Run total" line, which only ever
   // renders the guarded budget.spent() figure or "not tracked" — never a
   // sumDeltas fallback (see CHANGELOG for the Quality Review finding this fixes).
   const runTotal = hasSpent ? spent : null
-  const tracked = anyTracked || hasSpent
-  const reconciles = concurrency === 1 && hasSpent && anyTracked
-  const remainder = reconciles ? Math.max(0, spent - sumDeltas) : null
+  const trackedAny = anyTracked || anyStage
+  const tracked = trackedAny || hasSpent
+  const reconciles = concurrency === 1 && hasSpent && trackedAny
+  const remainder = hasSpent ? Math.max(0, spent - sumDeltas) : null
   const models = Object.keys(byModel).sort()
 
   const lines = []
@@ -1588,13 +1629,15 @@ function aggregateTokens(results, spent, concurrency) {
     : 'Run total: not tracked (budget.spent() unavailable this run)')
   lines.push('')
 
-  if (!anyTracked) {
+  if (!trackedAny) {
     lines.push('Per-issue / per-model breakdown: not tracked (no stage in this run reported a usable token delta).')
   } else {
     if (concurrency > 1) {
       lines.push('_approximate - overlapping concurrent stages over-count and do NOT reconcile to the run total._')
       lines.push('(A single shared monotonic counter cannot be split per concurrent call — agent() returns schema ' +
-        'content only, no per-call usage — so simultaneous issues each see the same counter movement.)')
+        'content only, no per-call usage — so simultaneous issues each see the same counter movement. The stage ' +
+        'rows below are exact even so — they are sampled outside the concurrent per-issue pool — only the ' +
+        'per-issue rows above them over-count.)')
     } else if (reconciles) {
       lines.push('_Reconciles exactly to the run total above — the "orchestration/unattributed" row below absorbs ' +
         'whatever budget.spent() counted that no stage attributed._')
@@ -1613,12 +1656,16 @@ function aggregateTokens(results, spent, concurrency) {
       cells.push(row.tracked ? String(row.total) : 'not tracked')
       lines.push('| ' + cells.join(' | ') + ' |')
     }
-    if (reconciles) {
+    for (const sr of stageRows) {
+      const cells = [sr.label].concat(models.map(function () { return '' })).concat([String(sr.total)])
+      lines.push('| ' + cells.join(' | ') + ' |')
+    }
+    if (hasSpent) {
       const remCells = ['orchestration/unattributed'].concat(models.map(function () { return '' })).concat([String(remainder)])
       lines.push('| ' + remCells.join(' | ') + ' |')
     }
     const totalCells = ['**Total**'].concat(models.map(function (m) { return '**' + byModel[m] + '**' }))
-    totalCells.push('**' + (reconciles ? spent : sumDeltas) + '**')
+    totalCells.push('**' + (hasSpent ? spent : sumDeltas) + '**')
     lines.push('| ' + totalCells.join(' | ') + ' |')
   }
 
@@ -1626,6 +1673,8 @@ function aggregateTokens(results, spent, concurrency) {
     run_total: runTotal,
     by_issue: byIssue,
     by_model: byModel,
+    by_stage: byStageOut,
+    remainder: remainder,
     tracked: tracked,
     reconciles: reconciles,
     markdown: lines.join('\n'),
