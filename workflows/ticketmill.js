@@ -1534,6 +1534,12 @@ function settledBlock(ctx) {
 const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotchas that later agents will need ' +
   '(test/env setup, shifted line numbers after deletes, tooling oddities), also return notes_for_downstream ' +
   '(1-3 short strings); otherwise return it empty.'
+
+// ----- commit SHA integrity (retro found agents twice typing a fabricated/shortened
+// SHA into a posted comment instead of reading the real one, requiring a fixup edit) -----
+const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> log -1 --format=%H — it prints the ' +
+  'full 40-character SHA with no trailing newline (unlike a carelessly-piped `git rev-parse HEAD`). Paste that ' +
+  'literal command output verbatim in the comment. Never type, shorten, guess, or recall a SHA from memory.'
 function collectNotes(ctx, from, r) {
   const arr = (r && r.notes_for_downstream) || []
   for (const n of arr) {
@@ -2014,6 +2020,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
         'If you changed anything, post an issue comment "## Simplify Pass (' + stepLabel + ', iteration ' + iter + ')" with',
         'the commit SHA and 2-4 lines on what was simplified (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ');',
         'skip the comment entirely if you made no changes.',
+        COMMIT_SHA_ASK,
         HANDOFF_ASK,
         'Return status, commit, files_changed, summary.',
       ].join('\n'), stageOpts('simplify'), IMPL_SCHEMA)
@@ -2057,6 +2064,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       '',
       'After committing, post an issue comment "## Quality Fix (' + stepLabel + ', iteration ' + iter + ')" with the',
       'commit SHA and the fixes applied in 2-4 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+      COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
       'Fix the issues and commit. Return status, commit, files_changed, fixes_applied, summary.',
@@ -2244,6 +2252,7 @@ async function runBrowserCheck(ctx, where) {
       'Fix the real defect — do NOT hide the symptom (e.g. removing the interaction that fails).',
       'After committing, post an issue comment "## Browser Fix (' + where + ', iteration ' + iter + ')" with the commit',
       'SHA and what was fixed (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+      COMMIT_SHA_ASK,
       HANDOFF_ASK,
       'Commit' + (where === 'pre-merge' ? ' and push: git -C ' + ctx.worktree + ' push origin ' + ctx.branch : '') + '. Return status, commit, files_changed, fixes_applied, summary.',
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
@@ -2450,6 +2459,7 @@ async function runTestLoop(ctx, forced) {
         'Fix the real defect — do NOT delete or weaken assertions just to make the failure disappear.',
         'After committing, post an issue comment "## Test Fix (iteration ' + iter + ')" with the commit SHA and which',
         'failures were addressed (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+        COMMIT_SHA_ASK,
         HANDOFF_ASK,
         'Fix the issues and commit. Return status, commit, files_changed, fixes_applied, summary.',
       ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
@@ -2492,6 +2502,7 @@ async function runTestLoop(ctx, forced) {
       fixContext(ctx, null),
       'After committing, post an issue comment "## Test Quality Fix (iteration ' + iter + ')" with the commit SHA and',
       'what was added/strengthened (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+      COMMIT_SHA_ASK,
       HANDOFF_ASK,
       'Add missing assertions, remove TODOs, add edge-case tests, etc. Commit. Return status, commit, files_changed, fixes_applied, summary.',
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
@@ -3421,6 +3432,7 @@ async function implementIssue(ctx) {
       'After committing, post an issue comment (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ') titled',
       '"## Task ' + task.id + ' Implemented" with the commit SHA and a 2-3 line summary — this keeps the issue',
       'audit trail alive during the implementation phase.',
+      COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
       'Return status, commit (SHA), files_changed, summary.',
@@ -3472,6 +3484,7 @@ async function implementIssue(ctx) {
         fixContext(ctx, task.description),
         'After committing, post an issue comment "## Task ' + task.id + ' Review Fix (attempt ' + attempt + ')" with the',
         'commit SHA and what was addressed in 2-4 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+        COMMIT_SHA_ASK,
         bwFeedback(ctx),
         HANDOFF_ASK,
         'Address the issues and commit. Return status, commit, files_changed, fixes_applied, summary.',
@@ -3630,6 +3643,7 @@ async function reviewAndMerge(ctx) {
       fixContext(ctx, null),
       'After pushing, post a PR comment "## PR Review Fix (iteration ' + iter + ')" with the commit SHA and the fixes',
       'applied in 2-4 lines (gh pr comment ' + ctx.pr + ' --repo ' + REPO + ').',
+      COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
       'Fix the issues, commit, and push: git -C ' + ctx.worktree + ' push origin ' + ctx.branch,
