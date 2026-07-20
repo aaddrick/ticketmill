@@ -102,9 +102,8 @@ export const meta = {
 //                                        // fix, testRun, testValidate, browser,
 //                                        // docblock, pr, specReview, codeReview,
 //                                        // techDocs, merge, report, retro, learnings.
-//                                        // The `M` map below (~160 lines down) is the
-//                                        // source of truth for these keys and their
-//                                        // defaults.
+//                                        // The `M` map below is the source of truth
+//                                        // for these keys and their defaults.
 //     "roles": {
 //       "implementers": ["laravel-backend-developer", "frontend-developer"],
 //       "default_implementer": "laravel-backend-developer",
