@@ -357,6 +357,12 @@ const PREFLIGHT_SCHEMA = {
     issue_state: { enum: ['open', 'closed', 'unknown'] },
     pr_number: { type: ['integer', 'null'] },
     pr_state: { enum: ['open', 'merged', 'closed', 'none'] },
+    // pr_base (issue #30): base branch of the SAME related PR pr_state/pr_number
+    // describe — null if no related PR. Lets the JS skip-return below string-match
+    // it against TARGET (the batch branch), so "merged into ANY branch" (e.g. a
+    // concurrent run's own batch branch) is never confused with "merged into THIS
+    // run's batch branch". See merged_into_target at the resume_point==='skip' return.
+    pr_base: { type: ['string', 'null'] },
     branch: { type: ['string', 'null'] }, worktree_exists: { type: 'boolean' },
     commits_ahead: { type: ['integer', 'null'] },
     resume_point: { enum: ['skip', 'process_pr', 'implement'] },
@@ -396,7 +402,14 @@ const UI_PROBE_SCHEMA = {
 // agent) does the ENGINE_OWNED filtering.
 const DIFF_PROBE_SCHEMA = {
   type: 'object', required: ['changed_files'],
-  properties: { changed_files: { type: 'array', items: { type: 'string' } } },
+  properties: {
+    changed_files: { type: 'array', items: { type: 'string' } },
+    // added_files: optional — files newly created on this branch (absent from
+    // origin/TARGET at baseline). Only runEngineOwnedGate's probe populates this
+    // (a second `--diff-filter=A` command); other DIFF_PROBE_SCHEMA callers omit
+    // it and get today's behavior unchanged (see the revert-stage partition).
+    added_files: { type: 'array', items: { type: 'string' } },
+  },
 }
 const CLAIM_SCHEMA = {
   type: 'object', required: ['issue', 'claimed'],
@@ -750,6 +763,36 @@ function memberIssues(ctx) {
   return (ctx.members || []).map(function (m) { return m.issue })
 }
 
+// batchClosesIssues (issue #30): the deduped issue numbers whose work is actually
+// IN the batch branch — used to derive the batch PR's "Closes #N" lines and the
+// gate/title/groups that must agree with them by construction (see the batch-PR
+// block below). A result counts as shipped when:
+//   - status==='completed' (this pass did the work), OR
+//   - status==='skipped' AND merged_into_target===true (a PRIOR pass's per-issue
+//     PR already merged into THIS run's TARGET — see the resume_point==='skip'
+//     return in processIssue() above, which computes merged_into_target from the
+//     structured pr_state/pr_base preflight fields, never from reason text).
+// Everything else (failed/not_started/dissolved, or a skip whose PR merged into a
+// DIFFERENT branch) contributes nothing. flatMaps over r.members (falling back to
+// [r.issue] for a non-grouped result) so a shipped group closes every member, not
+// just its primary — mirrors the inline flatMap the batch-PR prompt used to do
+// itself. Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker so
+// tests/harness.js can drive it directly.
+function batchClosesIssues(results) {
+  const out = []
+  const seen = {}
+  for (const r of results || []) {
+    if (!r) continue
+    const shipped = r.status === 'completed' || (r.status === 'skipped' && r.merged_into_target === true)
+    if (!shipped) continue
+    const members = (r.members && r.members.length) ? r.members : [r.issue]
+    for (const n of members) {
+      if (!seen[n]) { seen[n] = true; out.push(n) }
+    }
+  }
+  return out
+}
+
 // worktreeAnchor: the issue number passed to setup-worktree.sh as the physical
 // worktree/branch anchor. A group's worktree/branch/PR identity is bound to its
 // STABLE groupId (the lowest issue number ever proposed as a member — see
@@ -927,6 +970,22 @@ function laneKey(unitIndices) {
 function sortLanesByLowestIndex(lanes) {
   lanes.sort(function (a, b) { return Math.min.apply(null, a.unitIndices) - Math.min.apply(null, b.unitIndices) })
   return lanes
+}
+
+// laneMemberIssues: flatten-and-dedup the member issue numbers across every unit
+// in a lane, using memberIssues() so a lane's reported issue list matches the
+// semantics every other member-issue call site already uses (a consolidated
+// group unit contributes ALL its members, not just its primary issue). Extracted
+// as a named helper — rather than inlined at its one call site (the DRY_RUN
+// lanesPreviewOut composition, further down) — specifically so it sits before
+// the TICKETMILL-TEST-HARNESS-SPLIT marker and is directly unit-testable; the
+// lanesPreviewOut block itself lives after the split and is unreachable by
+// tests/harness.js.
+function laneMemberIssues(units, unitIndices) {
+  return unitIndices.reduce(function (acc, i) {
+    memberIssues(units[i]).forEach(function (n) { if (acc.indexOf(n) === -1) acc.push(n) })
+    return acc
+  }, [])
 }
 
 // computeLanes: pure reducer (issue #1, lane scheduling) that groups deriveUnits()'s
@@ -1470,13 +1529,13 @@ function aggregateTokens(results, spent, concurrency) {
       anyTracked = true
       const total = t.total || 0
       sumDeltas += total
-      byIssue.push({ issue: r.issue, total: total, byModel: Object.assign({}, t.byModel || {}), tracked: true })
+      byIssue.push({ issue: r.issue, total: total, by_model: Object.assign({}, t.byModel || {}), tracked: true })
       const models = t.byModel || {}
       for (const m in models) {
         if (Object.prototype.hasOwnProperty.call(models, m)) byModel[m] = (byModel[m] || 0) + models[m]
       }
     } else {
-      byIssue.push({ issue: r && r.issue, total: null, byModel: {}, tracked: false })
+      byIssue.push({ issue: r && r.issue, total: null, by_model: {}, tracked: false })
     }
   }
 
@@ -1518,7 +1577,7 @@ function aggregateTokens(results, spent, concurrency) {
     lines.push('|' + header.map(function () { return ' --- ' }).join('|') + '|')
     for (const row of byIssue) {
       const cells = ['#' + row.issue].concat(models.map(function (m) {
-        return row.tracked ? String(row.byModel[m] || 0) : 'not tracked'
+        return row.tracked ? String(row.by_model[m] || 0) : 'not tracked'
       }))
       cells.push(row.tracked ? String(row.total) : 'not tracked')
       lines.push('| ' + cells.join(' | ') + ' |')
@@ -2088,6 +2147,10 @@ async function runEngineOwnedGate(ctx) {
     'READ-ONLY probe for issue #' + ctx.issue + ': list every file this issue\'s implementation changed. Run exactly:',
     'git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --name-only',
     'Return changed_files (the output lines as an array; empty array if none).',
+    '',
+    'Also run this second command to find files newly created on this branch (absent from the batch baseline):',
+    'git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --diff-filter=A --name-only',
+    'Return added_files (the output lines as an array; empty array if none).',
   ].join('\n'), stageOpts('probe'), DIFF_PROBE_SCHEMA)
   if (!probe) {
     log('#' + ctx.issue + ' engine-owned gate: diff probe died — degrading (recorded), not blocking the issue')
@@ -2110,7 +2173,35 @@ async function runEngineOwnedGate(ctx) {
   }
   if (!revertFiles.length) return { ok: true }
 
+  // Partition revertFiles: createdFiles are absent from origin/TARGET (git
+  // checkout errors 'pathspec did not match any file(s)' on these — they must
+  // be git rm'd instead); existingFiles are the rest, handled via checkout as
+  // before. added_files is optional (older/degraded probe responses omit it),
+  // in which case createdFiles is empty and behavior is unchanged from before
+  // this partition existed — checkout attempts the created path too, fails,
+  // and the stage degrades to a recorded ctx.deferred follow-up as it always did.
+  const addedFiles = probe.added_files || []
+  const createdFiles = revertFiles.filter(function (f) { return addedFiles.indexOf(f) !== -1 })
+  const existingFiles = revertFiles.filter(function (f) { return addedFiles.indexOf(f) === -1 })
+
   log('#' + ctx.issue + ' engine-owned gate: regime (c) incidental change — hard-reverting ' + revertFiles.join(', ') + ' to origin/' + TARGET)
+  const revertSteps = []
+  let stepNum = 1
+  if (existingFiles.length) {
+    revertSteps.push(
+      stepNum++ + '. git -C ' + ctx.worktree + ' checkout origin/' + TARGET + ' -- ' + existingFiles.map(function (f) { return '"' + f + '"' }).join(' ')
+    )
+  }
+  if (createdFiles.length) {
+    revertSteps.push(
+      stepNum++ + '. git -C ' + ctx.worktree + ' rm ' + createdFiles.map(function (f) { return '"' + f + '"' }).join(' ')
+    )
+  }
+  revertSteps.push(
+    stepNum++ + '. Confirm the revert is exact: git -C ' + ctx.worktree + ' diff origin/' + TARGET + ' -- ' + revertFiles.map(function (f) { return '"' + f + '"' }).join(' ') + ' (must be empty)',
+    stepNum++ + '. git -C ' + ctx.worktree + ' commit -m "revert(engine): drop incidental engine-owned change(s) (#' + ctx.issue + ')"',
+    stepNum++ + '. git -C ' + ctx.worktree + ' push origin ' + ctx.branch
+  )
   const revert = await stage(ctx, 'engine-owned-revert', [
     'The scope guard\'s OUT-OF-SCOPE clause above (engine-owned paths — do not stage, commit, or restore them) does NOT',
     'apply to this stage: this stage IS the deterministic guardrail acting on your behalf. Carry out the steps below.',
@@ -2122,14 +2213,15 @@ async function runEngineOwnedGate(ctx) {
     '',
     'Hard-revert EXACTLY these paths to the batch baseline, and touch NOTHING else:',
     revertFiles.map(function (f) { return '- ' + f }).join('\n'),
+    (createdFiles.length
+      ? '\nOf these, the following were newly created on this branch (absent from origin/' + TARGET + ') — git rm them' +
+        ' rather than checking them out:\n' + createdFiles.map(function (f) { return '- ' + f }).join('\n')
+      : ''),
     '',
-    '1. git -C ' + ctx.worktree + ' checkout origin/' + TARGET + ' -- ' + revertFiles.map(function (f) { return '"' + f + '"' }).join(' '),
-    '2. Confirm the revert is exact: git -C ' + ctx.worktree + ' diff origin/' + TARGET + ' -- ' + revertFiles.map(function (f) { return '"' + f + '"' }).join(' ') + ' (must be empty)',
-    '3. git -C ' + ctx.worktree + ' commit -m "revert(engine): drop incidental engine-owned change(s) (#' + ctx.issue + ')"',
-    '4. git -C ' + ctx.worktree + ' push origin ' + ctx.branch,
+    revertSteps.join('\n'),
     '',
-    'Restore ONLY via that checkout from origin/' + TARGET + ' — never from git log/reflog/history on this branch, and never by',
-    're-authoring the file yourself. Stage and commit nothing outside the listed paths.',
+    'Restore existing paths ONLY via checkout from origin/' + TARGET + ' — never from git log/reflog/history on this branch, and',
+    'never by re-authoring the file yourself. Stage and commit nothing outside the listed paths.',
     'Return status, commit, files_changed, summary.',
   ].join('\n'), stageOpts('fix'), FIX_SCHEMA, 1)
   if (!revert || revert.status === 'error') {
@@ -2407,7 +2499,7 @@ async function runMergeAutoResolve(ctx) {
     'That command exits 0 if origin/' + TARGET + ' IS an ancestor of HEAD (TARGET has not moved past what tests',
     'just verified — safe to push) and non-zero if it moved further (the just-tested state is now stale).',
     'Return moved (boolean: true if the command exited non-zero / TARGET moved further, false otherwise).',
-  ].join('\n'), stageOpts('probe'), MERGE_GUARD_SCHEMA, 1)
+  ].join('\n'), stageOpts('probe'), MERGE_GUARD_SCHEMA)
   if (!guard) return { ok: false, error: 'pre-force-push guard stage died' }
   if (guard.moved) {
     ctx.metrics.merge_thrash = (ctx.metrics.merge_thrash || 0) + 1
@@ -3526,7 +3618,15 @@ async function processIssue(pre) {
   }
   if (pre.resume_point === 'skip') {
     log('#' + ctx.issue + ' skipped: ' + pre.reason)
-    return { issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx) }
+    // merged_into_target (issue #30): true ONLY when the related PR pr_state
+    // reported 'merged' AND its base branch (pr_base) is THIS run's batch branch
+    // (TARGET) — a plain string match done here in JS, where TARGET is
+    // authoritative, never left to agent judgment. A PR merged into a different
+    // branch (e.g. a concurrent run's own batch branch, or straight into BASE)
+    // must NOT count as "shipped into TARGET" — see batchClosesIssues() below,
+    // which is the sole reader of this field.
+    const merged_into_target = pre.pr_state === 'merged' && pre.pr_base === TARGET
+    return { issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target }
   }
   if (pre.resume_point === 'process_pr') {
     log('#' + ctx.issue + ' healing: open PR #' + ctx.pr + ' found — jumping to review/merge')
@@ -3875,16 +3975,16 @@ let preflights = (await Promise.all(issueList.map(function (it) {
     'Probe the current state of GitHub issue #' + it.number + ' in ' + REPO + ' (READ-ONLY: gh + git inspection, no changes).',
     '',
     '1. gh issue view ' + it.number + ' --repo ' + REPO + ' --json state,title,body',
-    '2. Related PRs: gh pr list --repo ' + REPO + ' --state all --search "' + it.number + '" --json number,state,headRefName,mergedAt',
+    '2. Related PRs: gh pr list --repo ' + REPO + ' --state all --search "' + it.number + '" --json number,state,headRefName,baseRefName,mergedAt',
     '   A PR is related if its head branch starts with "issue-' + it.number + '-" or its body references #' + it.number + '.',
-    '   Prefer: merged > open > closed-unmerged. Report its number and state.',
+    '   Prefer: merged > open > closed-unmerged. Report its number, state, and base branch (baseRefName) as pr_base — null if no related PR.',
     '3. Local: does ' + WORKTREES + '/issue-' + it.number + ' exist, and on what branch? Commits ahead:',
     '   git -C ' + ROOT + ' rev-list --count origin/' + TARGET + '..<branch> 2>/dev/null (0/none if no branch).',
     '4. Engine-owned guardrail (issue #3): is the ROOT working tree dirty under any engine-owned path right now?',
     '   git -C ' + ROOT + ' status --porcelain -- ' + enginePathspec.join(' '),
     '   Return every dirty path under that pathspec as root_dirty_engine_paths (empty array if the pathspec is clean).',
     '',
-    '4. predicted_files (best-effort lane-scheduling hint — fail open to [] on ANY doubt, never guess a path):',
+    '5. predicted_files (best-effort lane-scheduling hint — fail open to [] on ANY doubt, never guess a path):',
     '   a. From the issue title + body, extract ONLY high-signal identifiers: backticked spans (`like this`),',
     '      quoted spans ("like this"), path-like strings (contain a / or a file extension such as .js/.md/.json/.sh),',
     '      and code-symbol tokens (PascalCase, camelCase, snake_case, or ALL_CAPS words of 3+ chars).',
@@ -3898,7 +3998,7 @@ let preflights = (await Promise.all(issueList.map(function (it) {
     '      case-insensitive substring match for a path/filename match. Keep ONLY the exact repo-relative paths those',
     '      commands actually return — never fabricate or normalize a path yourself.',
     '   c. Dedupe and cap at 20 paths. If every resolution comes back empty, or any command errors, predicted_files = [].',
-    '5. depends_on (best-effort lane-scheduling hint — fail open to [] on ANY doubt):',
+    '6. depends_on (best-effort lane-scheduling hint — fail open to [] on ANY doubt):',
     '   a. Scan the issue body for "depends on #N", "depends-on #N", or "follow-up to #N" (case-insensitive). Collect each N.',
     '   b. Drop any N that is not one of this batch\'s issue numbers (' + batchIssueNumbers.join(', ') + '), and drop N == ' + it.number + '.',
     '   c. For each remaining N, check whether #N itself ALSO references "depends on #' + it.number + '" or',
@@ -3911,7 +4011,7 @@ let preflights = (await Promise.all(issueList.map(function (it) {
     '- "skip": issue is closed OR a related PR is already merged',
     '- "process_pr": a related PR is OPEN (implementation exists; it needs review + merge)',
     '- "implement": otherwise (fresh, or partial branch/worktree — implementation will continue from existing commits)',
-    'Return issue, title, body, issue_state, pr_number, pr_state, branch, worktree_exists, commits_ahead, resume_point, reason (one line), root_dirty_engine_paths,',
+    'Return issue, title, body, issue_state, pr_number, pr_state, pr_base, branch, worktree_exists, commits_ahead, resume_point, reason (one line), root_dirty_engine_paths,',
     'predicted_files (array of real repo-relative paths, [] if none/uncertain), depends_on (array of in-batch issue numbers, [] if none/uncertain).',
   ].join('\n'), { label: it.number + ':preflight', phase: 'Select', schema: PREFLIGHT_SCHEMA, model: M.probe.model, effort: M.probe.effort })
     .then(function (r) {
@@ -3925,7 +4025,7 @@ let preflights = (await Promise.all(issueList.map(function (it) {
         return r
       }
       // probe died -> assume full implement; the pipeline stages are individually idempotent
-      return { issue: it.number, title: it.title || '', body: '', issue_state: 'unknown', pr_number: null, pr_state: 'none', branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)', root_dirty_engine_paths: [], predicted_files: [], depends_on: [] }
+      return { issue: it.number, title: it.title || '', body: '', issue_state: 'unknown', pr_number: null, pr_state: 'none', pr_base: null, branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)', root_dirty_engine_paths: [], predicted_files: [], depends_on: [] }
     })
 }))).filter(Boolean)
 
@@ -4009,7 +4109,7 @@ if (DRY_RUN) {
   })
   const lanesPreviewOut = previewLanes.map(function (l) {
     return {
-      issues: l.unitIndices.map(function (i) { return previewUnits[i].issue }),
+      issues: laneMemberIssues(previewUnits, l.unitIndices),
       predicted_files: l.predicted_files,
       provenance: l.unitIndices.length < 2 ? 'none' : (previewTrustedKeys[laneKey(l.unitIndices)] ? 'trusted' : 'heuristic'),
     }
@@ -4225,36 +4325,42 @@ const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
 
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
-const completedIssues = results.filter(function (r) { return r && r.status === 'completed' })
-// Groups this run actually completed (a group unit's result carries the primary's
+// shippedIssues (issue #30): the union, across THIS pass's completions and any
+// prior pass's already-merged-into-TARGET skips, of every issue number whose
+// work is actually in the batch branch — see batchClosesIssues() above
+// memberIssues(). Driving the create/update gate, the title count, the
+// Consolidated Groups section, AND the Closes lines all off this one set is what
+// keeps them coherent by construction: a resumed/healing pass can no longer
+// rebuild a body that drops a Closes line for a member merged in a prior pass.
+const shippedIssues = batchClosesIssues(results)
+// Groups this run actually shipped (a group unit's result carries the primary's
 // issue number, materialized/reconciled BEFORE processIssue ran — see finalGroups
 // above), reused for the explicit "## Consolidated Groups" section below.
-const completedGroups = finalGroups.filter(function (g) {
-  return completedIssues.some(function (r) { return r.issue === g.primary })
+const shippedGroups = finalGroups.filter(function (g) {
+  return shippedIssues.indexOf(g.primary) !== -1
 })
-if (completedIssues.length) {
+if (shippedIssues.length) {
   const bp = await agent([
     'Create (or update) the batch integration PR for this run — DO NOT MERGE IT under any circumstances;',
     'a human reviews and merges this PR.',
     '',
     '1. Existing? gh pr list --repo ' + REPO + ' --head ' + TARGET + ' --base ' + BASE + ' --state open --json number',
     '2. If none: gh pr create --repo ' + REPO + ' --base ' + BASE + ' --head ' + TARGET,
-    '   Title: "Batch ' + RUN_TAG + ': ' + completedIssues.length + ' issue(s) (' + TARGET + ')"',
+    '   Title: "Batch ' + RUN_TAG + ': ' + shippedIssues.length + ' issue(s) (' + TARGET + ')"',
     '   Body must contain:',
-    '   - one "Closes #<issue>" line per completed issue AND every issue absorbed into it via',
-    '     consolidation (flatMap so a completed group closes EVERY member, not just its primary —',
-    '     this is what closes them all on merge):',
-    completedIssues.flatMap(function (r) { return (r.members && r.members.length ? r.members : [r.issue]) })
-      .map(function (n) { return '     Closes #' + n }).join('\n'),
+    '   - one "Closes #<issue>" line per shipped issue — every issue completed this pass AND every',
+    '     issue absorbed via consolidation AND every issue whose per-issue PR already merged into',
+    '     ' + TARGET + ' in a PRIOR pass (a resumed/healing run must not drop those):',
+    shippedIssues.map(function (n) { return '     Closes #' + n }).join('\n'),
     '   - a results table (Issue | Title | PR into batch | Status) built from:',
     JSON.stringify(results.map(function (r) { return { issue: r.issue, title: r.title, pr: r.pr, status: r.status } })).slice(0, 6000),
-    completedGroups.length
+    shippedGroups.length
       ? '   - a "## Consolidated Groups" section the reviewer MUST see, listing EXACTLY these lines (one\n' +
         '     line per group: its primary issue, every absorbed member, and why they were grouped):\n' +
-        completedGroups.map(function (g) {
+        shippedGroups.map(function (g) {
           return '     - primary #' + g.primary + ' — members: ' + g.members.map(function (n) { return '#' + n }).join(', ') + ' — ' + g.rationale
         }).join('\n')
-      : '   - (no consolidation groups completed this run — every issue merged as its own unit)',
+      : '   - (no consolidation groups shipped this run — every issue merged as its own unit)',
     VERIFY_SKIPS.length
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
@@ -4270,7 +4376,7 @@ if (completedIssues.length) {
   if (batchPr) log('batch PR: #' + batchPr + ' (' + TARGET + ' -> ' + BASE + ') — awaiting human review, NOT merged')
   else log('batch PR creation failed — create manually: gh pr create --repo ' + REPO + ' --base ' + BASE + ' --head ' + TARGET)
 } else {
-  log('no completed issues — skipping batch PR (' + TARGET + ' has nothing to integrate)')
+  log('no shipped issues — skipping batch PR (' + TARGET + ' has nothing to integrate)')
 }
 
 // ---- Report ----
