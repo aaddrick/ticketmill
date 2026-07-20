@@ -357,6 +357,12 @@ const PREFLIGHT_SCHEMA = {
     issue_state: { enum: ['open', 'closed', 'unknown'] },
     pr_number: { type: ['integer', 'null'] },
     pr_state: { enum: ['open', 'merged', 'closed', 'none'] },
+    // pr_base (issue #30): base branch of the SAME related PR pr_state/pr_number
+    // describe — null if no related PR. Lets the JS skip-return below string-match
+    // it against TARGET (the batch branch), so "merged into ANY branch" (e.g. a
+    // concurrent run's own batch branch) is never confused with "merged into THIS
+    // run's batch branch". See merged_into_target at the resume_point==='skip' return.
+    pr_base: { type: ['string', 'null'] },
     branch: { type: ['string', 'null'] }, worktree_exists: { type: 'boolean' },
     commits_ahead: { type: ['integer', 'null'] },
     resume_point: { enum: ['skip', 'process_pr', 'implement'] },
@@ -755,6 +761,36 @@ function pickPrimary(members, proposedPrimary) {
 // [ctx.issue] — the no-group case never sees anything new here.
 function memberIssues(ctx) {
   return (ctx.members || []).map(function (m) { return m.issue })
+}
+
+// batchClosesIssues (issue #30): the deduped issue numbers whose work is actually
+// IN the batch branch — used to derive the batch PR's "Closes #N" lines and the
+// gate/title/groups that must agree with them by construction (see the batch-PR
+// block below). A result counts as shipped when:
+//   - status==='completed' (this pass did the work), OR
+//   - status==='skipped' AND merged_into_target===true (a PRIOR pass's per-issue
+//     PR already merged into THIS run's TARGET — see the resume_point==='skip'
+//     return in processIssue() above, which computes merged_into_target from the
+//     structured pr_state/pr_base preflight fields, never from reason text).
+// Everything else (failed/not_started/dissolved, or a skip whose PR merged into a
+// DIFFERENT branch) contributes nothing. flatMaps over r.members (falling back to
+// [r.issue] for a non-grouped result) so a shipped group closes every member, not
+// just its primary — mirrors the inline flatMap the batch-PR prompt used to do
+// itself. Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker so
+// tests/harness.js can drive it directly.
+function batchClosesIssues(results) {
+  const out = []
+  const seen = {}
+  for (const r of results || []) {
+    if (!r) continue
+    const shipped = r.status === 'completed' || (r.status === 'skipped' && r.merged_into_target === true)
+    if (!shipped) continue
+    const members = (r.members && r.members.length) ? r.members : [r.issue]
+    for (const n of members) {
+      if (!seen[n]) { seen[n] = true; out.push(n) }
+    }
+  }
+  return out
 }
 
 // worktreeAnchor: the issue number passed to setup-worktree.sh as the physical
@@ -3582,7 +3618,15 @@ async function processIssue(pre) {
   }
   if (pre.resume_point === 'skip') {
     log('#' + ctx.issue + ' skipped: ' + pre.reason)
-    return { issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx) }
+    // merged_into_target (issue #30): true ONLY when the related PR pr_state
+    // reported 'merged' AND its base branch (pr_base) is THIS run's batch branch
+    // (TARGET) — a plain string match done here in JS, where TARGET is
+    // authoritative, never left to agent judgment. A PR merged into a different
+    // branch (e.g. a concurrent run's own batch branch, or straight into BASE)
+    // must NOT count as "shipped into TARGET" — see batchClosesIssues() below,
+    // which is the sole reader of this field.
+    const merged_into_target = pre.pr_state === 'merged' && pre.pr_base === TARGET
+    return { issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target }
   }
   if (pre.resume_point === 'process_pr') {
     log('#' + ctx.issue + ' healing: open PR #' + ctx.pr + ' found — jumping to review/merge')
@@ -3931,9 +3975,9 @@ let preflights = (await Promise.all(issueList.map(function (it) {
     'Probe the current state of GitHub issue #' + it.number + ' in ' + REPO + ' (READ-ONLY: gh + git inspection, no changes).',
     '',
     '1. gh issue view ' + it.number + ' --repo ' + REPO + ' --json state,title,body',
-    '2. Related PRs: gh pr list --repo ' + REPO + ' --state all --search "' + it.number + '" --json number,state,headRefName,mergedAt',
+    '2. Related PRs: gh pr list --repo ' + REPO + ' --state all --search "' + it.number + '" --json number,state,headRefName,baseRefName,mergedAt',
     '   A PR is related if its head branch starts with "issue-' + it.number + '-" or its body references #' + it.number + '.',
-    '   Prefer: merged > open > closed-unmerged. Report its number and state.',
+    '   Prefer: merged > open > closed-unmerged. Report its number, state, and base branch (baseRefName) as pr_base — null if no related PR.',
     '3. Local: does ' + WORKTREES + '/issue-' + it.number + ' exist, and on what branch? Commits ahead:',
     '   git -C ' + ROOT + ' rev-list --count origin/' + TARGET + '..<branch> 2>/dev/null (0/none if no branch).',
     '4. Engine-owned guardrail (issue #3): is the ROOT working tree dirty under any engine-owned path right now?',
@@ -3967,7 +4011,7 @@ let preflights = (await Promise.all(issueList.map(function (it) {
     '- "skip": issue is closed OR a related PR is already merged',
     '- "process_pr": a related PR is OPEN (implementation exists; it needs review + merge)',
     '- "implement": otherwise (fresh, or partial branch/worktree — implementation will continue from existing commits)',
-    'Return issue, title, body, issue_state, pr_number, pr_state, branch, worktree_exists, commits_ahead, resume_point, reason (one line), root_dirty_engine_paths,',
+    'Return issue, title, body, issue_state, pr_number, pr_state, pr_base, branch, worktree_exists, commits_ahead, resume_point, reason (one line), root_dirty_engine_paths,',
     'predicted_files (array of real repo-relative paths, [] if none/uncertain), depends_on (array of in-batch issue numbers, [] if none/uncertain).',
   ].join('\n'), { label: it.number + ':preflight', phase: 'Select', schema: PREFLIGHT_SCHEMA, model: M.probe.model, effort: M.probe.effort })
     .then(function (r) {
@@ -3981,7 +4025,7 @@ let preflights = (await Promise.all(issueList.map(function (it) {
         return r
       }
       // probe died -> assume full implement; the pipeline stages are individually idempotent
-      return { issue: it.number, title: it.title || '', body: '', issue_state: 'unknown', pr_number: null, pr_state: 'none', branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)', root_dirty_engine_paths: [], predicted_files: [], depends_on: [] }
+      return { issue: it.number, title: it.title || '', body: '', issue_state: 'unknown', pr_number: null, pr_state: 'none', pr_base: null, branch: null, worktree_exists: false, commits_ahead: null, resume_point: 'implement', reason: 'preflight probe died — defaulting to implement (stages self-heal)', root_dirty_engine_paths: [], predicted_files: [], depends_on: [] }
     })
 }))).filter(Boolean)
 
@@ -4281,36 +4325,42 @@ const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
 
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
-const completedIssues = results.filter(function (r) { return r && r.status === 'completed' })
-// Groups this run actually completed (a group unit's result carries the primary's
+// shippedIssues (issue #30): the union, across THIS pass's completions and any
+// prior pass's already-merged-into-TARGET skips, of every issue number whose
+// work is actually in the batch branch — see batchClosesIssues() above
+// memberIssues(). Driving the create/update gate, the title count, the
+// Consolidated Groups section, AND the Closes lines all off this one set is what
+// keeps them coherent by construction: a resumed/healing pass can no longer
+// rebuild a body that drops a Closes line for a member merged in a prior pass.
+const shippedIssues = batchClosesIssues(results)
+// Groups this run actually shipped (a group unit's result carries the primary's
 // issue number, materialized/reconciled BEFORE processIssue ran — see finalGroups
 // above), reused for the explicit "## Consolidated Groups" section below.
-const completedGroups = finalGroups.filter(function (g) {
-  return completedIssues.some(function (r) { return r.issue === g.primary })
+const shippedGroups = finalGroups.filter(function (g) {
+  return shippedIssues.indexOf(g.primary) !== -1
 })
-if (completedIssues.length) {
+if (shippedIssues.length) {
   const bp = await agent([
     'Create (or update) the batch integration PR for this run — DO NOT MERGE IT under any circumstances;',
     'a human reviews and merges this PR.',
     '',
     '1. Existing? gh pr list --repo ' + REPO + ' --head ' + TARGET + ' --base ' + BASE + ' --state open --json number',
     '2. If none: gh pr create --repo ' + REPO + ' --base ' + BASE + ' --head ' + TARGET,
-    '   Title: "Batch ' + RUN_TAG + ': ' + completedIssues.length + ' issue(s) (' + TARGET + ')"',
+    '   Title: "Batch ' + RUN_TAG + ': ' + shippedIssues.length + ' issue(s) (' + TARGET + ')"',
     '   Body must contain:',
-    '   - one "Closes #<issue>" line per completed issue AND every issue absorbed into it via',
-    '     consolidation (flatMap so a completed group closes EVERY member, not just its primary —',
-    '     this is what closes them all on merge):',
-    completedIssues.flatMap(function (r) { return (r.members && r.members.length ? r.members : [r.issue]) })
-      .map(function (n) { return '     Closes #' + n }).join('\n'),
+    '   - one "Closes #<issue>" line per shipped issue — every issue completed this pass AND every',
+    '     issue absorbed via consolidation AND every issue whose per-issue PR already merged into',
+    '     ' + TARGET + ' in a PRIOR pass (a resumed/healing run must not drop those):',
+    shippedIssues.map(function (n) { return '     Closes #' + n }).join('\n'),
     '   - a results table (Issue | Title | PR into batch | Status) built from:',
     JSON.stringify(results.map(function (r) { return { issue: r.issue, title: r.title, pr: r.pr, status: r.status } })).slice(0, 6000),
-    completedGroups.length
+    shippedGroups.length
       ? '   - a "## Consolidated Groups" section the reviewer MUST see, listing EXACTLY these lines (one\n' +
         '     line per group: its primary issue, every absorbed member, and why they were grouped):\n' +
-        completedGroups.map(function (g) {
+        shippedGroups.map(function (g) {
           return '     - primary #' + g.primary + ' — members: ' + g.members.map(function (n) { return '#' + n }).join(', ') + ' — ' + g.rationale
         }).join('\n')
-      : '   - (no consolidation groups completed this run — every issue merged as its own unit)',
+      : '   - (no consolidation groups shipped this run — every issue merged as its own unit)',
     VERIFY_SKIPS.length
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
@@ -4326,7 +4376,7 @@ if (completedIssues.length) {
   if (batchPr) log('batch PR: #' + batchPr + ' (' + TARGET + ' -> ' + BASE + ') — awaiting human review, NOT merged')
   else log('batch PR creation failed — create manually: gh pr create --repo ' + REPO + ' --base ' + BASE + ' --head ' + TARGET)
 } else {
-  log('no completed issues — skipping batch PR (' + TARGET + ' has nothing to integrate)')
+  log('no shipped issues — skipping batch PR (' + TARGET + ' has nothing to integrate)')
 }
 
 // ---- Report ----

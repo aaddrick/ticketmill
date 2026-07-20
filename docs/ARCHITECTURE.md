@@ -138,6 +138,37 @@ batch PR's `Closes #N` lines when the human merges it. This keeps N issues'
 worth of autonomous merges off the base branch while preserving per-issue review
 trails.
 
+### Closes lines: keyed off shipped issues, not raw completion status
+
+The batch PR's `Closes #N` lines used to come straight from `results.filter(r
+=> r.status === 'completed')`. That's correct for a single, unbroken pass, but
+it breaks on a healing or resumed run. An issue whose per-issue PR already
+merged into TARGET during a PRIOR pass preflights this pass as `status:
+'skipped'` (a related PR is already merged, so Select routes it straight to
+`resume_point: 'skip'`). Filtering on `completed` alone drops that issue from
+the Closes lines silently, and it stays open when the human merges the batch
+PR.
+
+`batchClosesIssues(results)` fixes this by keying inclusion on a `shipped` set
+instead of raw status: an issue counts as shipped when `status ===
+'completed'`, or when `status === 'skipped'` and `merged_into_target ===
+true`. `merged_into_target` is computed in JS at the `resume_point === 'skip'`
+return, as `pre.pr_state === 'merged' && pre.pr_base === TARGET`. That's a
+plain string match against TARGET, the one value in scope that's
+authoritative about which batch branch this run owns. It guards the
+mirror-image bug too: a PR merged into a DIFFERENT batch branch, a
+concurrent run's own TARGET or straight into BASE, must not count as shipped
+into this one. `pr_base` is a new preflight schema field, read from `gh pr
+list --json ...,baseRefName` at probe time alongside the existing `pr_state`.
+
+`batchClosesIssues` flatMaps over each result's `members` (falling back to
+`[r.issue]` when the result isn't grouped) and dedups, so a shipped
+consolidation group still closes every member, not just its primary. The
+same `shippedIssues` set now drives the batch PR's create/update gate, the
+title's issue count, and the "## Consolidated Groups" section as well as the
+Closes lines, so a resumed pass can't rebuild one of those four pieces
+in a way that disagrees with the other three.
+
 ### Merge auto-resolve: one mechanical recovery attempt before needs_human
 
 A PR whose preflight reads `CONFLICTING` used to escalate straight to
