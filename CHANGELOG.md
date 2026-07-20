@@ -7,7 +7,7 @@
   stage," but no stage ever actually performed it — Batch 2026-07-19-e (PR
   #56) merged real engine changes to main with the version and CHANGELOG left
   stale, requiring a manual repair commit (v0.1.28). Adds an OPTIONAL,
-  profile-gated `release` field (`version_files`, `changelog_file`, `bump`)
+  profile-gated `release` field (`version_files`, `changelog`, `bump`)
   and a Report-phase batch release stage that runs once per batch, before the
   batch-PR agent, so the bump lands inside the human-reviewed diff by
   construction. The stage regenerates a single CHANGELOG section in place
@@ -15,10 +15,9 @@
   ephemeral `git worktree` — the run root is never mutated, and a push
   failure is non-fatal-but-logged. Activates `release` in this repo's own
   `.claude/ticketmill.json` (`version_files: [".claude-plugin/plugin.json"]`,
-  `changelog_file: "CHANGELOG.md"`, `bump: null`); the new stage will not fire
+  `changelog: "CHANGELOG.md"`, `bump: null`); the new stage will not fire
   for this batch since the running engine at the run root predates it, so
-  this entry and the version bump are done by hand, as this repo's release
-  process requires on every change.
+  this entry and the version bump are done by hand this one time.
 
   Deferred follow-up (out of scope for this issue): `.claude/agents/
   ticketmill-implementer.md` and `ticketmill-code-reviewer.md` still read as
