@@ -57,6 +57,36 @@ export const meta = {
 //                                        // predicted-file overlap drive lanes.
 //     "docblock_globs": ["app/**/*.php"],// files needing docblocks; null = skip stage
 //     "docs_dir": "docs",                // tech-docs stage target; null = skip stage
+//     "release": null,                   // OPTIONAL, default null (stage skipped
+//                                        // entirely, no agent call): batch-level
+//                                        // CHANGELOG + version-file bump, owned by the
+//                                        // Report phase, run ONCE per batch immediately
+//                                        // before the batch PR agent — so the bump
+//                                        // lands inside the human-reviewed TARGET->BASE
+//                                        // diff by construction. Per-issue stages must
+//                                        // NOT bump versions themselves.
+//                                        // { "version_files": [".claude-plugin/plugin.json"],
+//                                        //   "changelog": "CHANGELOG.md",  // default shown
+//                                        //   "bump": null }               // "major"|"minor"|"patch" override;
+//                                        //                                // unset = derive from shipped
+//                                        //                                // commit types (any "feat" -> minor,
+//                                        //                                // else patch) — see deriveReleaseVersion().
+//                                        // version_files: JSON file(s) with a top-level "version"
+//                                        // string key, bumped in place. Name the CANONICAL file only —
+//                                        // never a path also listed in lockstep_installed_paths; that
+//                                        // file's own mirroring tooling keeps it in sync, a second bump
+//                                        // commit would just fight it. marketplace.json carries no
+//                                        // version field of its own — never add one here or anywhere else.
+//                                        // The next version is always computed from origin/BASE's
+//                                        // version_files[0] (never TARGET), so a resumed/healing pass
+//                                        // regenerates the identical version + CHANGELOG section in place
+//                                        // instead of double-bumping. CAVEAT: two batch PRs open
+//                                        // concurrently against the same BASE both compute BASE+bump to
+//                                        // the same next version and collide on version_files/changelog at
+//                                        // the second human merge — a git conflict at the human merge gate
+//                                        // (pre-existing under manual bumps, not made worse), not silent
+//                                        // corruption. The generated CHANGELOG entry is an explicit draft;
+//                                        // the human reviewer refines wording inside the batch PR.
 //     "consolidation": true,             // OPTIONAL, default true: Select-phase gate
 //                                        // that groups issues cheaper to resolve as
 //                                        // one unit. false disables the gate entirely
@@ -103,12 +133,13 @@ export const meta = {
 //     // {issue} if present (like serve_command's {port}), else appends -<issue>.
 //     "models": { "plan": { "model": "opus", "effort": "high" } }, // OPTIONAL per-stage
 //                                        // model/effort overrides, keyed by stage name.
-//                                        // Valid keys (24): probe, setup, research,
+//                                        // Valid keys (25): probe, setup, research,
 //                                        // evaluate, consolidation, contrarian, plan,
 //                                        // implement, taskReview, simplify, qReview,
 //                                        // fix, testRun, testValidate, browser,
 //                                        // docblock, pr, specReview, codeReview,
-//                                        // techDocs, merge, report, retro, learnings.
+//                                        // techDocs, merge, release, report, retro,
+//                                        // learnings.
 //                                        // The `M` map below is the source of truth
 //                                        // for these keys and their defaults.
 //     "roles": {
@@ -284,6 +315,7 @@ const M = {
   codeReview:   { model: 'opus', effort: 'high' },
   techDocs:     { model: 'sonnet' },
   merge:        { model: 'sonnet' },
+  release:      { model: 'sonnet' }, // Report-phase batch release stage (gated on profile.release)
   report:       { model: 'sonnet', effort: 'low' },
   retro:        { model: 'sonnet' },
   learnings:    { model: 'sonnet', effort: 'low' },
@@ -312,6 +344,8 @@ let TEST_CMD
 let LOGS = null                 // ROOT + '/' + profile.logs_dir
 let CLAIM_LABEL = 'ticketmill'
 let BROWSER = null              // profile.browser or null
+let RELEASE = null              // profile.release or null (normalized: version_files
+                                 // as strings, changelog defaulted to 'CHANGELOG.md')
 let VERIFY_SKIPS = []           // human-visible verification gaps -> batch PR body
 // ENGINE_OWNED / LOCKSTEP_INSTALLED_PATHS (issue #3): populated at Select from
 // ENGINE_OWNED_GLOBS (~line 1244, declared after this point — assigned via
@@ -564,6 +598,25 @@ const TECH_DOCS_SCHEMA = {
 const PR_SCHEMA = {
   type: 'object', required: ['status'],
   properties: { status: { enum: ['success', 'error'] }, pr_number: { type: ['integer', 'null'] }, pr_url: { type: 'string' }, error: { type: ['string', 'null'] } },
+}
+// ----- Report-phase release stage schemas (gated on profile.release) -----
+const RELEASE_PROBE_SCHEMA = {
+  type: 'object', required: ['base_version', 'commit_types'],
+  properties: {
+    base_version: { type: ['string', 'null'] },
+    commit_types: { type: 'array', items: { type: 'string' } },
+  },
+}
+const RELEASE_SCHEMA = {
+  type: 'object', required: ['status'],
+  properties: {
+    status: { enum: ['success', 'error'] },
+    version: { type: ['string', 'null'] },
+    commit: { type: ['string', 'null'] },
+    pushed: { type: ['boolean', 'null'] },
+    summary: { type: 'string' },
+    error: { type: ['string', 'null'] },
+  },
 }
 const MERGE_SCHEMA = {
   type: 'object', required: ['status'],
@@ -3995,6 +4048,53 @@ function contrarianCapFor(complexity) {
   return complexity === 'trivial' ? Math.min(2, MAX_CONTRARIAN_ITERATIONS) : MAX_CONTRARIAN_ITERATIONS
 }
 
+// releaseEnabled: profile.release is OPTIONAL (default null/absent — the Report-
+// phase release stage never runs, no agent call at all; see "release" in the
+// profile comment block above). An explicit object naming at least one
+// version_files entry opts in. Pure and placed above the TICKETMILL-TEST-HARNESS-
+// SPLIT marker, like consolidationEnabled/shouldWarnBaseBranch, so tests can
+// exercise the gating predicate without seeding module state.
+function releaseEnabled(profile) {
+  return !!(profile && profile.release && Array.isArray(profile.release.version_files) && profile.release.version_files.length)
+}
+
+// deriveReleaseVersion: the release stage's pure bump-derivation helper.
+// BASE-anchored on purpose — `baseVersion` must come from origin/BASE's
+// version_files[0] (read by a read-only probe agent), NEVER from TARGET, so a
+// resumed/healing Report pass recomputes the exact same next version instead of
+// double-bumping a version TARGET already carries from a prior pass. Bump choice:
+// profile.release.bump ("major"|"minor"|"patch") overrides when set; otherwise any
+// "feat" commit type shipped this batch bumps minor, everything else (fix, chore,
+// docs, ...) bumps patch — a batch is exactly one bump regardless of how many
+// distinct commit types it contains. Throws on a non-semver baseVersion (the call
+// site treats that as a non-fatal, logged release-stage skip — see Report phase).
+// Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+function deriveReleaseVersion(baseVersion, commitTypes, profile) {
+  const override = profile && profile.release && profile.release.bump
+  const bump = ['major', 'minor', 'patch'].indexOf(override) !== -1
+    ? override
+    : ((Array.isArray(commitTypes) ? commitTypes : []).indexOf('feat') !== -1 ? 'minor' : 'patch')
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(baseVersion || '').trim())
+  if (!m) throw new Error('deriveReleaseVersion: base version is not a valid semver string: ' + JSON.stringify(baseVersion))
+  let major = Number(m[1]); let minor = Number(m[2]); let patch = Number(m[3])
+  if (bump === 'major') { major += 1; minor = 0; patch = 0 }
+  else if (bump === 'minor') { minor += 1; patch = 0 }
+  else { patch += 1 }
+  return { version: major + '.' + minor + '.' + patch, bump: bump }
+}
+
+// releaseChangelogAnchor: the single, date-independent heading the release stage
+// looks for (and regenerates in place) in the batch's CHANGELOG.md — anchored to
+// the computed version and RUN_TAG, never to a wall-clock date. RUN_TAG is fixed
+// once at run start (args.run_label/args.date, or 'run' — see its declaration
+// above), so calling this with the SAME (version, runTag) pair on a Report pass
+// that resumes after midnight yields the IDENTICAL string as the pass before
+// midnight: the section is found and overwritten in place, never duplicated.
+// Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+function releaseChangelogAnchor(version, runTag) {
+  return '## [' + String(version) + '] - ' + String(runTag)
+}
+
 // ---- TICKETMILL-TEST-HARNESS-SPLIT: tests/harness.js truncates the source at this
 // marker and evaluates only what precedes it; nothing from here down (including the
 // top-level await below) runs under the test harness's vm context. Do not remove or
@@ -4043,6 +4143,17 @@ LOGS = ROOT + '/' + String(PROFILE.logs_dir || 'logs/ticketmill').replace(/^\/+|
 CLAIM_LABEL = String(PROFILE.claim_label || 'ticketmill')
 BROWSER = PROFILE.browser || null
 if (BROWSER && !BROWSER.serve_command) throw new Error('profile.browser is set but has no serve_command — browser verification cannot boot the app')
+RELEASE = PROFILE.release || null
+if (RELEASE) {
+  if (!Array.isArray(RELEASE.version_files) || !RELEASE.version_files.length) {
+    throw new Error('profile.release is set but has no non-empty version_files array — the release stage needs at least one JSON file with a "version" key to bump')
+  }
+  RELEASE.version_files = RELEASE.version_files.map(String)
+  if (RELEASE.bump != null && ['major', 'minor', 'patch'].indexOf(RELEASE.bump) === -1) {
+    throw new Error('profile.release.bump must be "major"|"minor"|"patch" if set, got: ' + JSON.stringify(RELEASE.bump))
+  }
+  RELEASE.changelog = RELEASE.changelog ? String(RELEASE.changelog) : 'CHANGELOG.md'
+}
 ENGINE_OWNED = mergeEngineOwnedGlobs(PROFILE)
 LOCKSTEP_INSTALLED_PATHS = Array.isArray(PROFILE.lockstep_installed_paths) ? PROFILE.lockstep_installed_paths.map(String) : []
 
@@ -4561,6 +4672,105 @@ const shippedGroups = finalGroups.filter(function (g) {
   return shippedIssues.indexOf(g.primary) !== -1
 })
 if (shippedIssues.length) {
+  // ---- RELEASE (non-fatal; gated on profile.release) — batch-level CHANGELOG +
+  // version bump, run ONCE per batch, BEFORE the batch-PR agent so the bump lands
+  // inside the human-reviewed TARGET -> BASE diff by construction. See "release"
+  // in the profile comment block above for the field shape and the concurrent-
+  // batch-collision caveat. Runs as the doc_writer role in an EPHEMERAL worktree
+  // (ROOT itself is never checked out/mutated; the engine's own installed copy at
+  // .claude/workflows/ticketmill.js is never touched by this stage).
+  if (releaseEnabled(PROFILE)) {
+    const versionFile = RELEASE.version_files[0]
+    const releaseProbe = await agent([
+      'READ-ONLY release probe for batch ' + TARGET + ' -> ' + BASE + ' in ' + REPO + '. Make no changes.',
+      '1. git fetch origin ' + BASE + ' ' + TARGET,
+      '2. Read the version currently on origin/' + BASE + ': git show origin/' + BASE + ':' + versionFile,
+      '   Extract the "version" field. If the file does not exist on origin/' + BASE + ' or has no such field,',
+      '   return base_version=null.',
+      '3. List distinct conventional-commit type prefixes shipped in this batch:',
+      '   git log origin/' + BASE + '..origin/' + TARGET + ' --pretty=%s | grep -oE \'^[a-z]+\' | sort -u',
+      '   (empty output is fine — return commit_types=[])',
+      'Return base_version (string or null) and commit_types (array of distinct prefixes found, e.g. ["feat","fix"]).',
+    ].join('\n'), { label: 'release-probe', phase: 'Report', schema: RELEASE_PROBE_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+      .catch(function (e) { log('release probe threw (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
+    if (!releaseProbe || !releaseProbe.base_version) {
+      log('release stage skipped (non-fatal) — could not read a "version" field from origin/' + BASE + ':' + versionFile)
+      VERIFY_SKIPS.push('release stage skipped — could not read the current version from origin/' + BASE + ':' + versionFile)
+    } else {
+      let derived = null
+      try {
+        derived = deriveReleaseVersion(releaseProbe.base_version, releaseProbe.commit_types, PROFILE)
+      } catch (e) {
+        log('release stage skipped (non-fatal): ' + String((e && e.message) || e).slice(0, 200))
+        VERIFY_SKIPS.push('release stage skipped — ' + String((e && e.message) || e).slice(0, 200))
+      }
+      if (derived) {
+        const anchor = releaseChangelogAnchor(derived.version, RUN_TAG)
+        const entryLines = shippedIssues.map(function (n) {
+          const r = results.filter(function (x) { return x.issue === n })[0]
+          return '- ' + (r && r.title ? r.title : ('issue #' + n)) + ' (#' + n + ')'
+        }).join('\n')
+        const releaseWorktree = WORKTREES + '/release-' + TARGET
+        let relWrite = null
+        try {
+          relWrite = await agent([
+            roleBlock('doc_writer'),
+            '',
+            'Batch release bump for ' + TARGET + ' -> ' + BASE + ' in ' + REPO + '. Target version: ' + derived.version +
+              ' (bump: ' + derived.bump + ', computed from origin/' + BASE + '\'s ' + versionFile + ' — NEVER from ' +
+              TARGET + ', so a resumed pass recomputes this exact same version instead of double-bumping).',
+            '',
+            '1. Ephemeral checkout — ROOT itself (' + ROOT + ') is never touched:',
+            '   git -C ' + ROOT + ' worktree add ' + releaseWorktree + ' origin/' + TARGET,
+            '2. In ' + releaseWorktree + ', bump the "version" field to exactly "' + derived.version + '" in EACH of:',
+            '   ' + RELEASE.version_files.join(', '),
+            '3. Regenerate-in-place the ONE batch CHANGELOG section in ' + RELEASE.changelog + ':',
+            '   - The section heading is EXACTLY: ' + JSON.stringify(anchor),
+            '   - If a heading matching that EXACT text already exists (a prior pass of THIS batch already wrote a',
+            '     draft section), REPLACE its body (everything up to the next "## " heading or EOF) with the list',
+            '     below — do not create a second section for the same batch.',
+            '   - If it does not exist yet, insert a new section with that exact heading (placed after the',
+            '     top-level title, before the first existing "## " entry — newest first) containing exactly this list:',
+            entryLines,
+            '   This is an explicit DRAFT for the human reviewer to refine (wording/voice) inside the batch PR —',
+            '   do not agonize over prose polish.',
+            '4. git -C ' + releaseWorktree + ' add -A',
+            '5. git -C ' + releaseWorktree + ' commit -m "chore(release): v' + derived.version + '"',
+            '   (if there is nothing to commit — e.g. a resumed pass regenerated byte-identical content — treat that',
+            '   as status=success with commit=null, not an error)',
+            '6. Push (non-fatal — if this fails, log it and return pushed=false; do NOT throw or retry):',
+            '   git -C ' + releaseWorktree + ' push origin HEAD:' + TARGET,
+            '',
+            'Return status (success|error), version, commit (exact SHA or null), pushed (boolean), summary, error.',
+          ].join('\n'), { label: 'release', phase: 'Report', schema: RELEASE_SCHEMA, model: M.release.model, effort: M.release.effort })
+            .catch(function (e) { log('release write agent threw (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
+        } finally {
+          // Cleanup runs REGARDLESS of the write agent's outcome — an ephemeral
+          // worktree must never linger. Idempotent (safe if worktree add itself
+          // never happened or already failed).
+          const relCleanup = await agent([
+            'Cleanup the ephemeral release worktree (idempotent — safe if it is already gone):',
+            'git -C ' + ROOT + ' worktree remove --force ' + releaseWorktree + ' 2>/dev/null || true',
+            'git -C ' + ROOT + ' worktree prune',
+            'rm -rf ' + releaseWorktree + ' || true',
+            'Return posted=true when done.',
+          ].join('\n'), { label: 'release-cleanup', phase: 'Report', schema: NOTE_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+            .catch(function () { return null })
+          if (!relCleanup || !relCleanup.posted) log('release-cleanup incomplete — ' + releaseWorktree + ' may need manual `git worktree remove --force`')
+        }
+        if (!relWrite || relWrite.status !== 'success') {
+          log('release stage degraded (non-fatal): ' + ((relWrite && relWrite.error) || 'agent died'))
+          VERIFY_SKIPS.push('release stage did not complete — CHANGELOG/version bump for this batch may need a manual follow-up')
+        } else if (relWrite.pushed === false) {
+          log('release commit made but push to ' + TARGET + ' failed (non-fatal) — push manually before merging the batch PR')
+          VERIFY_SKIPS.push('release commit (' + (relWrite.commit || 'unknown SHA') + ') did not push to ' + TARGET + ' — push manually before merging the batch PR')
+        } else {
+          log('release: bumped to v' + derived.version + ' (' + derived.bump + ') on ' + TARGET + (relWrite.commit ? ' — commit ' + relWrite.commit : ' (no-op, already up to date)'))
+        }
+      }
+    }
+  }
+
   const bp = await agent([
     'Create (or update) the batch integration PR for this run — DO NOT MERGE IT under any circumstances;',
     'a human reviews and merges this PR.',

@@ -52,7 +52,7 @@ flowchart TD
 
     subgraph REP["Report"]
         direction LR
-        RL["Release<br/>held claims"] --> BP["Batch PR to BASE<br/>never auto-merged<br/>Verification Gaps"] --> RO["Run report<br/>JSON + markdown"] --> RT["Retrospective<br/>process-retrospective.md"]
+        RL["Release<br/>held claims"] --> RVB["Release stage<br/>gated: CHANGELOG + version bump"] --> BP["Batch PR to BASE<br/>never auto-merged<br/>Verification Gaps"] --> RO["Run report<br/>JSON + markdown"] --> RT["Retrospective<br/>process-retrospective.md"]
     end
 
     REP -.->|"learnings feed the next run"| NEXT(("next run"))
@@ -170,6 +170,76 @@ same `shippedIssues` set now drives the batch PR's create/update gate, the
 title's issue count, and the "## Consolidated Groups" section as well as the
 Closes lines, so a resumed pass can't rebuild one of those four pieces
 in a way that disagrees with the other three.
+
+### Release stage: batch-level CHANGELOG and version bump, gated
+
+A batch of real engine changes once merged to BASE with the CHANGELOG and
+`.claude-plugin/plugin.json` version left stale (PR #56). Nothing in the
+pipeline ever bumped them; every stage assumed some other stage did. Fixing
+the stale state took a manual repair commit. The Report phase now owns this
+job as its own optional stage, gated on `profile.release`. Left unset (the
+default), the stage never runs and never calls an agent.
+
+`releaseEnabled(profile)` requires an explicit `profile.release.version_files`
+array with at least one entry. Setting it opts a repo in; it names the JSON
+file(s) carrying a top-level `"version"` key, plus an optional `changelog`
+path (default `CHANGELOG.md`) and an optional `bump` override
+(`"major"|"minor"|"patch"`). `version_files` should name only the canonical
+copy: a path also listed in `profile.lockstep_installed_paths` has its own
+mirroring tooling keeping it in sync, so bumping it here too would just fight
+that sync. `marketplace.json` carries no version field of its own and should
+never be listed.
+
+The stage runs once per batch, immediately before the batch-PR agent, and
+only when `shippedIssues.length` is nonzero. Running it there rather than
+per-issue is deliberate: a batch-level bump lands inside the human-reviewed
+TARGET -> BASE diff by construction, instead of scattering version churn
+across every per-issue PR that merges into the batch branch.
+
+**BASE-anchored derivation, never TARGET.** `deriveReleaseVersion(baseVersion,
+commitTypes, profile)` computes the next version from the version currently
+committed on `origin/BASE`, read by a read-only probe agent, never from
+`origin/TARGET`. A resumed or healing Report pass recomputes the identical
+next version instead of bumping a version TARGET already carries from an
+earlier pass. `commitTypes` comes from the batch's own commit log
+(`git log BASE..TARGET --pretty=%s`); any `feat` prefix shipped bumps minor,
+otherwise the bump is patch, unless `profile.release.bump` overrides it. A
+non-semver `baseVersion` makes the function throw, and the call site treats
+that as a non-fatal, logged skip rather than failing the run.
+
+**Idempotent CHANGELOG anchor.** `releaseChangelogAnchor(version, runTag)`
+builds the one heading the write agent looks for and regenerates in place:
+`## [<version>] - <runTag>`. It's anchored to the computed version and the
+run's fixed `RUN_TAG`, never to a wall-clock date, so calling it twice with
+the same batch produces the same string even if the second call happens after
+midnight. A prior pass's draft section gets its body replaced, not
+duplicated.
+
+**Ephemeral worktree, root never touched.** The write agent runs the
+`doc_writer` persona in a fresh `git worktree add` checked out from
+`origin/TARGET`, bumps the version file(s), regenerates the CHANGELOG
+section, commits, and pushes back to TARGET. `ROOT` itself is never checked
+out or mutated, and the worktree is removed in a `finally` block regardless
+of whether the write agent succeeded, so a dead agent can't leave it behind.
+A push failure is logged and pushed onto `VERIFY_SKIPS` rather than retried
+or treated as fatal: the commit still exists locally-to-the-worktree-run and
+can be pushed by hand before the batch PR merges.
+
+**Known collision, not corruption.** Two batch PRs open concurrently against
+the same BASE both compute BASE-plus-bump to the same next version, and
+collide on the version file and CHANGELOG section at the second human merge.
+That surfaces as an ordinary git conflict at the human merge gate. Manual
+version bumps carried the same exposure already; this stage doesn't add a
+new failure mode.
+
+**Adopting this repo's own profile is a follow-up, not part of this
+change.** `.claude/ticketmill.json` is engine-owned and out of this issue's
+scope, so `profile.release` here stays unset for now. Two agent charters
+still describe per-issue release discipline (`.claude/agents/
+ticketmill-implementer.md` and `ticketmill-code-reviewer.md`, both
+engine-owned) and will need realignment once this repo's own profile turns
+the stage on: an implementer should stop bumping per-issue, and the code
+reviewer should stop flagging a per-issue PR for a missing bump.
 
 ### Merge auto-resolve: one mechanical recovery attempt before needs_human
 
@@ -333,6 +403,7 @@ otherwise-green issue.
 | `isBudgetExhaustedError` noun+verb match | A bare keyword sweep on "budget"/"ceiling" matched a target repo's own domain errors, misreporting an ordinary agent death as token exhaustion and halting every remaining issue |
 | `COMMIT_SHA_ASK` guard | Twice, an agent typed a fabricated or shortened commit SHA into a posted comment instead of reading the real one, requiring a fixup edit |
 | `VERIFY_SKIPS` entry on a contrarian cap-out | An approach or plan gate's cap-out reached only `ctx.unresolved`, never the batch PR's Verification Gaps section, so a caveat worth a human's attention could ship and merge unseen |
+| Report-phase release stage (`releaseEnabled`, `deriveReleaseVersion`) | A batch of real engine changes (PR #56) merged with the CHANGELOG and version file left stale, because the pipeline had always assumed some later stage bumped them and no stage ever did |
 
 ### Commit SHA integrity: read it, don't recall it
 
