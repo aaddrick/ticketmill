@@ -75,6 +75,11 @@ test('(a) CONFLICTING PR auto-resolves through reviewAndMerge: clean rebase, for
     'test-validate-i1': { result: 'approved', comments: '', issues: [], summary: 'covered' },
     'merge-preflight-guard': { moved: false, detail: 'TARGET unchanged' },
     'merge-force-push': { status: 'success', error: null },
+    // probeChangedFiles (issue #87 task 1) — reviewAndMerge's own final diff
+    // snapshot, run unconditionally right before the merge stage. Scripted
+    // here so this scenario reaches its success path, not the throw-driven
+    // silent degrade installScriptedResponder would otherwise cause.
+    'changed-files-probe': { changed_files: ['workflows/ticketmill.js', 'tests/foo.test.js'], added_files: ['tests/foo.test.js'] },
     merge: { status: 'merged', follow_up_issues: [], error: null },
   })
 
@@ -87,9 +92,15 @@ test('(a) CONFLICTING PR auto-resolves through reviewAndMerge: clean rebase, for
   // reports status==='merged' — never by the helper.
   assert.strictEqual(ctx.metrics.merge_auto_resolved, 1)
   assert.strictEqual(ctx.metrics.merge_thrash, 0)
+  // The changed-files probe's response actually landed on ctx AND on the
+  // returned result — not just that the probe ran unasserted.
+  assert.deepStrictEqual(ctx.changed_files, ['workflows/ticketmill.js', 'tests/foo.test.js'])
+  assert.deepStrictEqual(ctx.added_files, ['tests/foo.test.js'])
+  assert.deepStrictEqual(result.changed_files, ctx.changed_files)
+  assert.deepStrictEqual(result.added_files, ctx.added_files)
 
   const keys = context.agent.calls.map(stageKeyOf)
-  for (const expected of ['spec-review-i1', 'code-review-i1', 'merge-preflight-probe', 'merge-rebase', 'test-run-i1', 'test-validate-i1', 'merge-preflight-guard', 'merge-force-push', 'merge']) {
+  for (const expected of ['spec-review-i1', 'code-review-i1', 'merge-preflight-probe', 'merge-rebase', 'test-run-i1', 'test-validate-i1', 'merge-preflight-guard', 'merge-force-push', 'changed-files-probe', 'merge']) {
     assert.ok(keys.includes(expected), 'expected stage "' + expected + '" to have run; ran: ' + keys.join(', '))
   }
   // The mechanical git recovery must all happen strictly after the probe finds
@@ -98,8 +109,13 @@ test('(a) CONFLICTING PR auto-resolves through reviewAndMerge: clean rebase, for
   const rebaseIdx = keys.indexOf('merge-rebase')
   const guardIdx = keys.indexOf('merge-preflight-guard')
   const pushIdx = keys.indexOf('merge-force-push')
+  const cfpIdx = keys.indexOf('changed-files-probe')
   const mergeIdx = keys.indexOf('merge')
   assert.ok(probeIdx < rebaseIdx && rebaseIdx < guardIdx && guardIdx < pushIdx && pushIdx < mergeIdx)
+  // The changed-files probe runs strictly after the force-push (so it captures
+  // the FINAL rebased/pushed diff) and strictly before the merge stage's own
+  // worktree teardown.
+  assert.ok(pushIdx < cfpIdx && cfpIdx < mergeIdx)
 
   // The probe and the merge stage's own final preflight both use the shared
   // UNKNOWN-tolerant settle-poll, not a single-shot read.
@@ -272,6 +288,10 @@ test('(g) [new] auto-resolve rebases and force-pushes clean (mar.resolved=true),
     'test-validate-i1': { result: 'approved', comments: '', issues: [], summary: 'covered' },
     'merge-preflight-guard': { moved: false, detail: 'TARGET unchanged' },
     'merge-force-push': { status: 'success', error: null },
+    // probeChangedFiles (issue #87 task 1) still runs here: it's unconditional
+    // and sits right before the merge stage, which DOES run in this scenario
+    // (it just reports blocked) — so this must be scripted like scenario (a).
+    'changed-files-probe': { changed_files: ['workflows/ticketmill.js'], added_files: [] },
     // runMergeAutoResolve completes successfully (resolved: true) — but the
     // merge stage's OWN settle-tolerant preflight then finds the PR blocked for
     // a reason unrelated to the auto-resolve flow entirely (e.g. a branch
@@ -293,12 +313,17 @@ test('(g) [new] auto-resolve rebases and force-pushes clean (mar.resolved=true),
   // stage right after it never reported status==='merged'.
   assert.strictEqual(ctx.metrics.merge_auto_resolved, 0)
   assert.strictEqual(ctx.metrics.merge_thrash, 0)
+  // The probe still ran and its result is still retained on the fail() path —
+  // a merge blocked for an unrelated reason must not throw away analytics the
+  // probe already captured.
+  assert.deepStrictEqual(ctx.changed_files, ['workflows/ticketmill.js'])
+  assert.deepStrictEqual(result.changed_files, ctx.changed_files)
 
   const keys = context.agent.calls.map(stageKeyOf)
   // The full auto-resolve mechanical sequence DID run, all the way through the
   // force-push — this is not a case where auto-resolve itself declined or
   // aborted early.
-  for (const expected of ['merge-rebase', 'merge-preflight-guard', 'merge-force-push', 'merge']) {
+  for (const expected of ['merge-rebase', 'merge-preflight-guard', 'merge-force-push', 'changed-files-probe', 'merge']) {
     assert.ok(keys.includes(expected), 'expected stage "' + expected + '" to have run; ran: ' + keys.join(', '))
   }
 })

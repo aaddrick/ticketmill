@@ -85,4 +85,38 @@ test('runTestLoop: returns ok:true after a single iteration once tests pass and 
 
   assert.strictEqual(result.ok, true)
   assert.strictEqual(ctx.metrics.test_iters, 1)
+  // test-validate approved on the very first pass -> test-quality-fix is
+  // never reached, so its round counter must stay at its fresh-ctx zero.
+  assert.strictEqual(ctx.metrics.test_quality_fix_rounds, 0)
+})
+
+test('runTestLoop: ctx.metrics.test_quality_fix_rounds increments once per test-quality-fix round, and stops incrementing once validation approves (issue #87 task 2)', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {}, TEST_CMD: 'npm test' })
+
+  let validateCalls = 0
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':test-run-') !== -1) return { result: 'passed', summary: 'all green', total_tests: 3, passed_tests: 3, failed_tests: 0, failures: [] }
+    if (label.indexOf(':test-validate-') !== -1) {
+      validateCalls++
+      // Two rounds of "changes requested" before the third approves, so
+      // test-quality-fix runs exactly twice.
+      return validateCalls <= 2
+        ? { result: 'changes_requested', comments: 'hollow assertion', issues: ['x'], summary: 'needs work' }
+        : { result: 'approved', summary: 'covered now' }
+    }
+    if (label.indexOf(':test-quality-fix-') !== -1) return { status: 'success', summary: 'strengthened tests', commit: 'deadbeef', files_changed: ['tests/foo.test.js'] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 45 })
+  const result = await context.runTestLoop(ctx)
+
+  assert.strictEqual(result.ok, true)
+  assert.strictEqual(ctx.metrics.test_iters, 3)
+  assert.strictEqual(ctx.metrics.test_quality_fix_rounds, 2)
+  // Same call site also feeds tallyTouches — the repeatedly-fixed file must
+  // read 2, proving both counters actually advanced together, not just one.
+  assert.strictEqual(ctx.touch_counts['tests/foo.test.js'], 2)
 })
