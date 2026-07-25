@@ -307,6 +307,192 @@ result, including a `needs_human` result the thrash guard escalated, since
 `fail()` carries `ctx.metrics` through. The two counts never overlap: a
 thrashed issue escalates before it can also count as resolved.
 
+### Friction & churn: a weighted per-run score, not a raw iteration count
+
+A run's difficulty used to live only inside each issue's raw metrics:
+iteration counts per stage, scattered across a JSON blob nobody scanned
+across a whole batch. `computeFriction(results)` turns those counts into one
+score per issue, so a human can see which issues actually fought back
+without reading every per-issue block.
+
+Seven capped pipeline stages (approach, plan, task-review, quality, test,
+browser, pr-review) each contribute `min(1, iters/cap)` to that score.
+Clearing a gate under its cap costs nothing: an issue whose stages all pass
+first try scores 0 across every one of them, no matter how many stages it
+has. On top of the seven ratios, weighted signal terms add friction a
+capped ratio can't see. `needs_human` carries the heaviest weight (2), since
+it's the one outcome a run can produce that never resolved on its own.
+`merge_thrash` (1.5) follows, since it forces a mandatory re-test and
+re-rebase cycle. `contrarian_capped` (1) is a flat penalty for hitting a
+contrarian cap with findings still open, and `unresolved_count` (0.25 per
+finding) adds granularity on top of it, so a capped-out issue carrying five
+open findings scores higher than one carrying only one. `quality_degrades`
+(0.5) and `test_quality_fix_rounds` (0.3) round out the list. The order and
+size of these weights tracks how much extra rework each signal actually
+costs, independent of how often it fires.
+
+Each nonzero stage or signal becomes one entry in that issue's `drivers`
+list, sorted by contribution. That's what lets the rendered table explain
+why an issue ranked where it did, instead of showing a bare number.
+
+`computeChurn(results, opts)` runs alongside it, reading the
+`changed_files`/`touch_counts` fields #87 added to `ctx`, and finds two
+different shapes of rework:
+
+- **Cross-issue hotspots**: a file touched by `HOTSPOT_ISSUE_THRESHOLD` (2)
+  or more distinct issues in the same run. Two issues landing on the same
+  file already counts as a collision worth flagging. One issue touching many
+  files across a run is ordinary and never trips this.
+- **Re-fix chains**: a file one issue's own `touch_counts` revisited
+  `REFIX_THRESHOLD` (3) or more times. The bar mirrors the "3+ fix rounds is
+  a smell" heuristic the quality and test loops already apply informally.
+
+Both get bucketed through the same `matchesGlobs` helper the lane scheduler
+uses for `serialize_globs`/engine-owned globs. A file matching
+`serialize_globs` buckets there first, since the profile already expects it
+to run hot. Anything left matching `ENGINE_OWNED` buckets next, and
+everything else lands in `surprising`. A `surprising` hotspot is the one
+worth a human's attention: neither the profile nor the engine's own file
+list predicted it would collide.
+
+`composeFrictionChurn(results, opts)` combines both rollups into one "##
+Friction & Churn" section, following the same JS-computed, verbatim-injected
+pattern as `aggregateTokens` and `aggregateMergeAutoResolve` above. The whole
+section is gated on `has_signal`, so a clean run, every stage under its cap
+and no hotspots or re-fix chains, renders nothing rather than an empty
+heading. `buildRunRecord` carries the same rollup under a `friction_churn`
+key: machine-readable fields only, no markdown, additive alongside the
+existing `tokens` and `merge_auto_resolve` blocks.
+
+### Rework tax and gate yield: did the fight pay for itself
+
+Friction & churn scores how hard a run fought. Rework tax and gate yield ask
+a narrower question: how much of that fight was wasted motion, and did the
+paranoid gates catch anything worth their cost. Both are pure JS reducers,
+built the same way as `composeFrictionChurn` above. Each computes once,
+injects its markdown verbatim into the batch PR and run report, and adds
+machine-readable fields to `buildRunRecord` alongside `friction_churn`.
+
+**Completing the gate findings tally.** `recordGateOutcome` (#87) tallied
+findings for the approach and plan contrarian gates only. `reviewAndMerge`
+now calls it for `pr-review` too, the third and last per-issue gate. The
+disposition vocabulary carries over unchanged: `accepted` when both the spec
+and code reviewer approve in the same iteration (the same condition that
+trips the `approved = true` break just below it), `carried-unresolved` when
+the iteration cap is reached without a clean pass, and `re-litigated`
+otherwise, since the loop revises and sends the PR back for another review.
+A dead reviewer never reaches this line: `reviewAndMerge` already fails the
+run with `needs_human` first. One gap carries through the tally.
+`REVIEW_SCHEMA`'s `issues` field has no `severity`, unlike the contrarian
+gates' `CHALLENGE_SCHEMA`. The review prompts never ask for one, so
+`gate_findings['pr-review'].severity` stays zero across the board while
+`disposition` and `count` still carry real signal for that gate.
+
+**Per-stage token tracking.** `stage()` already attributed each retry loop's
+token delta to `ctx.tokens.total` and `ctx.tokens.byModel`. It now attributes
+the same delta to `ctx.tokens.byStage[key]`, keyed by the literal stage name
+the caller passed in, things like `quality-fix-i1` or `pr-fix`. No new
+sampling runs and no new failure mode opens up. The accumulation rides the
+same try/finally block that already guards the total and per-model sums.
+
+**`computeReworkTax(results, tokenAgg)`** classifies each `byStage` key
+against a fixed prefix list: `quality-fix`, `test-fix`, `test-quality-fix`,
+`pr-fix`, `merge-conflict-resolve`. Anything matching one of those prefixes
+counts as rework. Everything else counts as first-pass work. The list checks
+the compound `test-quality-fix` prefix before the shorter `quality-fix` and
+`test-fix` prefixes it would otherwise match as a substring, then sums both
+buckets per issue and across the run.
+
+The result is only as trustworthy as the token accounting under it. Above
+concurrency 1, overlapping issues' stages attribute the same shared counter
+movement to each of their own `byStage` keys, the exact over-count
+`aggregateTokens` already documents for its per-issue rows. `computeReworkTax`
+gates on `tokenAgg.reconcile_error` staying at or under
+`MAX_RECONCILE_ERROR_FOR_TRUST` (#90's honest reconciliation signal). It
+never gates on the coarser `reconciles` boolean, because an untrusted
+`reconcile_error` taints the rework fraction the same way it taints the run
+total. A run that fails the check still returns its raw per-issue sums. Only
+the run-level fraction and the rendered signal go quiet, with a stated
+reason, so a machine consumer can see what was computed without the run
+treating it as trustworthy.
+
+**`computeGateYield(results)`** rolls the three gates' `gate_findings`
+tallies into one table: findings, severity mix, and an accepted-to-dismissed
+ratio, summed across every issue in the run. Alongside it sits the signal
+the reducer exists for, an escaped defect: an issue where `pr-review` raised
+findings but neither `approach` nor `plan` raised any. The check counts
+findings rather than weighing severity, matching the issue's own definition.
+It answers one question directly: did the early gates ever get a look at
+this, or did it only surface because nothing upstream ever saw it.
+
+### Outcome grading: a quality anchor beside the friction signal
+
+Friction, churn, rework tax, and gate yield all measure how hard a run
+fought. None of them measure whether the result was any good. An issue
+can clear every gate on the first try, score zero friction, and still
+ship a defect that gets reverted the next day. Self-improvement built
+only on process signal is Goodhart-able for exactly that reason, so
+issue #92 adds a read-only pass that back-annotates a prior run's merged
+batch PRs with what actually happened to them, and records it in
+`<logs_dir>/outcomes.jsonl`.
+
+**Split across the sandbox boundary, like learnings.** The Select-phase
+sandbox has no fs/git/gh (see "Sandbox lint" above), so it can't walk
+`runs.jsonl` or shell out to `gh` itself. An `outcome-grade` agent stage
+does both jobs live: it reads the run-history ledger and each run's full
+record to build the list of gradable targets (a merged member issue of a
+prior run's batch PR), then resolves one raw observation per target with
+`gh pr view`, `gh issue view`, and `gh search` — live reads, never the
+run record's own possibly-stale status. It fires alongside `learnPromise`
+so its latency hides behind the same preflight probes, and it is
+strictly read-only: no git fetch, no local writes, no state-changing `gh`
+command.
+
+The agent never decides a grade. It returns `observations` (one raw
+object per target), `prior_ledger_lines` (the raw text of
+`outcomes.jsonl`, verbatim and unparsed), and `now` (its own `date -u`
+read, since the sandbox forbids `Date.now()`). Everything downstream of
+that is deterministic JS above the `TICKETMILL-TEST-HARNESS-SPLIT`
+marker, unit-tested directly in `tests/outcomes.test.js` without ever
+shelling out.
+
+**`gradeFromObservation`** applies a fixed precedence: `reverted` >
+`reopened` > `hotfix` > `closed_unmerged` > `abandoned` > `clean` >
+`pending`. The aging is deliberately asymmetric. A bad outcome is real
+the moment it's observed and grades immediately, at any age. A clean
+grade waits: `merged, no negative signal` only becomes `clean` once the
+PR has stood for `min_age_days` (default 7, profile-overridable via
+`outcome_grading.min_age_days`, mirroring the
+`profile.contrarian_max_iterations` guard). Before that it grades
+`pending`, because "no negative signal yet" is not the same claim as
+"held up cleanly". `closed_unmerged` and `abandoned` are a terminal
+escape hatch for targets that will never see a merge and so can never
+earn `clean` any other way.
+
+**`diffOutcomeGrades`** is the only thing allowed to decide what gets
+appended. It compares this pass's freshly graded lines against
+`prior_ledger_lines` (both sides read last-line-wins, since the ledger is
+append-only) and keeps only lines that are new or whose grade changed,
+skipping any key whose prior grade is already terminal
+(`reverted`/`reopened`/`hotfix`/`closed_unmerged`/`abandoned` —
+`OUTCOME_TERMINAL_GRADES`) so settled history never gets bloated or
+second-guessed by a possibly-flaky re-read. `summarizeOutcomeCoverage`
+rolls the pass into `graded_count`/`negative_count`/`pending_count`/
+`sample_cap_hit`, so a later tier can read one small object instead of
+re-walking the ledger.
+
+**Persistence follows the `record`/`ledger` contract exactly.** The
+engine returns `outcomes` (the diffed, new-or-changed lines only),
+`outcomes_path`, and `outcomes_coverage` alongside `record`/`ledger`.
+`skills/mill/SKILL.md` seeds `outcomes.jsonl` if it doesn't exist yet and
+appends each entry as its own compact JSON line, in order: a plain,
+dumb append, never a rewrite or a dedup, matching how the skill already
+writes `runs.jsonl`. `outcomes.jsonl` is a per-host, gitignored local
+artifact, and target selection is bounded by
+`outcome_grading.sample_cap` (default 20, oldest-unobserved-first) so one
+pass stays cheap and history catches up over many runs instead of trying
+to grade everything at once.
+
 ### Engine-owned path guardrail: three regimes
 
 A worktree only sees committed state. A freshly forged agent file, or a
@@ -545,6 +731,80 @@ stays semantic instead. `recordAgentDeath()`'s existing three-consecutive-
 death circuit breaker is the backstop for any true exhaustion the tightened
 match still misses.
 
+### Cost estimator and token_budget guard: stopping before the ceiling, not after
+
+Everything above stops a run only once something has already gone wrong: the
+circuit breaker after three failures, the consecutive-death counter after
+three dead agents, the budget-exhaustion match after a real exhaustion error.
+Issue #97 adds a second, proactive layer that estimates a run's spend before
+it starts and can halt it before the account ceiling is ever reached.
+
+**The ledger gains a shape row.** `buildIssueShapeRows()` joins each result
+against its scheduling unit and its `tokenAgg.by_issue` entry into a compact
+`{issue, pf, tokens, tracked, member_count}` record, one per unit. A group
+unit's `pf` is already the union across members (`deriveUnits`' own
+contract), and its `tokens` is the whole group's total, never the primary
+issue's share alone. `buildRunRecord` carries these rows as `by_issue_shape`,
+plus `effective_concurrency` (`min(CONCURRENCY, lanes.length)`, the same
+number the lane-scheduling preview already logs), and `buildLedgerLine`
+copies both onto the `runs.jsonl` line verbatim. `schema_version` moves 1 ->
+2 for the addition. This is the estimator's only input: an issue's shape,
+and whether the run it happened in was single-lane enough to trust.
+
+**`estimateCost` medians over trusted rows only.** `buildTrustedPfBands()`
+keeps a `by_issue_shape` row only when its parent run has
+`effective_concurrency === 1` (attribution is only exact at that
+concurrency, see "Token tracking" above), `member_count === 1` (a group's
+whole-group total would inflate a singleton's band), and a `reconcile_error`
+at or under 0.5. That bar is deliberately coarser than the 0.05 one
+`computeReworkTax` uses to trust a run's own numbers: a clean single-lane
+run still leaves roughly a quarter of its spend as orchestration overhead
+that no per-issue row claims, the same shape `aggregateTokens` already
+documents, so the strict bar would starve the estimator down to almost no
+history at all. Rows are bucketed by predicted-files band (`0`, `1`, `2-3`,
+`4-7`, `8-15`, `16+`), and a band only reports a median once it holds 3 or
+more samples. Below that it degrades to `{estimate: null, confidence:
+'insufficient'}` rather than print a number built from one or two data
+points. A group's estimate is the sum of its members' own individual
+estimates, each banded on its own shape. Any unknown member poisons the sum
+to null instead of quietly understating it.
+
+**The dry_run preview surfaces the estimate before a run is even launched.**
+`buildCostEstimate()` wraps the estimator with three independent oversized
+flags and a batch projection. `structural` fires on a 4+ member
+consolidation group and needs no history at all. `pf_ceiling` fires on a
+predicted-files count at the top band, also history-free, but is evadable:
+the predicted-files probe fails open to `[]` on any doubt, so an
+under-predicted issue simply won't trip it. `multiple_of_median` fires when
+an estimate is 3x or more of the batch's own historical median, and needs
+trusted history to fire at all. The batch projection never reports a bare
+`projected_total` when any issue's estimate is null. It carries a
+`coverage_note` ("estimable K of N, M unknown") instead, so the preview
+never reads more confident than the data underneath it.
+
+**The `token_budget` guard runs underneath every real run, always on.**
+`resolveTokenBudget()` accepts an absolute OUTPUT-token ceiling or a
+relative `"Nx"` multiple of the batch's own historical median, run arg
+winning over `profile.token_budget`. A relative spec with no trusted history
+to multiply degrades to "guard off" rather than a false floor. Two checks
+layer inside `drainUnit`, ahead of the existing `STOP.tripped` check: a hard
+floor (`spentTokens() >= budget`) that needs no estimate at all, and an
+estimate-aware pre-check layered on top of it (`spent + estimateByIssue[issue]
+> budget`) that only fires when that unit carries a real number. `STOP`
+gained a `kind` field so this proactive trip stays distinct from every
+reactive breaker above: `state` reports `budget_halt`, not
+`circuit_breaker`, and carries its own `resume_hint` (raise the budget or
+split the remaining issues, then resume with `batch_branch`) instead of the
+generic "an agent kept dying" framing the reactive breakers use.
+
+**The sandbox has no filesystem, so the skill does the reading.**
+`skills/mill/SKILL.md` reads `runs.jsonl`, parses each line, and passes the
+array as `history` on every `Workflow()` call, dry_run and a live run alike,
+because the estimator and the pre-check are both pure functions over that
+array, not a file read. Skipping this step on a live run leaves the
+estimate-aware pre-check permanently dark. The hard floor still runs either
+way, since it needs no history to work.
+
 ### Claims interop
 
 Ticketmill honors fresh claims left by its ancestor engine ("## Batch Processing
@@ -729,6 +989,10 @@ lanes on `depends_on` and predicted-file overlap alone.
   carrying resume instructions; the claim is released.
 - Three issue failures, or three consecutive agent deaths -> circuit breaker:
   remaining issues are marked `not_started`, the report carries a resume plan.
+- `token_budget` reached or projected to be exceeded -> `budget_halt`, a state
+  distinct from `circuit_breaker`: the run stopped on purpose, before starting
+  an issue, not because an agent failed. Its own `resume_hint` names raising
+  the budget or splitting the remaining issues as the next step.
 - Quality loop degrades (non-fatal) but 3 degrades in a rolling window of 5 halt
   the issue: that rate signals a systemic problem, not flakiness.
 - Reviewer death at the PR gate -> `needs_human`, PR left open; reviewer death at

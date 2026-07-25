@@ -17,6 +17,14 @@
 //      loop) with a scripted agent() and a scripted, stateful budget.spent(),
 //      so the attribution math is proven end-to-end rather than assumed from
 //      the changelog's description of it.
+//   2b. stage()'s ctx.tokens.byStage[key] accumulation (issue #91) — the same
+//      finally-block delta, but keyed by stage()'s own `key` argument (the
+//      caller-supplied stage name, e.g. 'pr-fix-i1'), independent of
+//      opts.model/byModel. Prior to this, only a hand-fabricated byStage
+//      object was ever exercised (via aggregateTokens() in
+//      tests/token-usage.test.js) — never the accumulation that actually
+//      produces it, so a corrupted key (e.g. attributing the delta to the
+//      wrong bucket, or to opts.label instead of `key`) went undetected.
 //   3. addStage()/STAGE_TOKENS (#37) — the region-boundary bracketing helper
 //      that feeds aggregateTokens()'s 4th `byStage` arg in a real run. Drives
 //      context.addStage(bucket, before) directly (both live above the
@@ -221,6 +229,89 @@ test('stage(): a budget.spent() that throws on every call never affects the stag
   assert.strictEqual(r.ok, true)
   assert.strictEqual(ctx.tokens.total, 0)
   assert.strictEqual(ctx.tokens.tracked, false)
+})
+
+// ---- stage(): ctx.tokens.byStage[key] accumulation (issue #91) ----
+//
+// This is the production integration point recordReworkTax()/computeReworkTax()
+// and the rest of the rework-tax pipeline actually depend on: byStage is keyed
+// by stage()'s own `key` argument (its 2nd parameter), NOT by opts.label or
+// opts.model — a distinction the tests below prove by using a `key` that
+// differs from both.
+
+test('stage(): records the delta onto ctx.tokens.byStage[key], keyed by the stage() call\'s own `key` argument', async function () {
+  const context = harness.boot({ budget: queuedBudget([1000, 1300]) })
+  harness.installScriptedAgent(context, function () { return { ok: true } })
+
+  const ctx = harness.makeCtx({ issue: 20 })
+  await context.stage(ctx, 'pr-fix-i1', 'do the thing', { model: 'sonnet' }, {})
+
+  assert.strictEqual(ctx.tokens.byStage['pr-fix-i1'], 300)
+  // Sanity: the same delta also landed in total/byModel — byStage is an
+  // ADDITIONAL attribution, not a replacement for the existing accumulation.
+  assert.strictEqual(ctx.tokens.total, 300)
+  assert.strictEqual(ctx.tokens.byModel.sonnet, 300)
+})
+
+test('stage(): accumulates ctx.tokens.byStage[key] across multiple stage() calls sharing the same key, rather than overwriting', async function () {
+  const context = harness.boot({ budget: queuedBudget([0, 40, 40, 65]) })
+  harness.installScriptedAgent(context, function () { return { ok: true } })
+
+  const ctx = harness.makeCtx({ issue: 21 })
+  await context.stage(ctx, 'pr-fix-i1', 'first attempt', { model: 'opus' }, {})
+  await context.stage(ctx, 'pr-fix-i1', 'retry with same key', { model: 'opus' }, {})
+
+  assert.strictEqual(ctx.tokens.byStage['pr-fix-i1'], 65) // 40 + 25, accumulated not overwritten
+})
+
+test('stage(): different stage `key` arguments accumulate into independent ctx.tokens.byStage buckets', async function () {
+  const context = harness.boot({ budget: queuedBudget([0, 40, 40, 90]) })
+  harness.installScriptedAgent(context, function () { return { ok: true } })
+
+  const ctx = harness.makeCtx({ issue: 22 })
+  await context.stage(ctx, 'spec-review-i1', 'first', { model: 'sonnet' }, {})
+  await context.stage(ctx, 'code-review-i1', 'second', { model: 'sonnet' }, {})
+
+  assert.strictEqual(ctx.tokens.byStage['spec-review-i1'], 40)
+  assert.strictEqual(ctx.tokens.byStage['code-review-i1'], 50)
+  // Proves the bucket is keyed by `key`, not collapsed onto shared opts.model —
+  // a mutant that attributed every delta to a single/shared/wrong bucket would
+  // fail this exact assertion (byModel.sonnet legitimately IS the 90 total).
+  assert.strictEqual(ctx.tokens.byModel.sonnet, 90)
+})
+
+test('stage(): one before/after sample spans the whole retry loop — byStage[key] gets one accumulated delta, not one per attempt', async function () {
+  const budgetStub = queuedBudget([100, 250])
+  const context = harness.boot({ budget: budgetStub })
+
+  let attempts = 0
+  harness.installScriptedAgent(context, function () {
+    attempts++
+    return attempts < 2 ? null : { ok: true } // fail once, then succeed
+  })
+
+  const ctx = harness.makeCtx({ issue: 23 })
+  await context.stage(ctx, 'pr-fix-i1', 'do the thing', { model: 'sonnet' }, {})
+
+  assert.strictEqual(attempts, 2) // proves the retry actually happened
+  assert.strictEqual(ctx.tokens.byStage['pr-fix-i1'], 150)
+})
+
+test('stage(): ctx.tokens.byStage[key] silently no-ops (no throw) when ctx.tokens.byStage is absent, an older ctx.tokens shape', async function () {
+  const context = harness.boot({ budget: queuedBudget([10, 55]) })
+  harness.installScriptedAgent(context, function () { return { ok: true } })
+
+  const ctx = harness.makeCtx({ issue: 24 })
+  delete ctx.tokens.byStage // simulate a ctx.tokens built before byStage existed
+
+  const r = await context.stage(ctx, 'pr-fix-i1', 'do the thing', { model: 'sonnet' }, {})
+
+  assert.strictEqual(r.ok, true) // control flow completely unaffected
+  assert.strictEqual(ctx.tokens.byStage, undefined) // instrumentation never re-creates the field
+  // The rest of the finally-block's accumulation still ran normally — only the
+  // byStage branch is guarded/skipped.
+  assert.strictEqual(ctx.tokens.total, 45)
+  assert.strictEqual(ctx.tokens.tracked, true)
 })
 
 // ---- addStage()/STAGE_TOKENS: the #37 run-body region-boundary accumulator ----

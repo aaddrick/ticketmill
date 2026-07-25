@@ -76,6 +76,7 @@ it from your request; these are the knobs it can turn:
 | `dry_run` | Read-only preview: probes every issue and reports the routing plan |
 | `run_label` (alias `date`) | Tag for claims and report filenames. Pass today's date so reports don't collide |
 | `batch_branch` | Resume a prior run by reusing its `Batch_<timestamp>` branch |
+| `token_budget` | Halt the run BEFORE it overspends: an absolute OUTPUT-token count, or a relative `"Nx"` / `{multiple_of_median}` form. Run arg wins over the profile field of the same name — see the `mill` skill's `token_budget` section |
 | `root`, `repo` | Auto-discovered from git and gh; pass explicitly if the bootstrap probe fails |
 
 `concurrency` is parallelism across issues within one run: each pipeline gets
@@ -144,7 +145,10 @@ The run narrates itself in the places you already look:
   and timelines, written deterministically by the mill skill so nothing is truncated)
   and appends one line to `runs.jsonl` (the cross-run ledger). It also writes
   `summary-<run_label>.md` (the human version) and appends to the running
-  `process-retrospective.md`.
+  `process-retrospective.md`. A read-only pass also back-annotates prior runs'
+  merged PRs with what actually happened to them (reverted, reopened, hotfixed, or
+  held up cleanly) and appends the result to `outcomes.jsonl`, so self-improvement
+  has an outcome signal alongside the process-friction one.
 - **Live.** While a run is going, `/workflows` in Claude Code shows the progress
   tree: which issues are in flight and which stage each one is in.
 

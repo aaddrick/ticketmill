@@ -265,6 +265,17 @@ let WORKTREES = null            // ROOT + '/.worktrees' once ROOT is known
 const RUN_TAG = A.run_label || A.date || 'run'
 const CONCURRENCY = Math.max(1, Math.min(5, Number(A.concurrency) || 2))
 const DRY_RUN = !!A.dry_run
+// HISTORY (issue #97 task 3): parsed runs.jsonl ledger lines (buildLedgerLine's
+// own output shape), read from disk and handed in by the `mill` skill — the
+// sandbox has no fs, so this is the same skill-does-IO / engine-does-pure-logic
+// split as buildLedgerLine's own write path (see estimateCost's module comment).
+// The skill passes this on EVERY invocation, live runs and dry_run alike — the
+// dry_run cost_estimate preview below is one consumer, but a later task's
+// live-run estimate-aware budget pre-check needs the same array, so it is
+// threaded once here rather than only inside the DRY_RUN branch. Falls open to
+// [] (never throws) so a caller that omits it, or an older skill build that
+// doesn't know about it yet, degrades to "no history" rather than failing.
+const HISTORY = Array.isArray(A.history) ? A.history : []
 
 // ----- caps -----
 let MAX_CONTRARIAN_ITERATIONS = 3 // overridable via profile.contrarian_max_iterations (see __seed / Select)
@@ -303,6 +314,26 @@ const MAX_TOUCH_FILES = 100
 // comment already sets for gating efficiency metrics; not a correctness input,
 // only a display/trust-flag threshold.
 const MAX_RECONCILE_ERROR_FOR_TRUST = 0.05
+// churn analytics (issue #89): a file appearing in >= this many DISTINCT
+// issues' ctx.changed_files within one run is a cross-issue hotspot (computeChurn) —
+// 2 is the smallest number that actually means "more than one issue collided on
+// this file"; 1 would flag every file every issue ever touches.
+const HOTSPOT_ISSUE_THRESHOLD = 2
+// churn analytics (issue #89): a file whose ctx.touch_counts[file] (see
+// tallyTouches()) reaches this many re-touches WITHIN one issue is a re-fix
+// chain (computeChurn) — mirrors the "3+ fix rounds is a smell" bar the quality/
+// test loops already use informally; 1-2 touches is ordinary iterate-and-fix.
+const REFIX_THRESHOLD = 3
+// outcome grading (issue #92): default config for gradeFromObservation()'s
+// anti-Goodhart aging gate — overridable via profile.outcome_grading, mirroring
+// MAX_CONTRARIAN_ITERATIONS (see the guard near PROFILE.contrarian_max_iterations
+// in Select). min_age_days gates the POSITIVE grade only ("clean" is asymmetric:
+// a merged PR isn't certified clean until it's had this many days to surface
+// trouble); negative signals (reverted/reopened/hotfix) fire immediately regardless
+// of age. sample_cap bounds how many gradable targets one pass's read-only gh
+// probes cover, so the pass stays cheap and re-runs/deepens over many runs rather
+// than trying to grade full history in one shot.
+let OUTCOME_GRADING = { min_age_days: 7, sample_cap: 20 }
 
 // ----- model policy (profile.models may override any stage key) -----
 const M = {
@@ -407,17 +438,19 @@ const BOOT_SCHEMA = {
 const PROFILE_SCHEMA = {
   type: 'object', required: ['found'],
   // found/raw describe the probe's own response shape (does the profile file
-  // exist, and its raw text). engine_owned_globs/lockstep_installed_paths
-  // document — for readers of this schema — the two optional array fields
-  // issue #3 added to the parsed .claude/ticketmill.json profile itself (read
-  // via PROFILE.engine_owned_globs / PROFILE.lockstep_installed_paths at
-  // Select, see mergeEngineOwnedGlobs); they are not part of the probe
-  // response and additionalProperties is unset, so listing them here is
-  // documentation only, not enforcement.
+  // exist, and its raw text). engine_owned_globs/lockstep_installed_paths/
+  // outcome_grading document — for readers of this schema — optional fields
+  // added to the parsed .claude/ticketmill.json profile itself: issue #3's
+  // engine_owned_globs/lockstep_installed_paths (read at Select via
+  // mergeEngineOwnedGlobs), and issue #92's outcome_grading (read at Select via
+  // a guard mirroring profile.contrarian_max_iterations's, right after it).
+  // None of them are part of the probe response itself and additionalProperties
+  // is unset, so listing them here is documentation only, not enforcement.
   properties: {
     found: { type: 'boolean' }, raw: { type: 'string' },
     engine_owned_globs: { type: 'array', items: { type: 'string' } },
     lockstep_installed_paths: { type: 'array', items: { type: 'string' } },
+    outcome_grading: { type: 'object', properties: { min_age_days: { type: 'integer' }, sample_cap: { type: 'integer' } } },
   },
 }
 const AGENTS_SCHEMA = {
@@ -696,6 +729,47 @@ const LEARNINGS_SCHEMA = {
     found: { type: 'boolean' },
     agent_selection: { type: 'string' }, quality_loop: { type: 'string' }, test_loop: { type: 'string' },
     performance: { type: 'string' }, error_patterns: { type: 'string' }, workflow: { type: 'string' },
+  },
+}
+// OUTCOMES_SCHEMA (issue #92): the read-only Select-phase outcome-grading probe
+// (outcomeGradePromise, fired alongside learnPromise below). PIN
+// single-agent-returns-raw: the fs/git/gh-free engine sandbox cannot walk
+// runs.jsonl/runs/<tag>.json itself, so this ONE agent stage does both target
+// discovery (in-prompt) and the live gh reads, and returns raw per-target
+// observations only — it NEVER computes a grade. The engine's deterministic
+// post-hoc pass (gradeFromObservation etc., see the module comment above them)
+// turns these into ledger lines just after learnR is awaited below.
+const OUTCOMES_SCHEMA = {
+  type: 'object', required: ['observations', 'prior_ledger_lines', 'sample_cap_hit', 'now'],
+  properties: {
+    observations: {
+      type: 'array',
+      items: {
+        type: 'object', required: ['run_tag', 'batch_pr', 'issue'],
+        properties: {
+          run_tag: { type: 'string' },
+          batch_pr: { type: ['integer', 'null'] },
+          issue: { type: 'integer' },
+          // live_merge_state: THIS PASS's live `gh pr view` read of batch_pr's
+          // state — never the prior run record's own (possibly stale) state.
+          live_merge_state: { enum: ['open', 'merged', 'closed', 'none', 'unknown'] },
+          revert_found: { type: 'boolean' },
+          reopen_found: { type: 'boolean' },
+          hotfix_ref: { type: ['integer', 'null'] },
+          merged_at: { type: ['string', 'null'] },
+        },
+      },
+    },
+    // prior_ledger_lines: the RAW text lines of outcomes.jsonl, verbatim and
+    // UNPARSED — the engine JSON.parses each line itself post-hoc (see
+    // diffOutcomeGrades' call site below), so the agent never has to
+    // reproduce diffOutcomeGrades' last-line-wins/skip-terminal logic itself.
+    prior_ledger_lines: { type: 'array', items: { type: 'string' } },
+    sample_cap_hit: { type: 'boolean' },
+    // now: the probe's own `date -u` read, passed straight through to
+    // gradeFromObservation's `now` param (the sandbox has no Date.now()/`new
+    // Date()` — see that function's module comment).
+    now: { type: 'string' },
   },
 }
 // CONSOLIDATION_SCHEMA: the opus-tier Select-phase gate that proposes grouping
@@ -1361,7 +1435,14 @@ function applyRealRunCollapseGuard(units, lanes, concurrency, serializeGlobs) {
 }
 
 // ----- batch state -----
-const STOP = { tripped: false, reason: '' }
+// STOP.kind (issue #97 task 4): null for the pre-existing reactive breakers
+// (BATCH.failures circuit breaker, recordAgentDeath's consecutive-death
+// breaker, isBudgetExhaustedError's real-exhaustion-message breaker — all
+// still surface as state:'circuit_breaker'), 'budget' ONLY for the new
+// proactive runPool()/drainUnit() token_budget guard below — distinct so the
+// final state/resume_hint can tell "an agent call actually failed/died" apart
+// from "we stopped BEFORE spending more, on purpose, before anything failed".
+const STOP = { tripped: false, reason: '', kind: null }
 const BATCH = { failures: 0, consecutiveDeaths: 0 }
 // STAGE_TOKENS: region-boundary token buckets for Select-phase orchestration
 // spend that has no per-issue ctx to attribute to (see aggregateTokens' byStage
@@ -1372,8 +1453,17 @@ const BATCH = { failures: 0, consecutiveDeaths: 0 }
 const STAGE_TOKENS = { preflight: 0, select: 0 }
 let LEARN = null // category digests distilled from process-retrospective.md (Select phase)
 
-function tripStop(reason) {
-  if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; log('STOP: ' + reason) }
+function tripStop(reason, kind) {
+  if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; STOP.kind = kind || null; log('STOP: ' + reason) }
+}
+
+// tripBudgetStop (issue #97 task 4): the proactive token_budget guard's own
+// trip path, always tagged kind:'budget' — see the STOP.kind module comment
+// above for why this must stay distinct from the plain tripStop(reason) the
+// reactive breakers (circuit breaker, consecutive deaths, real budget-
+// exhaustion error message) already use.
+function tripBudgetStop(reason) {
+  tripStop(reason, 'budget')
 }
 
 // isBudgetExhaustedError: only a real budget/token-exhaustion signature is
@@ -1538,6 +1628,7 @@ async function stage(ctx, key, prompt, opts, schema, tries) {
         ctx.tokens.total += delta
         const model = opts && opts.model
         if (model) ctx.tokens.byModel[model] = (ctx.tokens.byModel[model] || 0) + delta
+        if (ctx.tokens.byStage) ctx.tokens.byStage[key] = (ctx.tokens.byStage[key] || 0) + delta
         ctx.tokens.tracked = true
       }
     } catch (e) {
@@ -1649,26 +1740,42 @@ function verifyNotesBlock() {
   return '## Project verification notes (from the ticketmill profile)\n' + vn.map(function (n) { return '- ' + n }).join('\n')
 }
 
-// ----- gate findings tally (issue #87 task 3) -----
-// Per-gate (currently the two per-issue contrarian gates, 'approach' and
-// 'plan' — CHALLENGE_SCHEMA's findings carry a severity, unlike REVIEW_SCHEMA/
-// TASK_REVIEW_SCHEMA's untyped issues/pass-fail shape, so those are the gates
-// a "severity mix" can honestly describe) tally of finding counts, severity
-// mix, and how that gate ITERATION resolved:
-//   accepted            - verdict sound_with_caveats with zero critical/major
-//                          (the same condition that triggers settleDecision()).
-//   carried-unresolved  - the contrarian cap was reached with critical/major
-//                         findings still open (they ride into ctx.unresolved).
+// ----- gate findings tally (issue #87 task 3, issue #91 wired in pr-review) -----
+// Per-gate (the two per-issue contrarian gates 'approach'/'plan', plus the
+// per-task 'pr-review' merge gate) tally of finding counts, severity mix, and
+// how that gate ITERATION resolved:
+//   accepted            - the gate iteration passed clean: for approach/plan,
+//                          verdict sound_with_caveats with zero critical/major
+//                          (the same condition that triggers settleDecision());
+//                          for pr-review, both spec and code review returned
+//                          'approved' (the same condition that ends the loop).
+//   carried-unresolved  - the gate's iteration cap was reached without a clean
+//                         pass: for approach/plan, critical/major findings
+//                         still open (they ride into ctx.unresolved); for
+//                         pr-review, MAX_PR_REVIEW_ITERATIONS reached without
+//                         both reviewers approving (the PR is left for human
+//                         review).
 //   re-litigated        - neither of the above: the loop revises and
-//                         re-challenges, so these findings get contested again
-//                         next iteration.
+//                         re-contests, so these findings get judged again
+//                         next iteration (a fix stage for pr-review, a
+//                         re-evaluate stage for approach/plan).
 //   dismissed           - the gate produced no adjudicated verdict at all
 //                         (challenger agent died) — any findings were never
-//                         actually judged.
+//                         actually judged. pr-review has no equivalent call:
+//                         a dead reviewer there fails the run immediately
+//                         (see reviewAndMerge) rather than tallying an outcome.
 // One call per gate ITERATION (not per finding), so `disposition` tallies
 // outcomes while `severity` sums every finding's severity across every
-// iteration of that gate. Bounded implicitly: one entry per gate name, each
-// gate runs at most challengeCap (<= MAX_CONTRARIAN_ITERATIONS) times per issue.
+// iteration of that gate. Bounded implicitly: one entry per gate name;
+// approach/plan run at most challengeCap (<= MAX_CONTRARIAN_ITERATIONS) times,
+// pr-review at most MAX_PR_REVIEW_ITERATIONS times, per issue/task.
+// NOTE: unlike CHALLENGE_SCHEMA (approach/plan), REVIEW_SCHEMA's `issues`
+// (pr-review's finding source) is untyped with no `severity` field — neither
+// the spec- nor code-review prompts ask for one — so `gate_findings['pr-
+// review'].severity` will stay {critical:0, major:0, minor:0} regardless of
+// actual findings. That's expected, not a bug: recordGateOutcome degrades
+// gracefully when `f.severity` doesn't match critical/major/minor, and
+// `disposition`/`count` still carry real signal for pr-review.
 function recordGateOutcome(ctx, gate, findings, disposition) {
   if (!ctx || !ctx.gate_findings) return
   const key = String(gate || '').trim()
@@ -1928,6 +2035,315 @@ function aggregateMergeAutoResolve(results) {
     thrash_count: thrashIssues.length,
     thrash_issues: thrashIssues,
     markdown: lines.join('\n'),
+  }
+}
+
+// FRICTION_WEIGHTS (issue #89): named per-signal weights for computeFriction's
+// non-stage "signal terms" — friction sources a capped iteration ratio can't
+// see. Multiplied by the signal's raw count (1 for a boolean signal) and
+// summed alongside the seven capped stage ratios. Ordered/weighted by how much
+// extra rework each signal actually costs:
+//   needs_human             - the unit never resolved on its own; the single
+//                             worst outcome a run can produce, so it dominates.
+//   merge_thrash             - the batch branch moved again mid-rebase, forcing
+//                             a mandatory re-test + re-rebase cycle.
+//   contrarian_capped        - a flat penalty for hitting a contrarian cap WITH
+//                             findings still unresolved (frictionFields).
+//   unresolved_count         - per-finding granularity ON TOP OF contrarian_capped,
+//                             so a capped-out issue carrying five open findings
+//                             scores higher than one carrying only one.
+//   quality_degrades         - each time the quality loop accepted a "degraded"
+//                             exit instead of a clean approval.
+//   test_quality_fix_rounds  - each extra fix round the test-quality gate forced.
+const FRICTION_WEIGHTS = {
+  needs_human: 2,
+  merge_thrash: 1.5,
+  contrarian_capped: 1,
+  unresolved_count: 0.25,
+  quality_degrades: 0.5,
+  test_quality_fix_rounds: 0.3,
+}
+
+// FRICTION_TOP_N (issue #89): bounds how many bumpiest issues/stages
+// computeFriction ranks into top_issues/top_stages — a human-readability cap
+// on the rendered markdown table, like MAX_LANE_ACCURACY_SAMPLES bounds the
+// retrospective sample. by_issue/by_stage (the full, unranked breakdown) are
+// never truncated by this cap.
+const FRICTION_TOP_N = 5
+
+// computeFriction (issue #89): pure per-issue/per-stage friction rollup — no
+// LLM math, same "load via harness.boot(), call directly" pattern as
+// aggregateTokens/aggregateMergeAutoResolve above, meant to be injected
+// verbatim (via composeFrictionChurn) into the batch-PR body / report agent.
+//
+// Each of the seven capped pipeline stages (approach/plan/task-review/quality/
+// test/browser/pr-review) contributes a normalized min(1, iters/cap) ratio —
+// running below a cap is normal, not friction, so a unit that cleared every
+// gate on its first pass scores 0 there regardless of how many stages it has.
+// Caps are read LIVE off module scope inside the function body (MAX_CONTRARIAN_
+// ITERATIONS et al — the same idiom aggregateTokens uses reading STAGE_LABELS),
+// never captured once at module load, so a __seed()-overridden cap in tests
+// changes the ratio it computes, not a stale snapshot.
+//
+// On top of the seven ratios, FRICTION_WEIGHTS-weighted signal terms add
+// friction a pure iteration count can't see: frictionFields' contrarian_capped/
+// unresolved_count/needs_human (spread onto every result — see frictionFields'
+// own doc comment) plus ctx.metrics' quality_degrades/test_quality_fix_rounds/
+// merge_thrash. Each nonzero stage/signal becomes one entry in that issue's
+// `drivers` breakdown, sorted by contribution descending, so the markdown/JSON
+// both explain WHY an issue ranked where it did, not just its final score.
+//
+// Defensive the same way aggregateMergeAutoResolve is about a null/empty
+// results array or a result missing .metrics — degrades to a clean, empty,
+// has_signal:false rollup, never throws.
+function computeFriction(results) {
+  const list = results || []
+  const caps = {
+    approach: MAX_CONTRARIAN_ITERATIONS,
+    plan: MAX_CONTRARIAN_ITERATIONS,
+    'task-review': MAX_TASK_REVIEW_ATTEMPTS,
+    quality: MAX_QUALITY_ITERATIONS,
+    test: MAX_TEST_ITERATIONS,
+    browser: MAX_BROWSER_ITERATIONS,
+    'pr-review': MAX_PR_REVIEW_ITERATIONS,
+  }
+  const stageField = {
+    approach: 'approach_iters',
+    plan: 'plan_iters',
+    'task-review': 'task_review_attempts',
+    quality: 'quality_iters',
+    test: 'test_iters',
+    browser: 'browser_iters',
+    'pr-review': 'pr_review_iters',
+  }
+  const stageKeys = Object.keys(caps)
+
+  const byIssue = []
+  const stageTotals = {}
+  for (const k of stageKeys) stageTotals[k] = { total: 0, count: 0 }
+
+  for (const r of list) {
+    const m = (r && r.metrics) || {}
+    const drivers = []
+    let score = 0
+
+    for (const k of stageKeys) {
+      const cap = caps[k] > 0 ? caps[k] : 1 // guard a misconfigured 0/negative cap from dividing by zero
+      const iters = Number(m[stageField[k]]) || 0
+      const ratio = Math.min(1, iters / cap)
+      if (ratio > 0) {
+        drivers.push({ name: k, value: iters, weight: null, contribution: ratio })
+        stageTotals[k].total += ratio
+        stageTotals[k].count += 1
+      }
+      score += ratio
+    }
+
+    // Signal terms: contrarian_capped/unresolved_count/needs_human come off the
+    // result's top-level frictionFields spread; quality_degrades/merge_thrash
+    // stay nested under .metrics (frictionFields never mirrors them there).
+    const signals = {
+      needs_human: r && r.needs_human ? 1 : 0,
+      merge_thrash: Number(m.merge_thrash) || 0,
+      contrarian_capped: r && r.contrarian_capped ? 1 : 0,
+      unresolved_count: Number(r && r.unresolved_count) || 0,
+      quality_degrades: Number(m.quality_degrades) || 0,
+      test_quality_fix_rounds: Number(r && r.test_quality_fix_rounds) || 0,
+    }
+    for (const name in signals) {
+      if (!Object.prototype.hasOwnProperty.call(signals, name)) continue
+      const raw = signals[name]
+      if (!raw) continue
+      const weight = FRICTION_WEIGHTS[name]
+      const contribution = raw * weight
+      drivers.push({ name: name, value: raw, weight: weight, contribution: contribution })
+      score += contribution
+    }
+
+    drivers.sort(function (a, b) { return b.contribution - a.contribution })
+    byIssue.push({ issue: r && r.issue, score: score, drivers: drivers })
+  }
+
+  const byStage = {}
+  for (const k of stageKeys) {
+    byStage[k] = { total: stageTotals[k].total, avg: list.length ? stageTotals[k].total / list.length : 0, count: stageTotals[k].count }
+  }
+
+  const topIssues = byIssue
+    .filter(function (i) { return i.score > 0 })
+    .slice()
+    .sort(function (a, b) { return b.score - a.score })
+    .slice(0, FRICTION_TOP_N)
+  const topStages = stageKeys
+    .map(function (k) { return Object.assign({ stage: k }, byStage[k]) })
+    .filter(function (s) { return s.total > 0 })
+    .sort(function (a, b) { return b.total - a.total })
+    .slice(0, FRICTION_TOP_N)
+
+  const hasSignal = topIssues.length > 0
+
+  const lines = []
+  lines.push('### Friction')
+  lines.push('')
+  if (!hasSignal) {
+    lines.push('No friction signal this run — every stage resolved within its normal range.')
+  } else {
+    lines.push('Bumpiest issues this run (ranked by weighted friction score):')
+    lines.push('')
+    lines.push('| Issue | Score | Top drivers |')
+    lines.push('| --- | --- | --- |')
+    for (const row of topIssues) {
+      const topDrivers = row.drivers.slice(0, 3).map(function (d) { return d.name + ' (' + d.contribution.toFixed(2) + ')' }).join(', ')
+      lines.push('| #' + row.issue + ' | ' + row.score.toFixed(2) + ' | ' + (topDrivers || '—') + ' |')
+    }
+    if (topStages.length) {
+      lines.push('')
+      lines.push('Bumpiest stages this run (summed capped ratio across issues):')
+      lines.push('')
+      lines.push('| Stage | Total | Issues hit |')
+      lines.push('| --- | --- | --- |')
+      for (const s of topStages) {
+        lines.push('| ' + s.stage + ' | ' + s.total.toFixed(2) + ' | ' + s.count + ' |')
+      }
+    }
+  }
+
+  return {
+    by_issue: byIssue,
+    by_stage: byStage,
+    top_issues: topIssues,
+    top_stages: topStages,
+    has_signal: hasSignal,
+    markdown: lines.join('\n'),
+  }
+}
+
+// computeChurn (issue #89): pure within-run churn rollup — from every result's
+// retained ctx.changed_files/ctx.touch_counts (issue #87), finds:
+//   - cross-issue hotspots: a file that shows up in >= HOTSPOT_ISSUE_THRESHOLD
+//     DISTINCT issues' changed_files this run (two+ issues collided on it).
+//   - re-fix chains: a file an issue's OWN touch_counts revisited
+//     >= REFIX_THRESHOLD times (that issue kept coming back to it).
+// Both are then bucketed serialize_globs / engine_owned / surprising via
+// matchesGlobs(file, globs) — `serializeGlobs`/`engineOwned` are passed as
+// PARAMS (mirroring matchesGlobs' own call sites), not read off module scope,
+// so a test (or a future profile-driven caller) can vary the bucketing without
+// seeding module state. A file matching both is bucketed serialize_globs first
+// (an expected-hot file the profile already flagged takes priority over the
+// engine's own default set).
+// Defensive the same way aggregateMergeAutoResolve is about a null/empty
+// results array or a result missing .changed_files/.touch_counts — degrades
+// to a clean, empty, has_signal:false rollup, never throws.
+function computeChurn(results, opts) {
+  const o = opts || {}
+  const serializeGlobs = Array.isArray(o.serializeGlobs) ? o.serializeGlobs : []
+  const engineOwned = Array.isArray(o.engineOwned) ? o.engineOwned : []
+  const list = results || []
+
+  function bucketFor(file) {
+    if (matchesGlobs(file, serializeGlobs)) return 'serialize_globs'
+    if (matchesGlobs(file, engineOwned)) return 'engine_owned'
+    return 'surprising'
+  }
+
+  // ---- cross-issue hotspots: file -> distinct issues whose changed_files hit it ----
+  const fileIssues = {}
+  for (const r of list) {
+    const issue = r && r.issue
+    for (const f of ((r && r.changed_files) || [])) {
+      const key = String(f || '').trim()
+      if (!key) continue
+      if (!fileIssues[key]) fileIssues[key] = []
+      if (fileIssues[key].indexOf(issue) === -1) fileIssues[key].push(issue)
+    }
+  }
+  const hotspots = Object.keys(fileIssues)
+    .filter(function (f) { return fileIssues[f].length >= HOTSPOT_ISSUE_THRESHOLD })
+    .map(function (f) { return { file: f, issues: fileIssues[f].slice(), count: fileIssues[f].length, bucket: bucketFor(f) } })
+    .sort(function (a, b) { return b.count - a.count })
+
+  // ---- within-issue re-fix chains: an issue's own touch_counts[file] hit the cap ----
+  const refixChains = []
+  for (const r of list) {
+    const issue = r && r.issue
+    const tc = (r && r.touch_counts) || {}
+    for (const f in tc) {
+      if (!Object.prototype.hasOwnProperty.call(tc, f)) continue
+      const count = tc[f]
+      if (count >= REFIX_THRESHOLD) refixChains.push({ issue: issue, file: f, count: count, bucket: bucketFor(f) })
+    }
+  }
+  refixChains.sort(function (a, b) { return b.count - a.count })
+
+  const buckets = {
+    serialize_globs: { hotspots: [], refix_chains: [] },
+    engine_owned: { hotspots: [], refix_chains: [] },
+    surprising: { hotspots: [], refix_chains: [] },
+  }
+  for (const h of hotspots) buckets[h.bucket].hotspots.push(h)
+  for (const c of refixChains) buckets[c.bucket].refix_chains.push(c)
+
+  const hasSignal = hotspots.length > 0 || refixChains.length > 0
+
+  const lines = []
+  lines.push('### Churn')
+  lines.push('')
+  if (!hasSignal) {
+    lines.push('No cross-issue hotspots or re-fix chains this run.')
+  } else {
+    if (hotspots.length) {
+      lines.push('Cross-issue hotspots (touched by ' + HOTSPOT_ISSUE_THRESHOLD + '+ issues this run):')
+      lines.push('')
+      lines.push('| File | Issues | Bucket |')
+      lines.push('| --- | --- | --- |')
+      for (const h of hotspots) lines.push('| ' + h.file + ' | ' + fmtIssues(h.issues) + ' | ' + h.bucket + ' |')
+    }
+    if (refixChains.length) {
+      if (hotspots.length) lines.push('')
+      lines.push('Re-fix chains (touched ' + REFIX_THRESHOLD + '+ times within one issue):')
+      lines.push('')
+      lines.push('| Issue | File | Touches | Bucket |')
+      lines.push('| --- | --- | --- | --- |')
+      for (const c of refixChains) lines.push('| #' + c.issue + ' | ' + c.file + ' | ' + c.count + ' | ' + c.bucket + ' |')
+    }
+  }
+
+  return {
+    hotspots: hotspots,
+    refix_chains: refixChains,
+    buckets: buckets,
+    has_signal: hasSignal,
+    markdown: lines.join('\n'),
+  }
+}
+
+// composeFrictionChurn (issue #89): the composer that emits ONE '## Friction &
+// Churn' section combining computeFriction's and computeChurn's own '###'
+// sub-blocks — same role aggregateTokens/aggregateMergeAutoResolve play
+// standalone, except this section is gated on has_signal for clean omission
+// (like the VERIFY_SKIPS.length ternary at the batch-PR body call site): a run
+// with neither friction nor churn signal renders nothing at all, rather than an
+// empty heading. Returns the two sub-rollups too so a caller (buildRunRecord,
+// the report agent) can read the machine-readable fields without recomputing.
+function composeFrictionChurn(results, opts) {
+  const friction = computeFriction(results)
+  const churn = computeChurn(results, opts)
+  const hasSignal = friction.has_signal || churn.has_signal
+
+  const lines = []
+  if (hasSignal) {
+    lines.push('## Friction & Churn')
+    lines.push('')
+    if (friction.has_signal) lines.push(friction.markdown)
+    if (friction.has_signal && churn.has_signal) lines.push('')
+    if (churn.has_signal) lines.push(churn.markdown)
+  }
+
+  return {
+    friction: friction,
+    churn: churn,
+    has_signal: hasSignal,
+    markdown: hasSignal ? lines.join('\n') : '',
   }
 }
 
@@ -3849,7 +4265,20 @@ async function reviewAndMerge(ctx) {
     const code = reviews[1]
     if (!spec || !code) return fail(ctx, 'needs_human', 'pr-review', 'a PR reviewer died — PR #' + ctx.pr + ' left open for human review')
 
-    if (spec.result === 'approved' && code.result === 'approved') { approved = true; break }
+    // gate_findings tally (issue #91): one call per PR-review iteration, using the
+    // same disposition vocabulary as the approach/plan gates above (see the doc
+    // comment on recordGateOutcome) — this is the only gate #87 left unwired, so
+    // an "escaped defect" (finding absent at approach/plan, present here) was
+    // previously undetectable. 'accepted' means both reviewers approved (the
+    // gate passed clean, mirroring the approved=true break below); on the final
+    // iteration without a clean pass the cap was reached with issues still open,
+    // same shape as the contrarian gates' 'carried-unresolved'; otherwise the
+    // loop continues into a fix stage and gets re-reviewed, i.e. 're-litigated'.
+    const prReviewClean = spec.result === 'approved' && code.result === 'approved'
+    const prReviewDisposition = prReviewClean ? 'accepted' : (iter === MAX_PR_REVIEW_ITERATIONS ? 'carried-unresolved' : 're-litigated')
+    recordGateOutcome(ctx, 'pr-review', (spec.issues || []).concat(code.issues || []), prReviewDisposition)
+
+    if (prReviewClean) { approved = true; break }
     if (iter === MAX_PR_REVIEW_ITERATIONS) break
 
     const fixAgent = pickFixAgent(code.recommended_fix_agent, null)
@@ -4001,7 +4430,7 @@ async function processIssue(pre) {
     // threaded value.
     engineOwnedIntentional: !!pre.engineOwnedIntentional,
     metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0 },
-    tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
+    tokens: { total: 0, byModel: {}, byStage: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
     // Retained-changed-files / friction signals (issue #87). null (not []) means
     // "never captured" — probeChangedFiles() sets these once, unconditionally,
     // from reviewAndMerge() right before the merge stage; a dead/degraded probe
@@ -4087,7 +4516,27 @@ async function processIssue(pre) {
 // unit-level work — a throw partway through one lane can never tear down another
 // lane's in-flight or already-written results, and results.length always stays
 // items.length no matter what any single fn() call does.
-async function runPool(items, limit, fn, lanes) {
+//
+// budgetCtx (issue #97 task 4, OPTIONAL — undefined/omitted is a no-op, matching
+// every existing caller/test that doesn't pass a 5th arg): { budget, estimateByIssue }
+// where `budget` is the already-resolved OUTPUT-token ceiling (resolveTokenBudget's
+// output — null/non-finite means "guard off", checked once per call so a caller
+// never has to special-case "no budget set") and `estimateByIssue` is
+// buildBudgetEstimateMap()'s {issue -> estimate|null} lookup. Checked in drainUnit
+// immediately before STOP.tripped is consulted, so a fresh trip here funnels
+// through the exact same not_started result-shape as every other STOP reason —
+// no separate code path to drift from. Two layered checks, hard floor first:
+//   1. HARD FLOOR (PRIMARY, history-free, honest at ANY concurrency): spentTokens()
+//      is the real guarded monotonic run-wide counter (see its own module comment)
+//      — a plain >= budget compare needs no per-unit estimate at all, so it is the
+//      backstop even when history is empty or every estimate is null.
+//   2. ESTIMATE-AWARE PRE-CHECK (layered ON TOP, only reached if the hard floor
+//      didn't already trip): spentTokens() + estimateByIssue[unit.issue] > budget.
+//      Only fires when that unit's estimate is a finite number — a null estimate
+//      (insufficient history, or any group member unestimable) is left to the hard
+//      floor rather than guessed at, per estimateIssue()'s own "null poisons the
+//      sum" contract.
+async function runPool(items, limit, fn, lanes, budgetCtx) {
   const results = new Array(items.length)
   const laneList = (Array.isArray(lanes) && lanes.length)
     ? lanes
@@ -4146,6 +4595,24 @@ async function runPool(items, limit, fn, lanes) {
   }
 
   async function drainUnit(i) {
+    // token_budget guard (issue #97 task 4) — checked BEFORE STOP.tripped so a
+    // fresh trip here is caught by the very next check, immediately below,
+    // through the SAME not_started result shape every other STOP reason uses.
+    if (!STOP.tripped && budgetCtx && isFiniteNumber(budgetCtx.budget)) {
+      const spent = spentTokens()
+      if (isFiniteNumber(spent)) {
+        if (spent >= budgetCtx.budget) {
+          tripBudgetStop('token_budget hard floor reached: ' + spent + ' OUTPUT tokens spent >= budget ' +
+            budgetCtx.budget + ' — halting before issue #' + items[i].issue)
+        } else {
+          const est = budgetCtx.estimateByIssue ? budgetCtx.estimateByIssue[items[i].issue] : null
+          if (isFiniteNumber(est) && (spent + est) > budgetCtx.budget) {
+            tripBudgetStop('token_budget estimate-aware pre-check: ' + spent + ' OUTPUT tokens spent + ' + est +
+              ' estimated for issue #' + items[i].issue + ' would exceed budget ' + budgetCtx.budget)
+          }
+        }
+      }
+    }
     if (STOP.tripped) {
       // items[i] is a unit (deriveUnits() shape) — .members is always present
       // (a self-reference singleton, or real group members), never ctx-shaped.
@@ -4214,6 +4681,7 @@ function __seed(o) {
   if ('ENGINE_OWNED' in o) ENGINE_OWNED = o.ENGINE_OWNED
   if ('LOCKSTEP_INSTALLED_PATHS' in o) LOCKSTEP_INSTALLED_PATHS = o.LOCKSTEP_INSTALLED_PATHS
   if ('MAX_CONTRARIAN_ITERATIONS' in o) MAX_CONTRARIAN_ITERATIONS = o.MAX_CONTRARIAN_ITERATIONS
+  if ('OUTCOME_GRADING' in o) OUTCOME_GRADING = o.OUTCOME_GRADING
 }
 
 // contrarianCapFor: proportional adversarial depth (see the comment at its call
@@ -4272,6 +4740,218 @@ function releaseChangelogAnchor(version, runTag) {
   return '## [' + String(version) + '] - ' + String(runTag)
 }
 
+// Fixed classification list for computeReworkTax (issue #91): a per-issue
+// ctx.tokens.byStage KEY (the literal `key` argument stage() was called with —
+// see its finally-block above) is rework spend if it starts with one of these
+// prefixes, else it counts as first-pass work. 'test-quality-fix' is ordered
+// before the shorter 'quality-fix'/'test-fix' prefixes it could otherwise be
+// mistaken for under a substring (rather than anchored-start) check — a
+// 'test-quality-fix-iN' key contains 'quality-fix' as a substring — so the
+// more specific compound prefix is tried first and this order is load-bearing
+// even though isReworkStageKey() below uses an anchored check today.
+const REWORK_STAGE_PREFIXES = ['test-quality-fix', 'quality-fix', 'test-fix', 'pr-fix', 'merge-conflict-resolve']
+
+function isReworkStageKey(key) {
+  const k = String(key || '')
+  return REWORK_STAGE_PREFIXES.some(function (p) { return k.indexOf(p) === 0 })
+}
+
+// computeReworkTax (issue #91): per-issue and per-run fraction of TRACKED
+// token spend that went into fix/retry loops (REWORK_STAGE_PREFIXES) vs
+// first-pass work, classified from the per-stage deltas stage() already
+// retains on ctx.tokens.byStage (issue #91 task 1) — no new instrumentation,
+// pure math over data aggregateTokens' caller already has in hand.
+//
+// Gating: MUST key off tokenAgg.reconcile_error (issue #90's honest,
+// concurrency-independent reconciliation signal) being <=
+// MAX_RECONCILE_ERROR_FOR_TRUST, NEVER the coarser `reconciles` boolean —
+// see aggregateTokens' own module comment for why. Under concurrency>1,
+// overlapping issues' stages attribute the SAME shared counter movement to
+// each of their own byStage keys (the exact over-count aggregateTokens
+// documents), so an untrusted reconcile_error taints per-issue rework
+// fractions too, not just the run total. When reconcile_error is null
+// (tokens never tracked this run) or exceeds the threshold, the run-level
+// fraction/signal are suppressed with an explicit reason rather than
+// rendered as if trustworthy; the raw per-issue sums are still returned
+// (never blanked) so a machine consumer can see what was computed without
+// the run treating it as a trusted metric.
+//
+// Null-safe: a result with no `.tokens`, `.tokens.tracked === false`, or no
+// `.tokens.byStage` contributes nothing (tracked:false row), never throws.
+// Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+function computeReworkTax(results, tokenAgg) {
+  const list = Array.isArray(results) ? results : []
+  const t = tokenAgg || {}
+  const reconcileError = isFiniteNumber(t.reconcile_error) ? t.reconcile_error : null
+  const trusted = reconcileError != null && reconcileError <= MAX_RECONCILE_ERROR_FOR_TRUST
+
+  const byIssue = []
+  let runRework = 0
+  let runFirstPass = 0
+  let anyTracked = false
+
+  for (const r of list) {
+    const tok = r && r.tokens
+    const stage = tok && tok.tracked ? tok.byStage : null
+    if (!stage) {
+      byIssue.push({ issue: r && r.issue, rework: null, first_pass: null, fraction: null, tracked: false })
+      continue
+    }
+    anyTracked = true
+    let rework = 0
+    let firstPass = 0
+    for (const key in stage) {
+      if (!Object.prototype.hasOwnProperty.call(stage, key)) continue
+      const v = stage[key] || 0
+      if (isReworkStageKey(key)) rework += v
+      else firstPass += v
+    }
+    runRework += rework
+    runFirstPass += firstPass
+    const denom = rework + firstPass
+    byIssue.push({ issue: r.issue, rework: rework, first_pass: firstPass, fraction: denom > 0 ? rework / denom : null, tracked: true })
+  }
+
+  const runDenom = runRework + runFirstPass
+  const runFraction = runDenom > 0 ? runRework / runDenom : null
+  const suppressedReason = !trusted
+    ? (reconcileError == null
+      ? 'token accounting reconcile_error is unavailable this run — rework tax cannot be trusted, suppressed'
+      : 'token reconcile_error (' + reconcileError.toFixed(3) + ') exceeds the trust threshold (' + MAX_RECONCILE_ERROR_FOR_TRUST + ') — rework tax suppressed')
+    : null
+  const hasSignal = trusted && anyTracked && runRework > 0
+
+  const lines = []
+  lines.push('## Rework Tax')
+  lines.push('')
+  if (!trusted) {
+    lines.push('_Suppressed — ' + suppressedReason + '._')
+  } else if (!anyTracked) {
+    lines.push('No per-stage token data tracked this run — rework tax not computed.')
+  } else if (!hasSignal) {
+    lines.push('No rework spend this run — every tracked token went to first-pass work.')
+  } else {
+    lines.push('Run-wide: **' + (runFraction * 100).toFixed(1) + '%** of tracked tokens went to rework/retry loops (' +
+      runRework + ' of ' + runDenom + ').')
+    lines.push('')
+    lines.push('| Issue | Rework | First-pass | Rework % |')
+    lines.push('| --- | --- | --- | --- |')
+    for (const row of byIssue) {
+      if (!row.tracked) continue
+      lines.push('| #' + row.issue + ' | ' + row.rework + ' | ' + row.first_pass + ' | ' +
+        (row.fraction == null ? '—' : (row.fraction * 100).toFixed(1) + '%') + ' |')
+    }
+  }
+
+  return {
+    by_issue: byIssue,
+    run_rework: runRework,
+    run_first_pass: runFirstPass,
+    run_fraction: runFraction,
+    reconcile_error: reconcileError,
+    trusted: trusted,
+    suppressed_reason: suppressedReason,
+    has_signal: hasSignal,
+    markdown: lines.join('\n'),
+  }
+}
+
+// computeGateYield (issue #91): per-gate yield off the gate_findings tally
+// recordGateOutcome() already builds per issue (issue #87 task 3's
+// approach/plan wiring, issue #91 task 1's pr-review wiring) — count,
+// severity mix, and an accepted-vs-dismissed ratio summed across every
+// issue's per-gate tally this run.
+//
+// Escaped-defect signal (count-based, per the issue's own literal
+// definition): an issue whose 'pr-review' gate raised findings (count > 0)
+// while its EARLY gates ('approach', 'plan') raised none — a defect that
+// could only be caught this late because nothing upstream ever saw it, not
+// merely a finding re-litigated across iterations of the SAME gate.
+//
+// Defensive the same way aggregateMergeAutoResolve/computeFriction are about
+// a null/empty results array or a result missing .gate_findings — degrades
+// to a clean, empty, has_signal:false rollup, never throws.
+// Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+function computeGateYield(results) {
+  const list = Array.isArray(results) ? results : []
+  const ESCAPE_GATE = 'pr-review'
+  const EARLY_GATES = ['approach', 'plan']
+
+  const byGate = {}
+  function gateBucket(key) {
+    if (!byGate[key]) byGate[key] = { count: 0, severity: { critical: 0, major: 0, minor: 0 }, accepted: 0, dismissed: 0 }
+    return byGate[key]
+  }
+
+  const byIssue = []
+  const escapedDefects = []
+
+  for (const r of list) {
+    const gf = (r && r.gate_findings) || {}
+    for (const key in gf) {
+      if (!Object.prototype.hasOwnProperty.call(gf, key)) continue
+      const g = gf[key] || {}
+      const bucket = gateBucket(key)
+      bucket.count += Number(g.count) || 0
+      const sev = g.severity || {}
+      bucket.severity.critical += Number(sev.critical) || 0
+      bucket.severity.major += Number(sev.major) || 0
+      bucket.severity.minor += Number(sev.minor) || 0
+      const disp = g.disposition || {}
+      bucket.accepted += Number(disp.accepted) || 0
+      bucket.dismissed += Number(disp.dismissed) || 0
+    }
+
+    const escapeCount = Number((gf[ESCAPE_GATE] || {}).count) || 0
+    const earlyCount = EARLY_GATES.reduce(function (sum, k) { return sum + (Number((gf[k] || {}).count) || 0) }, 0)
+    const escaped = escapeCount > 0 && earlyCount === 0
+    if (escaped) escapedDefects.push({ issue: r && r.issue, count: escapeCount })
+    byIssue.push({ issue: r && r.issue, escaped: escaped })
+  }
+
+  const gateKeys = Object.keys(byGate).sort()
+  for (const key of gateKeys) {
+    const b = byGate[key]
+    b.ratio = (b.accepted + b.dismissed) > 0 ? b.accepted / (b.accepted + b.dismissed) : null
+  }
+
+  const hasSignal = escapedDefects.length > 0 || gateKeys.some(function (k) { return byGate[k].count > 0 })
+
+  const lines = []
+  lines.push('## Gate Yield')
+  lines.push('')
+  if (!gateKeys.length) {
+    lines.push('No gate findings recorded this run.')
+  } else {
+    lines.push('| Gate | Findings | Critical | Major | Minor | Accepted:Dismissed |')
+    lines.push('| --- | --- | --- | --- | --- | --- |')
+    for (const key of gateKeys) {
+      const b = byGate[key]
+      lines.push('| ' + key + ' | ' + b.count + ' | ' + b.severity.critical + ' | ' + b.severity.major + ' | ' + b.severity.minor + ' | ' +
+        (b.ratio == null ? '—' : b.accepted + ':' + b.dismissed) + ' |')
+    }
+  }
+  if (escapedDefects.length) {
+    lines.push('')
+    lines.push('Escaped defects (findings at "' + ESCAPE_GATE + '" that every earlier gate missed):')
+    lines.push('')
+    lines.push('| Issue | Findings at ' + ESCAPE_GATE + ' |')
+    lines.push('| --- | --- |')
+    for (const e of escapedDefects) lines.push('| #' + e.issue + ' | ' + e.count + ' |')
+  } else if (gateKeys.length) {
+    lines.push('')
+    lines.push('No escaped defects this run.')
+  }
+
+  return {
+    by_gate: byGate,
+    by_issue: byIssue,
+    escaped_defects: escapedDefects,
+    has_signal: hasSignal,
+    markdown: lines.join('\n'),
+  }
+}
+
 // computeCompleteness (issue #87 task 5): a pure trust flag for a run's own
 // telemetry, answering three questions the record can otherwise only be
 // TRUSTED to answer, never verified to answer:
@@ -4316,6 +4996,54 @@ function computeCompleteness(results, tokenAgg) {
   }
 }
 
+// buildIssueShapeRows (issue #97 task 1): per-unit "shape" summary joined from
+// `results` (this run's per-issue/per-group outcome records) and `units` (the
+// lane-scheduling units that produced them — index-aligned with `results`, see
+// runPool()'s own module comment, but looked up by issue number here rather than
+// position so a future reordering can never silently mismatch). Feeds the
+// history estimateCost() reduces over (issue #97 task 2): one row per unit —
+//   issue        - the unit's primary issue number (r.issue).
+//   pf           - predicted_files count. For a group unit (member_count > 1)
+//                  this is ALREADY the union over every member — deriveUnits()
+//                  computes it via unionField(memberRefs, 'predicted_files')
+//                  before the unit ever reaches the pool (see its module
+//                  comment) — never a per-member sum computed here.
+//   tokens       - this row's token total, joined off tokenAgg.by_issue (itself
+//                  one entry per result — for a group unit that IS the whole
+//                  group's total, not the primary's share of it alone).
+//   tracked      - whether `tokens` is a real, budget-derived number.
+//   member_count - result.members.length (memberIssues(ctx) at the result-build
+//                  site, line ~4378 — results never carry a raw groupId, only
+//                  the resolved member-issue list). >1 flags a group unit so
+//                  estimateCost() never files its union pf + whole-group total
+//                  into a singleton's pf-band.
+function buildIssueShapeRows(results, units, byIssue) {
+  const list = Array.isArray(results) ? results : []
+  const unitByIssue = {}
+  for (const u of (Array.isArray(units) ? units : [])) {
+    if (u && u.issue != null) unitByIssue[u.issue] = u
+  }
+  const tokenByIssue = {}
+  for (const row of (Array.isArray(byIssue) ? byIssue : [])) {
+    if (row && row.issue != null) tokenByIssue[row.issue] = row
+  }
+  const out = []
+  for (const r of list) {
+    if (!r || r.issue == null) continue
+    const u = unitByIssue[r.issue]
+    const pf = (u && Array.isArray(u.predicted_files)) ? u.predicted_files.length : 0
+    const tok = tokenByIssue[r.issue]
+    out.push({
+      issue: r.issue,
+      pf: pf,
+      tokens: (tok && isFiniteNumber(tok.total)) ? tok.total : null,
+      tracked: !!(tok && tok.tracked),
+      member_count: Array.isArray(r.members) ? r.members.length : 1,
+    })
+  }
+  return out
+}
+
 // buildRunRecord (issue #86): assemble the FULL, untruncated machine-readable record
 // for a run. Pure and above the split marker so tests can prove — at 18-issue+ scale —
 // that no per-issue metrics/timeline block is dropped. This object is what the outer
@@ -4326,18 +5054,31 @@ function computeCompleteness(results, tokenAgg) {
 // never reached disk). The Report agent now renders only the human-readable .md; the
 // bytes of the machine record never pass through a model. Shape is byte-for-byte the
 // prior `resultsJson` payload plus a `schema_version` and `run_tag` header, plus (issue
-// #87 task 5) a `completeness` trust flag — see computeCompleteness() just above.
+// #87 task 5) a `completeness` trust flag — see computeCompleteness() just above — plus
+// (issue #97 task 1) `by_issue_shape`/`effective_concurrency`, the estimator's raw
+// history input. `f.units` is optional (defaults to [], pf falls open to 0) so every
+// existing caller/fixture that predates issue #97 keeps working unchanged.
+// `f.effectiveConcurrency` mirrors the dry_run lane preview's own
+// `Math.min(CONCURRENCY, lanes.length)` (see the routing-plan preview above) — the
+// caller passes it through rather than this pure function re-deriving it, since
+// CONCURRENCY/lanes are real-run-only bindings outside buildRunRecord's inputs.
 function buildRunRecord(f) {
   const t = f.tokenAgg || {}
   const m = f.mergeAgg || {}
+  const fc = f.frictionChurnAgg || {}
+  const fcFriction = fc.friction || {}
+  const fcChurn = fc.churn || {}
+  const rt = f.reworkTaxAgg || {}
+  const gy = f.gateYieldAgg || {}
   return {
     completeness: computeCompleteness(f.results, t),
-    schema_version: 1,
+    schema_version: 2,
     run_tag: f.runTag,
     state: f.state,
     base_branch: f.baseBranch,
     batch_branch: f.batchBranch,
     batch_pr: f.batchPr,
+    effective_concurrency: isFiniteNumber(f.effectiveConcurrency) ? f.effectiveConcurrency : null,
     stop: f.stop,
     counts: f.counts,
     verification_gaps: f.verificationGaps,
@@ -4358,7 +5099,51 @@ function buildRunRecord(f) {
       thrash_count: m.thrash_count,
       thrash_issues: m.thrash_issues,
     },
+    // friction_churn (issue #89): machine-readable fields only (no markdown) —
+    // mirrors the tokens/merge_auto_resolve shape above. Additive top-level key;
+    // never removes or renames an existing field, so it stays safe against #86's
+    // zero-field-loss tests (they assert no per-issue block is dropped, not
+    // top-level key exclusivity).
+    friction_churn: {
+      has_signal: !!fc.has_signal,
+      friction: {
+        has_signal: !!fcFriction.has_signal,
+        by_issue: fcFriction.by_issue,
+        by_stage: fcFriction.by_stage,
+        top_issues: fcFriction.top_issues,
+        top_stages: fcFriction.top_stages,
+      },
+      churn: {
+        has_signal: !!fcChurn.has_signal,
+        hotspots: fcChurn.hotspots,
+        refix_chains: fcChurn.refix_chains,
+        buckets: fcChurn.buckets,
+      },
+    },
+    // rework_tax / gate_yield (issue #91): machine-readable fields only (no
+    // markdown, same as friction_churn above) — additive top-level keys, safe
+    // against #86's zero-field-loss tests. rework_tax carries `trusted` /
+    // `suppressed_reason` alongside the raw sums so a consumer can see WHY a
+    // run's rework fraction was (or wasn't) trusted without re-deriving it
+    // from tokens.reconcile_error.
+    rework_tax: {
+      has_signal: !!rt.has_signal,
+      trusted: !!rt.trusted,
+      reconcile_error: rt.reconcile_error,
+      suppressed_reason: rt.suppressed_reason,
+      run_fraction: rt.run_fraction,
+      run_rework: rt.run_rework,
+      run_first_pass: rt.run_first_pass,
+      by_issue: rt.by_issue,
+    },
+    gate_yield: {
+      has_signal: !!gy.has_signal,
+      by_gate: gy.by_gate,
+      by_issue: gy.by_issue,
+      escaped_defects: gy.escaped_defects,
+    },
     consolidation_groups: f.consolidationGroups,
+    by_issue_shape: buildIssueShapeRows(f.results, f.units, t.by_issue),
     results: f.results,
   }
 }
@@ -4369,7 +5154,11 @@ function buildRunRecord(f) {
 // runs/<run_tag>.json); this is the index. Pure/above the split marker. Carries
 // `trustworthy` (issue #87 task 5, mirroring record.completeness.trustworthy) so a
 // cross-run trend line can be filtered to only the runs whose telemetry is complete,
-// without re-opening every run's full record to re-derive it.
+// without re-opening every run's full record to re-derive it. Also carries
+// `by_issue_shape` and `effective_concurrency` verbatim off the record (issue #97
+// task 1) — estimateCost() (task 2) reduces over exactly this ledger, not the full
+// per-run record, so the shape rows and their trust signal (effective_concurrency)
+// must live here, not only in runs/<run_tag>.json.
 function buildLedgerLine(record) {
   const r = record || {}
   const t = r.tokens || {}
@@ -4379,6 +5168,7 @@ function buildLedgerLine(record) {
     base_branch: r.base_branch,
     batch_branch: r.batch_branch,
     batch_pr: r.batch_pr,
+    effective_concurrency: isFiniteNumber(r.effective_concurrency) ? r.effective_concurrency : null,
     counts: r.counts,
     issues: Array.isArray(r.results) ? r.results.length : 0,
     tokens_total: t.run_total,
@@ -4388,6 +5178,645 @@ function buildLedgerLine(record) {
     verification_gaps: Array.isArray(r.verification_gaps) ? r.verification_gaps.length : 0,
     stop_tripped: !!(r.stop && r.stop.tripped),
     trustworthy: !!(r.completeness && r.completeness.trustworthy),
+    by_issue_shape: Array.isArray(r.by_issue_shape) ? r.by_issue_shape : [],
+  }
+}
+
+// ============================================================================
+// estimateCost (issue #97 task 2): a pure, sandbox-safe token-cost estimator
+// over the runs.jsonl ledger — the substrate #86/task 1 built. The engine has
+// no fs, so the `mill` skill reads runs.jsonl and hands the parsed lines in as
+// `history` (this is the same skill-does-IO / engine-does-pure-logic split as
+// buildLedgerLine's write path). Deliberately conservative: an estimate is
+// only ever a band median off TRUSTED history, and the function would rather
+// say "insufficient" than print a number nobody should act on.
+// ============================================================================
+
+// ESTIMATOR_PF_BAND_EDGES / pfBandKey: the cheap issue-shape bucket the
+// estimator medians over — predicted_files count, the only signal that is (a)
+// pure, (b) available for a brand-new issue at dry_run (preflight already
+// computes it), and (c) recoverable from history (by_issue_shape.pf, task 1).
+// Bands widen geometrically because pf itself is noisy at the low end (a
+// 1-file fix and a 2-file fix are practically the same shape) and predicted_files
+// is capped at 20 (MAX_LANE_PREDICTED_FILES-adjacent cap in preflight), so a
+// single open-ended top band covers everything past 15.
+const ESTIMATOR_PF_BANDS = [
+  { max: 0, key: '0' },
+  { max: 1, key: '1' },
+  { max: 3, key: '2-3' },
+  { max: 7, key: '4-7' },
+  { max: 15, key: '8-15' },
+  { max: Infinity, key: '16+' },
+]
+function pfBandKey(pf) {
+  const n = isFiniteNumber(pf) ? pf : 0
+  for (const b of ESTIMATOR_PF_BANDS) {
+    if (n <= b.max) return b.key
+  }
+  return ESTIMATOR_PF_BANDS[ESTIMATOR_PF_BANDS.length - 1].key
+}
+
+// ESTIMATOR_MAX_RECONCILE_ERROR: a coarse PATHOLOGY guard on the estimator's
+// history input — deliberately NOT the strict MAX_RECONCILE_ERROR_FOR_TRUST
+// (0.05, run-record.js line ~305) used to gate the run-level `trustworthy`
+// flag and rework-tax. Per aggregateTokens' own module comment, an
+// effective_concurrency===1 run STILL, by design, leaves ~26% of spend
+// (PR-review/merge/report overhead) unattributed to any single issue — that
+// ~0.26 reconcile_error is the EXPECTED shape of good history here, not a
+// defect, so re-applying the 0.05 bar would starve the estimator down to
+// near-zero trusted rows. 0.5 instead rejects only genuinely pathological
+// runs (a real accounting failure, a stale/corrupt ledger line) while keeping
+// the normal ~0.26 case in the trusted pool.
+const ESTIMATOR_MAX_RECONCILE_ERROR = 0.5
+
+// ESTIMATOR_MIN_BAND_SAMPLES: the smallest trusted-row count a pf-band needs
+// before its median is reported as a real number. A median of 1-2 points
+// isn't a central tendency, it's just "whatever those 1-2 issues happened to
+// cost" — 3 is the smallest sample where the median stops being a single
+// data point in disguise. Below this, the band degrades honestly to
+// {estimate: null, confidence: 'insufficient'} rather than print a number
+// that looks precise but is actually noise.
+const ESTIMATOR_MIN_BAND_SAMPLES = 3
+
+// medianOf: plain numeric median of an already-non-empty array. Pure/no
+// mutation of the caller's array (sorts a copy). Returns null on empty input
+// so callers never have to special-case it themselves.
+function medianOf(values) {
+  const v = (values || []).slice().sort(function (a, b) { return a - b })
+  const n = v.length
+  if (n === 0) return null
+  const mid = Math.floor(n / 2)
+  return n % 2 === 1 ? v[mid] : (v[mid - 1] + v[mid]) / 2
+}
+
+// buildTrustedPfBands: flattens `history` (an array of parsed runs.jsonl
+// ledger lines, i.e. buildLedgerLine's own output shape) into per-pf-band
+// token samples, keeping ONLY rows that clear every trust gate:
+//   - the row's PARENT RUN has effective_concurrency === 1 (issue #97's
+//     Revised Evaluation i1: recovers the default serialize_globs single-lane
+//     case with exact per-issue attribution — concurrency>1 runs are excluded
+//     wholesale, not row-by-row, since attribution is ambiguous for every row
+//     in that run, not just some).
+//   - the row's PARENT RUN's reconcile_error is finite and <=
+//     ESTIMATOR_MAX_RECONCILE_ERROR (the coarse pathology bar above, not
+//     MAX_RECONCILE_ERROR_FOR_TRUST).
+//   - the row itself has member_count === 1 (issue #97's Revised Plan i2: a
+//     group-unit row carries the union pf + WHOLE-GROUP token total under
+//     task 1's contract — filing that into a singleton pf-band would
+//     over-estimate every future singleton issue in that band).
+//   - the row itself is tracked with a finite token total (buildIssueShapeRows
+//     already sets tokens:null/tracked:false together when untracked, but
+//     both are checked here so the gate reads as self-contained, not
+//     dependent on that invariant holding forever).
+// Returns { [bandKey]: { median, count } } for every band with >=1 trusted
+// sample — NOT necessarily >= ESTIMATOR_MIN_BAND_SAMPLES; estimateIssue()
+// applies that threshold per-lookup so a caller inspecting `bands` directly
+// (e.g. a future oversized-multiple-of-median check) can still see the raw
+// sample count behind a band that estimateIssue() itself would call
+// insufficient.
+function buildTrustedPfBands(history) {
+  const runs = Array.isArray(history) ? history : []
+  const buckets = {}
+  for (const run of runs) {
+    if (!run) continue
+    if (run.effective_concurrency !== 1) continue
+    const re = run.reconcile_error
+    if (!(isFiniteNumber(re) && re <= ESTIMATOR_MAX_RECONCILE_ERROR)) continue
+    const rows = Array.isArray(run.by_issue_shape) ? run.by_issue_shape : []
+    for (const row of rows) {
+      if (!row) continue
+      if (row.member_count !== 1) continue
+      if (!row.tracked) continue
+      if (!isFiniteNumber(row.tokens)) continue
+      const band = pfBandKey(row.pf)
+      if (!buckets[band]) buckets[band] = []
+      buckets[band].push(row.tokens)
+    }
+  }
+  const stats = {}
+  for (const band in buckets) {
+    if (!Object.prototype.hasOwnProperty.call(buckets, band)) continue
+    stats[band] = { median: medianOf(buckets[band]), count: buckets[band].length }
+  }
+  return stats
+}
+
+// estimateIssue: one queried issue/unit's estimate off `bandStats` (band ->
+// {median, count} from buildTrustedPfBands). Band-median-else-null, NEVER a
+// global fallback (an issue with zero same-band history gets null, not some
+// other band's number pretending to be shape-matched). A group unit (members
+// array with >1 entries — each entry itself an {issue, predicted_files}-
+// shaped descriptor, mirroring the units deriveUnits() builds) estimates as
+// the SUM of its own members' individual estimates, each banded on that
+// MEMBER's own predicted_files count — not the group's unioned pf — so a
+// bundle's estimate reflects what its parts actually cost separately. Any
+// null member poisons the sum to null (honest: a partial sum would understate
+// the group and silently defeat a budget guard reading it).
+function estimateIssue(it, bandStats) {
+  const issueNum = it && it.issue
+  const members = Array.isArray(it && it.members) ? it.members : null
+  if (members && members.length > 1) {
+    let sum = 0
+    let anyNull = false
+    for (const m of members) {
+      const est = estimateIssue(m, bandStats)
+      if (est.estimate == null) anyNull = true
+      else sum += est.estimate
+    }
+    return {
+      issue: issueNum,
+      pf_band: null,
+      member_count: members.length,
+      estimate: anyNull ? null : sum,
+      confidence: anyNull ? 'insufficient' : 'estimated',
+    }
+  }
+  const pf = isFiniteNumber(it && it.pf) ? it.pf
+    : (Array.isArray(it && it.predicted_files) ? it.predicted_files.length : 0)
+  const band = pfBandKey(pf)
+  const stats = bandStats[band]
+  const trusted = !!stats && stats.count >= ESTIMATOR_MIN_BAND_SAMPLES
+  return {
+    issue: issueNum,
+    pf_band: band,
+    member_count: 1,
+    estimate: trusted ? stats.median : null,
+    confidence: trusted ? 'estimated' : 'insufficient',
+  }
+}
+
+// estimateCost (issue #97 task 2): the public pure reducer.
+//   history - array of parsed runs.jsonl lines (buildLedgerLine's shape).
+//             Missing/malformed entries degrade cleanly (see
+//             buildTrustedPfBands) rather than throwing.
+//   issues  - array of {issue, predicted_files} descriptors to estimate (a
+//             brand-new issue at dry_run has no history of its own, only its
+//             own preflight-predicted shape), optionally carrying `members`
+//             for a consolidated group (see estimateIssue above).
+// Returns { by_issue: [...], bands: {...} } — `bands` is exposed (not just
+// consumed internally) so a later consumer (task 3's oversized-multiple-of-
+// median check) can read the same trusted-band medians without re-deriving
+// them from `history` a second time.
+function estimateCost(history, issues) {
+  const bandStats = buildTrustedPfBands(history)
+  const list = Array.isArray(issues) ? issues : []
+  const byIssue = list.map(function (it) { return estimateIssue(it, bandStats) })
+  return {
+    by_issue: byIssue,
+    bands: bandStats,
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Oversized-issue flags + batch projection (issue #97 task 3) — feeds the
+// `cost_estimate` block on the dry_run routing-plan preview (state:'dry_run'
+// return, below the split marker). Pure/above the split marker so every arm is
+// directly unit-testable; the dry_run wiring itself is a thin call site.
+// ----------------------------------------------------------------------------
+
+// OVERSIZE_GROUP_MEMBERS: the PRIMARY oversized signal — structural, history-
+// free, so it fires even for a brand-new batch with zero trusted history (the
+// multiple-of-median arm below needs a real estimate; this one never does). A
+// consolidation group this large still runs as ONE worktree/pipeline (shared
+// setup + PR + merge — see deriveUnits()'s module comment), so its token cost
+// is NOT the sum of N independently-bounded issues, it's one unbounded run
+// whose failure modes compound. This is exactly the incident shape the issue's
+// Research phase documented (one bundled issue burning ~15x the per-issue
+// norm). 4 covers "a couple of related issues merged for efficiency" (2-3
+// members, routine) while flagging anything larger as a pre-split candidate.
+const OVERSIZE_GROUP_MEMBERS = 4
+
+// OVERSIZE_PF_CEILING: a SECONDARY, also history-free oversized signal — a raw
+// predicted_files count at or above the top ESTIMATOR_PF_BANDS boundary (the
+// '16+' band starts at 16, see that array above). Deliberately documented as
+// EVADABLE, unlike OVERSIZE_GROUP_MEMBERS above: predicted_files is a
+// best-effort preflight probe that fails open to [] on ANY doubt (see the
+// preflight probe's own module comment) and is capped at 20 paths — an issue
+// whose real footprint the probe simply couldn't resolve reports pf=0 and
+// evades this check entirely. Never load-bearing on its own; always paired
+// with the structural arm above.
+const OVERSIZE_PF_CEILING = 16
+
+// ESTIMATOR_OVERSIZED_MULTIPLE: the UNIT-INVARIANT arm — flags an issue/group
+// whose own estimate is a large multiple of globalHistoricalMedian() (below),
+// regardless of which pf band it falls in, so an outlier in ANY band is judged
+// against the batch's overall typical cost, not just its own band's median
+// (which a singleton estimate always equals exactly, by construction). Unlike
+// the two structural arms above, this one requires real trusted history — null
+// when the estimate itself is null. 3x is deliberately conservative: the
+// incident this issue documents was ~15x the norm, but a pre-split nudge
+// should fire well before spend reaches that scale, not only once it already
+// has.
+const ESTIMATOR_OVERSIZED_MULTIPLE = 3
+
+// globalHistoricalMedian: a single unit-invariant reference cost, derived
+// ONLY from `bands` (estimateCost()'s own return — see its module comment:
+// "so a later consumer (task 3's oversized-multiple-of-median check) can read
+// the same trusted-band medians without re-deriving them from history a
+// second time"). Deliberately the median OF the per-band medians, not a
+// pf-band-specific number, so one reference cost applies uniformly to every
+// issue in the batch. Returns null when no band has any trusted sample.
+function globalHistoricalMedian(bands) {
+  const b = bands || {}
+  const medians = []
+  for (const band in b) {
+    if (!Object.prototype.hasOwnProperty.call(b, band)) continue
+    if (isFiniteNumber(b[band].median)) medians.push(b[band].median)
+  }
+  return medianOf(medians)
+}
+
+// flagOversized: combines all three arms for one queried item. `item` is the
+// ORIGINAL issues[] entry passed to buildCostEstimate (carries the raw
+// `pf`/`member_count` inputs the estimate alone doesn't preserve — estimateIssue()
+// returns pf_band, a string bucket, never the raw pf number); `est` is that
+// same item's estimateCost() by_issue row. The structural arm intentionally
+// reads ONLY item.member_count — a group with predicted_files=[] on every
+// member (pf=0, no pf_ceiling signal at all) must still flag once its member
+// count clears the threshold.
+function flagOversized(item, est, globalMedian) {
+  const it = item || {}
+  const structural = (isFiniteNumber(it.member_count) ? it.member_count : 1) >= OVERSIZE_GROUP_MEMBERS
+  const pfCeiling = isFiniteNumber(it.pf) && it.pf >= OVERSIZE_PF_CEILING
+  const multipleOfMedian = isFiniteNumber(est && est.estimate) && isFiniteNumber(globalMedian) && globalMedian > 0 &&
+    est.estimate >= ESTIMATOR_OVERSIZED_MULTIPLE * globalMedian
+  return {
+    structural: structural,
+    pf_ceiling: pfCeiling,
+    multiple_of_median: multipleOfMedian,
+    any: structural || pfCeiling || multipleOfMedian,
+  }
+}
+
+// buildBatchProjection: the batch-wide rollup. Deliberately NEVER emits a bare
+// summed total when ANY member's estimate is null — a partial sum silently
+// mislabeled as "the batch total" would UNDER-state true spend, defeating the
+// entire point of a pre-run budget signal. Instead it always carries a
+// coverage indicator so a caller can see exactly how much of the batch the
+// number covers, with the SAME confidence semantics per-issue estimates use
+// ('estimated' only on full coverage, else 'insufficient').
+function buildBatchProjection(byIssueEstimates) {
+  const list = Array.isArray(byIssueEstimates) ? byIssueEstimates : []
+  let known = 0
+  let estimableCount = 0
+  for (const e of list) {
+    if (isFiniteNumber(e && e.estimate)) { known += e.estimate; estimableCount++ }
+  }
+  const total = list.length
+  const unknownCount = total - estimableCount
+  const fullCoverage = total > 0 && unknownCount === 0
+  return {
+    total_issues: total,
+    estimable_count: estimableCount,
+    unknown_count: unknownCount,
+    projected_total: fullCoverage ? known : null,
+    confidence: fullCoverage ? 'estimated' : 'insufficient',
+    coverage_note: 'estimable ' + estimableCount + ' of ' + total + ', ' + unknownCount + ' unknown',
+  }
+}
+
+// buildCostEstimate (issue #97 task 3): the public pure entry point the
+// dry_run routing-plan preview (state:'dry_run' return, below the split
+// marker) calls. Wraps estimateCost() with the oversized flags and batch
+// projection above so the wiring below the split marker stays a thin,
+// untestable-but-trivial call site — every real decision lives here, fully
+// unit-testable.
+//   history - see estimateCost's own module comment (parsed runs.jsonl lines,
+//             the HISTORY run arg above).
+//   issues  - array of {issue, pf, member_count, members?} — `pf` is the raw
+//             predicted_files count (own for a singleton, union for a group),
+//             `member_count` the live member count, `members` (only present
+//             when member_count>1) an array of {issue, pf} per-member
+//             descriptors mirroring estimateCost()'s own group contract. See
+//             the dry_run call site for how these are derived from
+//             previewUnits.
+function buildCostEstimate(history, issues) {
+  const list = Array.isArray(issues) ? issues : []
+  const result = estimateCost(history, list)
+  const globalMedian = globalHistoricalMedian(result.bands)
+  const byIssue = result.by_issue.map(function (est, i) {
+    return Object.assign({}, est, { oversized: flagOversized(list[i], est, globalMedian) })
+  })
+  return {
+    by_issue: byIssue,
+    bands: result.bands,
+    batch_projection: buildBatchProjection(byIssue),
+  }
+}
+
+// ----------------------------------------------------------------------------
+// token_budget resolution + per-unit estimate map (issue #97 task 4) — feeds
+// runPool()'s always-on hard-floor/estimate-aware guard (see that function's
+// own budgetCtx module comment). Pure/above the split marker, like the rest of
+// the estimator, so every arm is directly unit-testable; the Select-phase call
+// site (real PROFILE/units/HISTORY) is a thin, untestable-but-trivial wiring
+// point, same posture as buildCostEstimate's own dry_run call site.
+// ----------------------------------------------------------------------------
+
+// parseTokenBudgetSpec: normalizes ONE raw token_budget value (a run arg OR a
+// profile field — both accept the exact same shapes) into {kind, amount} /
+// {kind, multiple}, or null when the value is absent/unusable so callers can
+// fall through to the next source cleanly. Two accepted forms:
+//   - ABSOLUTE OUTPUT-token count: a positive finite number, or a numeric
+//     string ("500000") — budget.spent() (spentTokens()) is OUTPUT tokens only
+//     (see its own module comment), so this ceiling is in the same unit.
+//   - RELATIVE multiple-of-historical-median: a string shaped "<N>x"
+//     (case-insensitive, e.g. "5x") or an object {multiple_of_median: N} — the
+//     unit-INVARIANT form (works regardless of what a "normal" issue costs in
+//     this repo), resolved against globalHistoricalMedian() by the caller
+//     (resolveTokenBudget, below) since that requires `bands`, which this
+//     function deliberately does not take (keeps the parse step trivially
+//     testable without any history fixture).
+function parseTokenBudgetSpec(raw) {
+  if (raw == null) return null
+  if (isFiniteNumber(raw) && raw > 0) return { kind: 'absolute', amount: raw }
+  if (typeof raw === 'string') {
+    const mx = /^\s*(\d+(?:\.\d+)?)\s*x\s*$/i.exec(raw)
+    if (mx) {
+      const mult = Number(mx[1])
+      return isFiniteNumber(mult) && mult > 0 ? { kind: 'multiple', multiple: mult } : null
+    }
+    const n = Number(raw)
+    return isFiniteNumber(n) && n > 0 ? { kind: 'absolute', amount: n } : null
+  }
+  if (typeof raw === 'object' && isFiniteNumber(raw.multiple_of_median) && raw.multiple_of_median > 0) {
+    return { kind: 'multiple', multiple: raw.multiple_of_median }
+  }
+  return null
+}
+
+// resolveTokenBudget (issue #97 task 4): run arg wins over the profile field —
+// same "run arg -> profile field" precedence CONCURRENCY/BROWSER/etc already
+// use — and a relative ("Nx") spec is multiplied by globalHistoricalMedian(bands),
+// the SAME trusted-band medians buildCostEstimate's own multiple_of_median
+// oversized arm reads (see that function's module comment: "so a later
+// consumer ... can read the same trusted-band medians without re-deriving them
+// from history a second time"), so "5x" means "5x THIS batch's own trusted
+// historical per-issue median", not some other reference cost. Degrades to
+// {budget: null, ...} — guard OFF, never a false floor — when: neither source
+// sets a usable value, OR a relative spec is given but no trusted history
+// exists yet to multiply (globalHistoricalMedian returns null on zero trusted
+// bands, matching the estimator's own honest-degrade posture). `degraded`
+// (present only on that second case) is a human-readable line the Select-phase
+// call site logs — never thrown, a mis-set token_budget must not halt the run
+// itself.
+function resolveTokenBudget(runArgValue, profileValue, bands) {
+  const fromArg = parseTokenBudgetSpec(runArgValue)
+  const spec = fromArg || parseTokenBudgetSpec(profileValue)
+  if (!spec) return { budget: null, source: null, spec: null }
+  const source = fromArg ? 'arg' : 'profile'
+  if (spec.kind === 'absolute') return { budget: spec.amount, source: source, spec: spec }
+  const median = globalHistoricalMedian(bands)
+  if (!isFiniteNumber(median) || median <= 0) {
+    return {
+      budget: null, source: source, spec: spec,
+      degraded: 'relative token_budget (' + spec.multiple + 'x) needs trusted historical data; none available yet — guard is off this run',
+    }
+  }
+  return { budget: spec.multiple * median, source: source, spec: spec }
+}
+
+// buildBudgetEstimateMap (issue #97 task 4): the estimate-aware pre-check's
+// history-derived input. Built ONCE at Select from the SAME `history` run arg
+// the skill passes on EVERY invocation — live runs and dry_run alike (see the
+// HISTORY module comment above) — NOT scoped inside the DRY_RUN branch,
+// otherwise the pre-check would be completely dead on a real run (Revised Plan
+// iteration 2, Minor finding). Mirrors the dry_run cost_estimate preview's own
+// unit -> issues[] shaping (task 3's costEstimateUnits/costEstimateIssues call
+// site) but keyed by issue number for O(1) per-unit lookup in drainUnit,
+// instead of an index-aligned array.
+//
+// A unit whose resume_point isn't 'implement' (skip/process_pr) is charged 0,
+// not left unestimated and not charged a full band-median guess — a
+// 'process_pr' unit pays only rework-tax and a 'skip' unit does no real work
+// at all (processIssue's own resume_point==='skip' early return), so a fresh
+// implement-shaped historical estimate would misrepresent what either actually
+// costs, exactly the reasoning the dry_run preview's own resume_point-filter
+// already documents.
+function buildBudgetEstimateMap(history, units) {
+  const list = Array.isArray(units) ? units : []
+  const implementUnits = list.filter(function (u) { return u && u.resume_point === 'implement' })
+  const issues = implementUnits.map(function (u) {
+    const memberCount = Array.isArray(u.members) ? u.members.length : 1
+    const item = { issue: u.issue, pf: (Array.isArray(u.predicted_files) ? u.predicted_files.length : 0), member_count: memberCount }
+    if (memberCount > 1) {
+      item.members = u.members.map(function (m) { return { issue: m.issue, pf: (Array.isArray(m.predicted_files) ? m.predicted_files.length : 0) } })
+    }
+    return item
+  })
+  const estimate = buildCostEstimate(history, issues)
+  const map = {}
+  list.forEach(function (u) { if (u) map[u.issue] = 0 }) // default: non-'implement' units cost ~0 — see module comment
+  estimate.by_issue.forEach(function (est, i) { map[implementUnits[i].issue] = est.estimate })
+  return { estimateByIssue: map, bands: estimate.bands }
+}
+
+// ============================================================================
+// Outcome grading (issue #92): the read-only back-annotation pass that grades
+// a prior run's merged batch PRs against what actually happened afterward
+// (reverted / issue reopened / needed a hotfix / held up cleanly), so later
+// self-improvement has a real quality anchor instead of only process-friction
+// signal (which is Goodhart-able — an issue can sail through every gate
+// friction-free and still ship a defect).
+//
+// The gh/git reads themselves cannot happen here (the sandbox has no fs/git/gh —
+// see docs/ARCHITECTURE.md); a Select-phase agent() stage resolves raw
+// `observation` objects live via gh, one per {run_tag, batch_pr, issue} gradable
+// target (a merged member issue of a prior run's batch PR). Everything below is
+// the deterministic, pure grading/diff/summarize core that turns those raw
+// observations into ledger lines — unit-tested directly (tests/outcomes.test.js)
+// without ever shelling out.
+// ============================================================================
+
+// OUTCOME_TERMINAL_GRADES: grades that are FINAL once observed — the target is
+// never re-graded or re-emitted again (see diffOutcomeGrades' skip-terminal
+// rule). 'pending' and 'clean' are deliberately excluded: 'pending' is a
+// placeholder by definition, and 'clean' stays open to correction (a PR
+// certified clean today can still be reverted next week) — only a target that
+// can never produce new signal (a revert/reopen/hotfix already happened, or the
+// PR never merged at all) is truly done.
+const OUTCOME_TERMINAL_GRADES = ['reverted', 'reopened', 'hotfix', 'closed_unmerged', 'abandoned']
+// OUTCOME_NEGATIVE_GRADES: the anti-Goodhart quality-negative signals proper —
+// excludes closed_unmerged/abandoned, which are a terminal ESCAPE for a target
+// that can never reach "clean" (no merge occurred), not evidence of a bad
+// outcome, so they must not inflate a negative-outcome rate.
+const OUTCOME_NEGATIVE_GRADES = ['reverted', 'reopened', 'hotfix']
+
+// outcomeLineKey: the ledger's identity key — run_tag + batch_pr + issue (one row
+// per member issue of a batch PR, not one row per PR, so a multi-issue batch PR
+// grades each issue independently). Shared by diffOutcomeGrades' dedup/lookup.
+function outcomeLineKey(line) {
+  const l = line || {}
+  return String(l.run_tag) + '::' + String(l.batch_pr) + '::' + String(l.issue)
+}
+
+// toEpochMs: accepts a Date, an epoch-ms number, or an ISO-8601 string and
+// returns epoch ms (NaN if unparseable). Lets `now` and observation.merged_at
+// arrive in whichever shape their source naturally produces (a `date` probe
+// returns a string; a test fixture may hand in either) without forcing every
+// caller through the same constructor.
+function toEpochMs(x) {
+  if (x instanceof Date) return x.getTime()
+  if (typeof x === 'number') return x
+  if (typeof x === 'string') return Date.parse(x)
+  return NaN
+}
+
+// ageInDays: whole/fractional days between an ISO merge timestamp and `now`.
+// Returns null (never NaN) when either side fails to parse, so callers can
+// treat "unknown age" the same as "not old enough yet" without a NaN leaking
+// into a >= comparison (NaN >= N is always false, which would accidentally be
+// correct here, but null is the honest, greppable signal of "couldn't tell").
+function ageInDays(isoTimestamp, now) {
+  const mergedMs = typeof isoTimestamp === 'string' ? Date.parse(isoTimestamp) : NaN
+  const nowMs = toEpochMs(now)
+  if (!Number.isFinite(mergedMs) || !Number.isFinite(nowMs)) return null
+  return (nowMs - mergedMs) / 86400000
+}
+
+// pickOutcomeSignals: the compact, audit-friendly subset of an observation's raw
+// fields carried onto the ledger line as `signals` — enough to explain WHY a
+// grade was assigned (mirrors gate_yield's raw-count-alongside-verdict idiom)
+// without echoing back the full agent payload.
+function pickOutcomeSignals(observation) {
+  const o = observation || {}
+  return {
+    pr_state: o.pr_state != null ? o.pr_state : null,
+    merged_at: o.merged_at != null ? o.merged_at : null,
+    reverted: !!o.reverted,
+    reopened: !!o.reopened,
+    hotfix_pr: o.hotfix_pr != null ? o.hotfix_pr : null,
+    issue_state: o.issue_state != null ? o.issue_state : null,
+    abandoned: !!o.abandoned,
+  }
+}
+
+// gradeFromObservation (issue #92): the deterministic grade decision. Takes ONE
+// raw observation (as resolved live via gh by the Select-phase outcome-observation
+// agent — never a stale pre-merge record), `now` (a Date/epoch-ms/ISO string —
+// ALWAYS injected by the caller; this function itself never calls Date.now() or
+// argless `new Date()`, which the sandbox forbids and lint-engine.js enforces),
+// and `cfg` (defaults to OUTCOME_GRADING; pass an explicit object to override
+// min_age_days in tests or from a profile-loaded config).
+//
+// Asymmetric aging is the whole point: a bad outcome is real the moment it's
+// observed and grades immediately, at any age. A good outcome is not certified
+// until it's had time to prove itself — "no negative signal yet" is not the same
+// claim as "held up cleanly", so `clean` is gated behind cfg.min_age_days.
+//
+// Precedence (first match wins):
+//   1. reverted   — a revert commit referencing this PR/issue was found.
+//   2. reopened   — the issue's timeline shows it reopened after this run closed it.
+//   3. hotfix     — a later PR cross-references this issue as a fix for it.
+//   4. closed_unmerged — batch_pr closed without ever merging: this target can
+//      never reach "clean" (there was nothing to hold up), so it gets a terminal
+//      escape now instead of sitting `pending` forever.
+//   5. abandoned  — the issue itself was abandoned (closed, no PR ever merged),
+//      same terminal-escape reasoning as closed_unmerged.
+//   6. clean      — merged, no negative signal, and >= min_age_days old.
+//   7. pending    — everything else (merged but still too young, or state unknown).
+function gradeFromObservation(observation, now, cfg) {
+  const o = observation || {}
+  const c = cfg || OUTCOME_GRADING
+  const minAgeDays = Number.isFinite(c.min_age_days) ? c.min_age_days : OUTCOME_GRADING.min_age_days
+  const signals = pickOutcomeSignals(o)
+
+  if (o.reverted) return { grade: 'reverted', signals: signals }
+  if (o.reopened) return { grade: 'reopened', signals: signals }
+  if (o.hotfix_pr) return { grade: 'hotfix', signals: signals }
+  if (o.pr_state === 'closed' && !o.merged_at) return { grade: 'closed_unmerged', signals: signals }
+  if (o.abandoned) return { grade: 'abandoned', signals: signals }
+
+  if (o.merged_at) {
+    const age = ageInDays(o.merged_at, now)
+    if (age != null && age >= minAgeDays) return { grade: 'clean', signals: signals }
+  }
+
+  return { grade: 'pending', signals: signals }
+}
+
+// buildOutcomeLine (issue #92): the compact single-object JSONL shape appended to
+// <logs_dir>/outcomes.jsonl, one line per {run_tag, batch_pr, issue} — mirrors
+// buildLedgerLine's "flat, small, one-object-per-line" contract. schema_version
+// lets a future reader distinguish shapes without re-deriving them, same as
+// buildRunRecord's header.
+function buildOutcomeLine(f) {
+  const o = f || {}
+  return {
+    schema_version: 1,
+    run_tag: o.run_tag,
+    batch_pr: o.batch_pr,
+    issue: o.issue,
+    grade: o.grade,
+    signals: o.signals || {},
+    decided_at: o.decided_at,
+  }
+}
+
+// diffOutcomeGrades (issue #92): the sole emit decision for the ledger append —
+// the mill skill's write step is a plain, dumb append of whatever this returns
+// (never its own dedup logic). Given this pass's freshly graded `currentLines`
+// and the prior ledger's lines (as read verbatim off disk, oldest-to-newest),
+// returns only the lines that are NEW (key not seen before) or CHANGED (grade
+// differs from the prior ledger's last-line-wins value for that key) —
+// unconditionally SKIPPING any key whose prior grade is already terminal
+// (OUTCOME_TERMINAL_GRADES), since a terminal grade never legitimately changes;
+// re-emitting it would just be append-only bloat (or, if a re-observation ever
+// disagreed, silently overwrite settled history with a possibly-flaky read).
+//
+// last-line-wins is applied to BOTH inputs: `priorLedgerLines` because
+// outcomes.jsonl is append-only (a key can appear more than once across its
+// history and the latest line is authoritative), and `currentLines` for the
+// same reason should a caller ever hand in more than one line per key in a
+// single pass (defensive; the normal caller emits at most one).
+function diffOutcomeGrades(currentLines, priorLedgerLines) {
+  const currentMap = new Map()
+  for (const line of (Array.isArray(currentLines) ? currentLines : [])) {
+    if (!line) continue
+    currentMap.set(outcomeLineKey(line), line)
+  }
+  const priorMap = new Map()
+  for (const line of (Array.isArray(priorLedgerLines) ? priorLedgerLines : [])) {
+    if (!line) continue
+    priorMap.set(outcomeLineKey(line), line)
+  }
+
+  const out = []
+  for (const [key, line] of currentMap) {
+    const prior = priorMap.get(key)
+    if (prior && OUTCOME_TERMINAL_GRADES.indexOf(prior.grade) !== -1) continue // skip-terminal
+    if (!prior || prior.grade !== line.grade) out.push(line)
+  }
+  return out
+}
+
+// summarizeOutcomeCoverage (issue #92): the small machine-readable rollup a
+// Tier 5 consumer (or a run's own Report phase) reads instead of walking
+// outcomes.jsonl itself. `observations` is this pass's raw per-target reads
+// (graded_count counts the non-null ones — a null entry is a target the
+// read-only probe failed to resolve, not a graded target); `lines` is the
+// full current-pass grade set (buildOutcomeLine output, BEFORE diffOutcomeGrades
+// trims it to new/changed-only — coverage describes the whole pass, not just
+// this pass's ledger delta); `sampleCapHit` passes through the caller's own
+// "did target selection hit cfg.sample_cap" flag verbatim, since only the
+// caller (which did the selecting) knows that.
+function summarizeOutcomeCoverage(observations, lines, sampleCapHit) {
+  let gradedCount = 0
+  for (const o of (Array.isArray(observations) ? observations : [])) {
+    if (o) gradedCount++
+  }
+  let negativeCount = 0
+  let pendingCount = 0
+  for (const line of (Array.isArray(lines) ? lines : [])) {
+    if (!line) continue
+    if (line.grade === 'pending') pendingCount++
+    else if (OUTCOME_NEGATIVE_GRADES.indexOf(line.grade) !== -1) negativeCount++
+  }
+  return {
+    graded_count: gradedCount,
+    negative_count: negativeCount,
+    pending_count: pendingCount,
+    sample_cap_hit: !!sampleCapHit,
   }
 }
 
@@ -4433,6 +5862,24 @@ if (Object.prototype.hasOwnProperty.call(PROFILE, 'contrarian_max_iterations')) 
   const cmi = PROFILE.contrarian_max_iterations
   if (!Number.isInteger(cmi) || cmi < 1) throw new Error('profile.contrarian_max_iterations must be an integer >= 1, got: ' + JSON.stringify(cmi))
   MAX_CONTRARIAN_ITERATIONS = cmi
+}
+// outcome grading (issue #92): OPTIONAL profile.outcome_grading overrides
+// OUTCOME_GRADING's hardcoded defaults (min_age_days:7, sample_cap:20 — see its
+// declaration) — same shape of guard as contrarian_max_iterations just above.
+// Absent profile key -> defaults stand untouched.
+if (Object.prototype.hasOwnProperty.call(PROFILE, 'outcome_grading')) {
+  const og = PROFILE.outcome_grading
+  if (!og || typeof og !== 'object' || Array.isArray(og)) throw new Error('profile.outcome_grading must be an object, got: ' + JSON.stringify(og))
+  const nextOG = Object.assign({}, OUTCOME_GRADING)
+  if (Object.prototype.hasOwnProperty.call(og, 'min_age_days')) {
+    if (!Number.isInteger(og.min_age_days) || og.min_age_days < 0) throw new Error('profile.outcome_grading.min_age_days must be an integer >= 0, got: ' + JSON.stringify(og.min_age_days))
+    nextOG.min_age_days = og.min_age_days
+  }
+  if (Object.prototype.hasOwnProperty.call(og, 'sample_cap')) {
+    if (!Number.isInteger(og.sample_cap) || og.sample_cap < 1) throw new Error('profile.outcome_grading.sample_cap must be an integer >= 1, got: ' + JSON.stringify(og.sample_cap))
+    nextOG.sample_cap = og.sample_cap
+  }
+  OUTCOME_GRADING = nextOG
 }
 REPO = PROFILE.repo || REPO
 LOGS = ROOT + '/' + String(PROFILE.logs_dir || 'logs/ticketmill').replace(/^\/+|\/+$/g, '')
@@ -4538,10 +5985,11 @@ log('Selected ' + issueList.length + ' issue(s): ' + issueList.map(function (i) 
 // stage prompts: plan gets agent_selection+workflow, contrarians get
 // quality_loop+performance, test stages get test_loop.
 // STAGE_TOKENS.preflight R1: brackets the whole region from just before
-// learnPromise fires to just after it is awaited below — this deliberately
-// spans (never sub-brackets) the fire-and-forget learnPromise itself, plus
-// targetFetch and the preflight Promise.all in between, all of which run
-// strictly sequentially before runPool() (see addStage()'s module comment).
+// learnPromise fires to just after it (and outcomeGradePromise, fired right below
+// it) are awaited below — this deliberately spans (never sub-brackets) the two
+// fire-and-forget promises themselves, plus targetFetch and the preflight
+// Promise.all in between, all of which run strictly sequentially before runPool()
+// (see addStage()'s module comment).
 const preflightR1Before = spentTokens()
 const learnPromise = agent([
   'Read ' + LOGS + '/process-retrospective.md (READ-ONLY).',
@@ -4553,6 +6001,73 @@ const learnPromise = agent([
   'Return found=true and the six category strings.',
 ].join('\n'), { label: 'learnings-digest', phase: 'Select', schema: LEARNINGS_SCHEMA, model: M.learnings.model, effort: M.learnings.effort })
   .catch(function (e) { log('learnings digest failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
+
+// ---- Select: outcome-grading pass (issue #92), fired alongside learnPromise so
+// its latency hides behind the preflight probes too — see the STAGE_TOKENS.preflight
+// R1 bracket comment above. STRICTLY READ-ONLY: cat runs.jsonl/runs/<tag>.json/
+// outcomes.jsonl under LOGS, `gh pr view`/`gh issue view`/server-side `gh search` —
+// no git fetch, no local writes, no repo mutations of any kind. Does its own target
+// discovery in-prompt (the sandbox cannot read LOGS itself to build the target list
+// for it) and returns raw observations only; the deterministic grade decision
+// (gradeFromObservation) runs post-hoc, just after learnR below, using the pure
+// core above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+const outcomeGradePromise = agent([
+  'READ-ONLY outcome-grading pass over ' + REPO + '\'s ticketmill run history under ' + LOGS + '.',
+  'NO repo mutations of any kind: no git fetch, no local file writes, no gh command that changes state —',
+  'only cat and gh READ commands (gh pr view, gh issue view, gh search, gh pr list) below.',
+  '',
+  '0. now: run `date -u +%Y-%m-%dT%H:%M:%SZ` and return it verbatim as `now`.',
+  '',
+  '1. Target discovery — build the gradable-target list from run history:',
+  '   a. cat ' + LOGS + '/runs.jsonl (if missing/empty: return observations=[], prior_ledger_lines=[],',
+  '      sample_cap_hit=false, and now from step 0 — stop here, nothing else to do).',
+  '      Each line is one compact JSON object with (at least) run_tag and batch_pr; `issues` on that line is a',
+  '      COUNT, not a list of issue numbers — do not treat it as one.',
+  '   b. For each DISTINCT run_tag on those lines, cat ' + LOGS + '/runs/<run_tag>.json (the full record). If a',
+  '      run_tag has no such file, skip it (its runs.jsonl line predates the full-record format). Read its own',
+  '      batch_pr field (NOT the runs.jsonl line\'s) and its results[] array (one entry per unit this run',
+  '      processed: {issue, status, members, ...}).',
+  '   c. If a run\'s batch_pr is null, skip all of its issues — nothing ever reached a human-reviewed PR to grade.',
+  '      Otherwise, for each results[] entry with status === "completed", the gradable issue numbers are its',
+  '      members array (fall back to [entry.issue] if members is empty/absent — that is the no-group case).',
+  '      Build one candidate target {run_tag, batch_pr: <the full record\'s batch_pr>, issue: <member>} per member.',
+  '      Skip entries whose status is anything other than "completed" (skipped/error never shipped code).',
+  '   d. cat ' + LOGS + '/outcomes.jsonl (if missing/empty: no prior grades — every candidate survives). Return its',
+  '      raw lines VERBATIM, one array entry per line, as prior_ledger_lines — do not parse, reshape, or',
+  '      interpret them for the RETURNED array; the caller does that. For target SELECTION only (not for what',
+  '      you return), parse each line yourself: per {run_tag, batch_pr, issue} key, using the LAST line that',
+  '      key appears on (later lines override earlier ones), if its grade is one of reverted / reopened / hotfix /',
+  '      closed_unmerged / abandoned, that target is TERMINAL — drop it from the candidate list, it can never be',
+  '      re-graded.',
+  '   e. From the surviving candidates, sort oldest run_tag first (grade the longest-unobserved history first) and',
+  '      keep at most ' + OUTCOME_GRADING.sample_cap + '. Set sample_cap_hit = true if more candidates existed than',
+  '      that cap, else false.',
+  '',
+  '2. For each surviving target, resolve ONE observation. Batch efficiently: reuse a single `gh pr view <batch_pr>`',
+  '   read across every member issue of that same batch_pr instead of re-querying it per issue.',
+  '   a. gh pr view <batch_pr> --repo ' + REPO + ' --json state,mergedAt — a LIVE read; never trust the run',
+  '      record\'s own recorded status, which can be stale (a PR still open when the run finished may have merged',
+  '      since). live_merge_state = "merged" | "open" | "closed" (closed without merging) | "none" (PR not found).',
+  '      merged_at = the ISO mergedAt timestamp when merged, else null.',
+  '   b. revert_found (only meaningful once merged): server-side search for a commit or PR that reverts this PR —',
+  '      gh search commits --repo ' + REPO + ' "Revert" "#<batch_pr>", and gh pr list --repo ' + REPO + ' --state',
+  '      merged --search "Revert #<batch_pr>" as a second angle. true only when a commit/PR is clearly a revert of',
+  '      this specific PR (not merely mentioning its number in passing).',
+  '   c. reopen_found: gh issue view <issue> --repo ' + REPO + ' --json state,timelineItems — scan timelineItems',
+  '      for a ReopenedEvent that occurs AFTER the ClosedEvent this run produced (issue reopened following the',
+  '      batch PR merge, not reopened-then-reclosed earlier in its history). true only on a clear match.',
+  '   d. hotfix_ref: from that SAME timelineItems read, look for a CrossReferencedEvent whose source is a',
+  '      DIFFERENT, later-merged PR that references this issue AND whose title/body language indicates it fixes a',
+  '      problem from the original change (e.g. "fix"/"hotfix"/"regression" — not a routine follow-up feature).',
+  '      hotfix_ref = that PR\'s number, else null.',
+  '   e. On any gh command failure for a target, still return an entry for it with whatever fields you resolved',
+  '      and the rest null/false/"unknown" — never drop a target silently; the caller must see every target it',
+  '      asked about, even a partially-resolved one.',
+  '',
+  'Return observations (array, one entry per target — even partially-resolved ones), prior_ledger_lines (the raw',
+  'outcomes.jsonl lines, verbatim, unparsed), sample_cap_hit, and now (from step 0).',
+].join('\n'), { label: 'outcome-grade', phase: 'Select', schema: OUTCOMES_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+  .catch(function (e) { log('outcome-grading pass failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
 
 // ---- Select: preflight probe (the GitHub-state healing layer) ----
 // enginePathspec (issue #3): the literalized engine-owned pathspec, computed
@@ -4657,6 +6172,7 @@ preflights = engineSkip.preflights
 if (engineSkip.flagged.length) log('engine-owned guardrail: root working tree dirty under an engine-owned path targeted by issue(s) ' + engineSkip.flagged.join(', ') + ' — routed to select-skip (regime a)')
 
 const learnR = await learnPromise
+const outcomeGradeR = await outcomeGradePromise
 addStage('preflight', preflightR1Before) // STAGE_TOKENS.preflight R1 close — see the bracket comment above learnPromise
 if (learnR && learnR.found) {
   LEARN = learnR
@@ -4664,6 +6180,40 @@ if (learnR && learnR.found) {
     .filter(function (c) { return learnR[c] }).join(', '))
 } else {
   log('no prior-run learnings digest — plan stage falls back to reading the retro file itself')
+}
+
+// ---- Select: outcome-grading post-hoc (issue #92) — turn outcomeGradeR's raw,
+// judgment-free observations into ledger lines using the deterministic pure core
+// above the TICKETMILL-TEST-HARNESS-SPLIT marker (gradeFromObservation,
+// buildOutcomeLine, diffOutcomeGrades, summarizeOutcomeCoverage). The agent never
+// decides a grade itself — only this JS does, so the decision logic lives in one
+// place and stays unit-testable (tests/outcomes.test.js) without ever shelling out.
+let OUTCOMES_TO_APPEND = []
+let OUTCOMES_COVERAGE = summarizeOutcomeCoverage([], [], false)
+if (outcomeGradeR) {
+  // prior_ledger_lines arrives as raw, unparsed text (the agent never interprets
+  // it — see OUTCOMES_SCHEMA's module comment); parse it here, dropping any line
+  // that fails to parse rather than letting one bad line abort the whole pass.
+  const priorLedgerObjects = (Array.isArray(outcomeGradeR.prior_ledger_lines) ? outcomeGradeR.prior_ledger_lines : [])
+    .map(function (line) { try { return JSON.parse(line) } catch (e) { return null } })
+    .filter(Boolean)
+  const observations = Array.isArray(outcomeGradeR.observations) ? outcomeGradeR.observations : []
+  const gradedLines = observations.map(function (o) {
+    const g = gradeFromObservation({
+      pr_state: o.live_merge_state,
+      merged_at: o.merged_at,
+      reverted: !!o.revert_found,
+      reopened: !!o.reopen_found,
+      hotfix_pr: o.hotfix_ref,
+    }, outcomeGradeR.now)
+    return buildOutcomeLine({ run_tag: o.run_tag, batch_pr: o.batch_pr, issue: o.issue, grade: g.grade, signals: g.signals, decided_at: outcomeGradeR.now })
+  })
+  OUTCOMES_TO_APPEND = diffOutcomeGrades(gradedLines, priorLedgerObjects)
+  OUTCOMES_COVERAGE = summarizeOutcomeCoverage(observations, gradedLines, outcomeGradeR.sample_cap_hit)
+  log('outcome grading: ' + gradedLines.length + ' target(s) graded, ' + OUTCOMES_TO_APPEND.length + ' new/changed ledger line(s)' +
+    (OUTCOMES_COVERAGE.sample_cap_hit ? ' (sample cap hit — history not fully caught up yet)' : ''))
+} else {
+  log('outcome-grading pass failed or returned nothing (non-fatal) — no outcome ledger lines this run')
 }
 
 // ---- Select: consolidation gate (judgment call — see the PROPOSECONSOLIDATION
@@ -4754,6 +6304,42 @@ if (DRY_RUN) {
   // every predicted_files entry (and therefore every heuristic lane here) may
   // be resolved against a stale origin/TARGET, not what a real run would fetch.
   const refPossiblyStale = !targetFetch || targetFetch.status !== 'success'
+  // Cost-estimate preview (issue #97 task 3) — built off the SAME previewUnits
+  // the lane-scheduling preview above already derived, so a unit's shape here
+  // matches the unit a real run would actually drain. Scoped to
+  // resume_point === 'implement' units ONLY (Quality Review, task 3 iteration
+  // 1): a 'skip' unit does no real work at all (processIssue's
+  // resume_point==='skip' early return) and a 'process_pr' unit pays only
+  // rework-tax, not a fresh implement-shaped run — charging either the SAME
+  // full pf-band-median estimate as a genuine implement would inflate
+  // batch_projection.projected_total and could spuriously trip
+  // oversized.multiple_of_median on an already-skipped/healed issue. A unit's
+  // own `.resume_point` is inherited straight from its preflight/primaryRef in
+  // deriveUnits(), so this filter needs no new plumbing. Task 4/5's live-run
+  // pre-check reuses this SAME filtered construction so the estimate map it
+  // builds off of stays unpolluted too. Each surviving unit becomes one
+  // buildCostEstimate() `issues[]` entry: `pf` is the unit's own predicted_files
+  // count (already the union for a group unit — deriveUnits() computes it that
+  // way, see its module comment), `member_count` its live member count, and
+  // `members` (only when >1) each member's OWN predicted_files count — NOT the
+  // union — mirroring estimateCost()'s group contract (each member bands on its
+  // own shape, see estimateIssue()'s module comment).
+  const costEstimateUnits = previewUnits.filter(function (u) { return u.resume_point === 'implement' })
+  const costEstimateIssues = costEstimateUnits.map(function (u) {
+    const memberCount = Array.isArray(u.members) ? u.members.length : 1
+    const item = {
+      issue: u.issue,
+      pf: (Array.isArray(u.predicted_files) ? u.predicted_files.length : 0),
+      member_count: memberCount,
+    }
+    if (memberCount > 1) {
+      item.members = u.members.map(function (m) {
+        return { issue: m.issue, pf: (Array.isArray(m.predicted_files) ? m.predicted_files.length : 0) }
+      })
+    }
+    return item
+  })
+  const costEstimate = buildCostEstimate(HISTORY, costEstimateIssues)
 
   return {
     state: 'dry_run', root: ROOT, repo: REPO, base_branch: BASE,
@@ -4786,6 +6372,19 @@ if (DRY_RUN) {
         ? 'preflight-fetch of origin/' + TARGET + ' failed — predicted_files (and every lane/DF signal above) may be grounded against a stale ref'
         : null,
     },
+    // Cost-estimate preview (issue #97 task 3) — see buildCostEstimate() above
+    // the split marker for the full per-issue/oversized/batch_projection
+    // contract. history_available reports whether the HISTORY run arg carried
+    // any lines at all, distinct from a per-issue 'insufficient' confidence
+    // (which can still happen WITH history if same-shape history is thin) —
+    // both are honest-degrade signals but at different scopes (whole-run vs.
+    // per-issue). Trusted history accrues only from effective_concurrency===1
+    // runs (see buildTrustedPfBands's module comment): a default
+    // concurrency:2 product batch's own history stays dark here indefinitely,
+    // by design — the structural (OVERSIZE_GROUP_MEMBERS) and pf_ceiling arms,
+    // plus the always-on hard budget floor, are what protect that usage
+    // pattern in the absence of a per-issue estimate.
+    cost_estimate: Object.assign({ history_available: HISTORY.length > 0 }, costEstimate),
     note: 'No changes made. Re-run without dry_run to execute.',
   }
 }
@@ -4902,12 +6501,33 @@ if (guard.dissolvedCount) {
 }
 if (lanes.length < units.length) log('lane scheduling: ' + lanes.length + ' lane(s) for ' + units.length + ' unit(s) — effective concurrency ' + Math.min(CONCURRENCY, lanes.length) + '/' + CONCURRENCY)
 
+// ---- Process: token_budget guard (issue #97 task 4) — resolve once, before
+// runPool() drains, off the HISTORY run arg (threaded on EVERY invocation, live
+// runs and dry_run alike — see the HISTORY module comment) and this run's real
+// `units`, so the estimate-aware pre-check has a live map even on a real run
+// (Revised Plan iteration 2, Minor finding: it would otherwise only ever fire
+// inside the dry_run preview). run arg -> profile field precedence, matching
+// every other run-arg/profile-fallback field above.
+const budgetEstimate = buildBudgetEstimateMap(HISTORY, units)
+const tokenBudgetResolved = resolveTokenBudget(A.token_budget, PROFILE && PROFILE.token_budget, budgetEstimate.bands)
+if (tokenBudgetResolved.degraded) log('token_budget: ' + tokenBudgetResolved.degraded)
+if (isFiniteNumber(tokenBudgetResolved.budget)) {
+  log('token_budget: guard armed at ' + tokenBudgetResolved.budget + ' OUTPUT tokens (source: ' + tokenBudgetResolved.source +
+    (tokenBudgetResolved.spec && tokenBudgetResolved.spec.kind === 'multiple' ? ', ' + tokenBudgetResolved.spec.multiple + 'x historical median' : '') + ')')
+}
+const TOKEN_BUDGET_CTX = { budget: tokenBudgetResolved.budget, estimateByIssue: budgetEstimate.estimateByIssue }
+
 // ---- Process: per-issue pipeline with issue-level concurrency + breakers ----
-const results = await runPool(units, CONCURRENCY, processIssue, lanes)
+const results = await runPool(units, CONCURRENCY, processIssue, lanes, TOKEN_BUDGET_CTX)
 
 const counts = {}
 for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1
-const state = STOP.tripped ? 'circuit_breaker'
+// state (issue #97 task 4): 'budget_halt' is distinct from 'circuit_breaker' —
+// STOP.kind === 'budget' ONLY when the proactive token_budget guard tripped
+// (see the STOP.kind module comment); every other STOP reason (BATCH.failures,
+// consecutive agent deaths, a real budget-exhaustion error message) still
+// reports 'circuit_breaker', unchanged.
+const state = STOP.tripped ? (STOP.kind === 'budget' ? 'budget_halt' : 'circuit_breaker')
   : (results.some(function (r) { return r.status !== 'completed' && r.status !== 'skipped' }) ? 'completed_with_errors' : 'completed')
 log('Batch done: ' + JSON.stringify(counts) + ' state=' + state + (STOP.tripped ? ' (' + STOP.reason + ')' : ''))
 
@@ -4950,6 +6570,19 @@ const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY, STAGE_TOK
 
 // ---- Merge auto-resolution: JS-computed run-level rollup, injected verbatim below ----
 const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
+
+// ---- Friction & churn (issue #89): JS-computed run-level rollup, injected verbatim
+// below. serializeGlobs is the same profile-driven array computeLanes/the engine-owned
+// guardrail already use (declared above at the lane-scheduling call site); ENGINE_OWNED
+// is the module-level array populated at Select. ----
+const FRICTION_CHURN_AGG = composeFrictionChurn(results, { serializeGlobs: serializeGlobs, engineOwned: ENGINE_OWNED })
+
+// ---- Rework tax & gate yield (issue #91): JS-computed run-level rollups,
+// injected verbatim below. REWORK_TAX_AGG is gated on TOKEN_AGG.reconcile_error
+// (see computeReworkTax's own module comment for why), so it must be computed
+// AFTER TOKEN_AGG above, never before. ----
+const REWORK_TAX_AGG = computeReworkTax(results, TOKEN_AGG)
+const GATE_YIELD_AGG = computeGateYield(results)
 
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
@@ -5091,6 +6724,18 @@ if (shippedIssues.length) {
     VERIFY_SKIPS.length
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
+    FRICTION_CHURN_AGG.has_signal
+      ? '   - this "## Friction & Churn" section, injected VERBATIM (already computed in JS — do not recompute,\n' +
+        '     re-sum, or add commentary beyond copying it in):\n' + FRICTION_CHURN_AGG.markdown
+      : '   - (no friction or churn signal this run)',
+    REWORK_TAX_AGG.has_signal
+      ? '   - this "## Rework Tax" section, injected VERBATIM (already computed in JS — do not recompute, re-sum,\n' +
+        '     or add commentary beyond copying it in):\n' + REWORK_TAX_AGG.markdown
+      : '   - (no rework-tax signal this run)',
+    GATE_YIELD_AGG.has_signal
+      ? '   - this "## Gate Yield" section, injected VERBATIM (already computed in JS — do not recompute, re-sum,\n' +
+        '     or add commentary beyond copying it in):\n' + GATE_YIELD_AGG.markdown
+      : '   - (no gate-yield signal this run)',
     '   - a note that per-issue PRs were squash-merged into ' + TARGET + ' with full review trails on each issue.',
     '   - this "## Merge Auto-Resolution" section, injected VERBATIM (already computed in JS — do not recompute,',
     '     re-sum, or add commentary beyond copying it in):\n' + MERGE_RESOLVE_AGG.markdown,
@@ -5113,8 +6758,11 @@ if (shippedIssues.length) {
 // agent only renders the human .md, so the record bytes never pass through a model.
 const runRecord = buildRunRecord({
   runTag: RUN_TAG, state: state, baseBranch: BASE, batchBranch: TARGET, batchPr: batchPr,
+  effectiveConcurrency: Math.min(CONCURRENCY, lanes.length),
   stop: STOP, counts: counts, verificationGaps: VERIFY_SKIPS, tokensSpent: spentTokens(),
-  tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, consolidationGroups: finalGroups, results: results,
+  tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, frictionChurnAgg: FRICTION_CHURN_AGG,
+  reworkTaxAgg: REWORK_TAX_AGG, gateYieldAgg: GATE_YIELD_AGG,
+  consolidationGroups: finalGroups, results: results, units: units,
 })
 const resultsJson = JSON.stringify(runRecord, null, 2)
 const report = await agent([
@@ -5138,6 +6786,18 @@ const report = await agent([
   '   Include this "## Token Usage" section VERBATIM (already',
   '   computed in JS — do not recompute, re-sum, or add commentary beyond copying it in):',
   TOKEN_AGG.markdown,
+  FRICTION_CHURN_AGG.has_signal
+    ? '   Include this "## Friction & Churn" section VERBATIM (already computed in JS — do not recompute,\n' +
+      '   re-sum, or add commentary beyond copying it in):\n' + FRICTION_CHURN_AGG.markdown
+    : '   (no friction or churn signal this run — omit the "## Friction & Churn" section entirely)',
+  REWORK_TAX_AGG.has_signal
+    ? '   Include this "## Rework Tax" section VERBATIM (already computed in JS — do not recompute, re-sum,\n' +
+      '   or add commentary beyond copying it in):\n' + REWORK_TAX_AGG.markdown
+    : '   (no rework-tax signal this run — omit the "## Rework Tax" section entirely)',
+  GATE_YIELD_AGG.has_signal
+    ? '   Include this "## Gate Yield" section VERBATIM (already computed in JS — do not recompute, re-sum,\n' +
+      '   or add commentary beyond copying it in):\n' + GATE_YIELD_AGG.markdown
+    : '   (no gate-yield signal this run — omit the "## Gate Yield" section entirely)',
   '3. Include the current timestamp from: date -Iseconds',
   RUN_TAG === 'run' ? '4. The tag "run" is a collision-prone default: substitute the current date (date +%F) for "run" in the .md filename so successive runs do not overwrite each other, and return the actual path.' : '',
   '',
@@ -5218,10 +6878,29 @@ return {
   logs_dir: LOGS,
   record: runRecord,
   ledger: buildLedgerLine(runRecord),
+  // issue #92: outcome grading, same deterministic-persistence contract as
+  // record/ledger above — the outer mill skill appends each `outcomes` line
+  // (already new/changed-only, per diffOutcomeGrades) to `outcomes_path`
+  // (<logs_dir>/outcomes.jsonl) with a real fs Write, never via an agent.
+  // `outcomes_coverage` is the small machine-readable rollup a later
+  // observability tier (or this run's own report) reads instead of re-walking
+  // the ledger — see summarizeOutcomeCoverage's module comment.
+  outcomes: OUTCOMES_TO_APPEND,
+  outcomes_path: LOGS + '/outcomes.jsonl',
+  outcomes_coverage: OUTCOMES_COVERAGE,
   report: report ? report.report_path : null,
   summary_table: report ? report.markdown_summary : null,
   lane_prediction_accuracy: retro ? (retro.lane_prediction_accuracy || null) : null,
   stopped: STOP.tripped ? STOP.reason : null,
+  // resume_hint (issue #97 task 4): a budget_halt gets its OWN hint, distinct
+  // from the reactive death-signature breaker's hint below — a proactive
+  // pre-spend stop is not "an agent kept dying", it needs a token_budget-
+  // specific nudge (raise the budget, or resume with the same/a smaller batch)
+  // rather than the generic "usage limit or API outage, try again later" framing.
   resume_hint: state === 'completed' ? null :
-    'Re-run ticketmill with the same args PLUS batch_branch: "' + TARGET + '" (so healing lands on the same integration branch) — the Select-phase preflight skips merged/closed issues, routes open PRs straight to review/merge, and continues partial branches. For exact journal replay use Workflow({scriptPath, resumeFromRunId}).',
+    (state === 'budget_halt'
+      ? 'token_budget reached before the batch finished (' + STOP.reason + '). Re-run ticketmill with the same args PLUS ' +
+        'batch_branch: "' + TARGET + '" to continue — the Select-phase preflight skips merged/closed issues and continues ' +
+        'partial branches — after raising token_budget or splitting the remaining issues into a smaller batch.'
+      : 'Re-run ticketmill with the same args PLUS batch_branch: "' + TARGET + '" (so healing lands on the same integration branch) — the Select-phase preflight skips merged/closed issues, routes open PRs straight to review/merge, and continues partial branches. For exact journal replay use Workflow({scriptPath, resumeFromRunId}).'),
 }
