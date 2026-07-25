@@ -107,6 +107,38 @@ test('isBudgetExhaustedError: "ran out of tokens" (plural noun + exhaustion verb
   assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
 })
 
+// Regression case for the narrowed regex's phrase-qualified branch: bare
+// singular "token" only counts when directly qualified by "limit" or
+// "budget" (token[\s-]+(?:budget|limit)). This is the one alternative in
+// hasBudgetNoun that admits singular "token" back in, and it was the sole
+// gap flagged by test validation's mutation check — deleting this
+// alternative outright left every prior case green, since none of them
+// exercised a bare-token message that relies on it. "token limit reached"
+// supplies both the noun (via "token limit") and the verb (via "limit
+// reached") through this branch alone.
+test('isBudgetExhaustedError: "token limit reached" (token directly qualified by "limit" + exhaustion verb) returns true and trips STOP', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('token limit reached')
+  assert.strictEqual(result, true)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+})
+
+test('isBudgetExhaustedError: "token budget exceeded" (token directly qualified by "budget" + exhaustion verb) returns true and trips STOP', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('token budget exceeded')
+  assert.strictEqual(result, true)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+})
+
+// Pins the [\s-]+ separator class itself (hyphenated qualifier), distinct
+// from the space-separated cases above.
+test('isBudgetExhaustedError: "token-limit exceeded" (hyphenated token-limit qualifier + exhaustion verb) returns true and trips STOP', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('token-limit exceeded')
+  assert.strictEqual(result, true)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+})
+
 // Every alternative in hasExhaustionVerb's regex gets its own true-positive
 // case here, each paired with a budget noun. A typo in any one alternative
 // (e.g. "ran\s+out" losing its \s+) would silently disable detection for
