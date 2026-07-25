@@ -313,6 +313,16 @@ const HOTSPOT_ISSUE_THRESHOLD = 2
 // chain (computeChurn) — mirrors the "3+ fix rounds is a smell" bar the quality/
 // test loops already use informally; 1-2 touches is ordinary iterate-and-fix.
 const REFIX_THRESHOLD = 3
+// outcome grading (issue #92): default config for gradeFromObservation()'s
+// anti-Goodhart aging gate — overridable via profile.outcome_grading, mirroring
+// MAX_CONTRARIAN_ITERATIONS (see the guard near PROFILE.contrarian_max_iterations
+// in Select). min_age_days gates the POSITIVE grade only ("clean" is asymmetric:
+// a merged PR isn't certified clean until it's had this many days to surface
+// trouble); negative signals (reverted/reopened/hotfix) fire immediately regardless
+// of age. sample_cap bounds how many gradable targets one pass's read-only gh
+// probes cover, so the pass stays cheap and re-runs/deepens over many runs rather
+// than trying to grade full history in one shot.
+let OUTCOME_GRADING = { min_age_days: 7, sample_cap: 20 }
 
 // ----- model policy (profile.models may override any stage key) -----
 const M = {
@@ -417,17 +427,19 @@ const BOOT_SCHEMA = {
 const PROFILE_SCHEMA = {
   type: 'object', required: ['found'],
   // found/raw describe the probe's own response shape (does the profile file
-  // exist, and its raw text). engine_owned_globs/lockstep_installed_paths
-  // document — for readers of this schema — the two optional array fields
-  // issue #3 added to the parsed .claude/ticketmill.json profile itself (read
-  // via PROFILE.engine_owned_globs / PROFILE.lockstep_installed_paths at
-  // Select, see mergeEngineOwnedGlobs); they are not part of the probe
-  // response and additionalProperties is unset, so listing them here is
-  // documentation only, not enforcement.
+  // exist, and its raw text). engine_owned_globs/lockstep_installed_paths/
+  // outcome_grading document — for readers of this schema — optional fields
+  // added to the parsed .claude/ticketmill.json profile itself: issue #3's
+  // engine_owned_globs/lockstep_installed_paths (read at Select via
+  // mergeEngineOwnedGlobs), and issue #92's outcome_grading (read at Select via
+  // a guard mirroring profile.contrarian_max_iterations's, right after it).
+  // None of them are part of the probe response itself and additionalProperties
+  // is unset, so listing them here is documentation only, not enforcement.
   properties: {
     found: { type: 'boolean' }, raw: { type: 'string' },
     engine_owned_globs: { type: 'array', items: { type: 'string' } },
     lockstep_installed_paths: { type: 'array', items: { type: 'string' } },
+    outcome_grading: { type: 'object', properties: { min_age_days: { type: 'integer' }, sample_cap: { type: 'integer' } } },
   },
 }
 const AGENTS_SCHEMA = {
@@ -4563,6 +4575,7 @@ function __seed(o) {
   if ('ENGINE_OWNED' in o) ENGINE_OWNED = o.ENGINE_OWNED
   if ('LOCKSTEP_INSTALLED_PATHS' in o) LOCKSTEP_INSTALLED_PATHS = o.LOCKSTEP_INSTALLED_PATHS
   if ('MAX_CONTRARIAN_ITERATIONS' in o) MAX_CONTRARIAN_ITERATIONS = o.MAX_CONTRARIAN_ITERATIONS
+  if ('OUTCOME_GRADING' in o) OUTCOME_GRADING = o.OUTCOME_GRADING
 }
 
 // contrarianCapFor: proportional adversarial depth (see the comment at its call
@@ -5000,6 +5013,215 @@ function buildLedgerLine(record) {
   }
 }
 
+// ============================================================================
+// Outcome grading (issue #92): the read-only back-annotation pass that grades
+// a prior run's merged batch PRs against what actually happened afterward
+// (reverted / issue reopened / needed a hotfix / held up cleanly), so later
+// self-improvement has a real quality anchor instead of only process-friction
+// signal (which is Goodhart-able — an issue can sail through every gate
+// friction-free and still ship a defect).
+//
+// The gh/git reads themselves cannot happen here (the sandbox has no fs/git/gh —
+// see docs/ARCHITECTURE.md); a Select-phase agent() stage resolves raw
+// `observation` objects live via gh, one per {run_tag, batch_pr, issue} gradable
+// target (a merged member issue of a prior run's batch PR). Everything below is
+// the deterministic, pure grading/diff/summarize core that turns those raw
+// observations into ledger lines — unit-tested directly (tests/outcomes.test.js)
+// without ever shelling out.
+// ============================================================================
+
+// OUTCOME_TERMINAL_GRADES: grades that are FINAL once observed — the target is
+// never re-graded or re-emitted again (see diffOutcomeGrades' skip-terminal
+// rule). 'pending' and 'clean' are deliberately excluded: 'pending' is a
+// placeholder by definition, and 'clean' stays open to correction (a PR
+// certified clean today can still be reverted next week) — only a target that
+// can never produce new signal (a revert/reopen/hotfix already happened, or the
+// PR never merged at all) is truly done.
+const OUTCOME_TERMINAL_GRADES = ['reverted', 'reopened', 'hotfix', 'closed_unmerged', 'abandoned']
+// OUTCOME_NEGATIVE_GRADES: the anti-Goodhart quality-negative signals proper —
+// excludes closed_unmerged/abandoned, which are a terminal ESCAPE for a target
+// that can never reach "clean" (no merge occurred), not evidence of a bad
+// outcome, so they must not inflate a negative-outcome rate.
+const OUTCOME_NEGATIVE_GRADES = ['reverted', 'reopened', 'hotfix']
+
+// outcomeLineKey: the ledger's identity key — run_tag + batch_pr + issue (one row
+// per member issue of a batch PR, not one row per PR, so a multi-issue batch PR
+// grades each issue independently). Shared by diffOutcomeGrades' dedup/lookup.
+function outcomeLineKey(line) {
+  const l = line || {}
+  return String(l.run_tag) + '::' + String(l.batch_pr) + '::' + String(l.issue)
+}
+
+// toEpochMs: accepts a Date, an epoch-ms number, or an ISO-8601 string and
+// returns epoch ms (NaN if unparseable). Lets `now` and observation.merged_at
+// arrive in whichever shape their source naturally produces (a `date` probe
+// returns a string; a test fixture may hand in either) without forcing every
+// caller through the same constructor.
+function toEpochMs(x) {
+  if (x instanceof Date) return x.getTime()
+  if (typeof x === 'number') return x
+  if (typeof x === 'string') return Date.parse(x)
+  return NaN
+}
+
+// ageInDays: whole/fractional days between an ISO merge timestamp and `now`.
+// Returns null (never NaN) when either side fails to parse, so callers can
+// treat "unknown age" the same as "not old enough yet" without a NaN leaking
+// into a >= comparison (NaN >= N is always false, which would accidentally be
+// correct here, but null is the honest, greppable signal of "couldn't tell").
+function ageInDays(isoTimestamp, now) {
+  const mergedMs = typeof isoTimestamp === 'string' ? Date.parse(isoTimestamp) : NaN
+  const nowMs = toEpochMs(now)
+  if (!Number.isFinite(mergedMs) || !Number.isFinite(nowMs)) return null
+  return (nowMs - mergedMs) / 86400000
+}
+
+// pickOutcomeSignals: the compact, audit-friendly subset of an observation's raw
+// fields carried onto the ledger line as `signals` — enough to explain WHY a
+// grade was assigned (mirrors gate_yield's raw-count-alongside-verdict idiom)
+// without echoing back the full agent payload.
+function pickOutcomeSignals(observation) {
+  const o = observation || {}
+  return {
+    pr_state: o.pr_state != null ? o.pr_state : null,
+    merged_at: o.merged_at != null ? o.merged_at : null,
+    reverted: !!o.reverted,
+    reopened: !!o.reopened,
+    hotfix_pr: o.hotfix_pr != null ? o.hotfix_pr : null,
+    issue_state: o.issue_state != null ? o.issue_state : null,
+    abandoned: !!o.abandoned,
+  }
+}
+
+// gradeFromObservation (issue #92): the deterministic grade decision. Takes ONE
+// raw observation (as resolved live via gh by the Select-phase outcome-observation
+// agent — never a stale pre-merge record), `now` (a Date/epoch-ms/ISO string —
+// ALWAYS injected by the caller; this function itself never calls Date.now() or
+// argless `new Date()`, which the sandbox forbids and lint-engine.js enforces),
+// and `cfg` (defaults to OUTCOME_GRADING; pass an explicit object to override
+// min_age_days in tests or from a profile-loaded config).
+//
+// Asymmetric aging is the whole point: a bad outcome is real the moment it's
+// observed and grades immediately, at any age. A good outcome is not certified
+// until it's had time to prove itself — "no negative signal yet" is not the same
+// claim as "held up cleanly", so `clean` is gated behind cfg.min_age_days.
+//
+// Precedence (first match wins):
+//   1. reverted   — a revert commit referencing this PR/issue was found.
+//   2. reopened   — the issue's timeline shows it reopened after this run closed it.
+//   3. hotfix     — a later PR cross-references this issue as a fix for it.
+//   4. closed_unmerged — batch_pr closed without ever merging: this target can
+//      never reach "clean" (there was nothing to hold up), so it gets a terminal
+//      escape now instead of sitting `pending` forever.
+//   5. abandoned  — the issue itself was abandoned (closed, no PR ever merged),
+//      same terminal-escape reasoning as closed_unmerged.
+//   6. clean      — merged, no negative signal, and >= min_age_days old.
+//   7. pending    — everything else (merged but still too young, or state unknown).
+function gradeFromObservation(observation, now, cfg) {
+  const o = observation || {}
+  const c = cfg || OUTCOME_GRADING
+  const minAgeDays = Number.isFinite(c.min_age_days) ? c.min_age_days : OUTCOME_GRADING.min_age_days
+  const signals = pickOutcomeSignals(o)
+
+  if (o.reverted) return { grade: 'reverted', signals: signals }
+  if (o.reopened) return { grade: 'reopened', signals: signals }
+  if (o.hotfix_pr) return { grade: 'hotfix', signals: signals }
+  if (o.pr_state === 'closed' && !o.merged_at) return { grade: 'closed_unmerged', signals: signals }
+  if (o.abandoned) return { grade: 'abandoned', signals: signals }
+
+  if (o.merged_at) {
+    const age = ageInDays(o.merged_at, now)
+    if (age != null && age >= minAgeDays) return { grade: 'clean', signals: signals }
+  }
+
+  return { grade: 'pending', signals: signals }
+}
+
+// buildOutcomeLine (issue #92): the compact single-object JSONL shape appended to
+// <logs_dir>/outcomes.jsonl, one line per {run_tag, batch_pr, issue} — mirrors
+// buildLedgerLine's "flat, small, one-object-per-line" contract. schema_version
+// lets a future reader distinguish shapes without re-deriving them, same as
+// buildRunRecord's header.
+function buildOutcomeLine(f) {
+  const o = f || {}
+  return {
+    schema_version: 1,
+    run_tag: o.run_tag,
+    batch_pr: o.batch_pr,
+    issue: o.issue,
+    grade: o.grade,
+    signals: o.signals || {},
+    decided_at: o.decided_at,
+  }
+}
+
+// diffOutcomeGrades (issue #92): the sole emit decision for the ledger append —
+// the mill skill's write step is a plain, dumb append of whatever this returns
+// (never its own dedup logic). Given this pass's freshly graded `currentLines`
+// and the prior ledger's lines (as read verbatim off disk, oldest-to-newest),
+// returns only the lines that are NEW (key not seen before) or CHANGED (grade
+// differs from the prior ledger's last-line-wins value for that key) —
+// unconditionally SKIPPING any key whose prior grade is already terminal
+// (OUTCOME_TERMINAL_GRADES), since a terminal grade never legitimately changes;
+// re-emitting it would just be append-only bloat (or, if a re-observation ever
+// disagreed, silently overwrite settled history with a possibly-flaky read).
+//
+// last-line-wins is applied to BOTH inputs: `priorLedgerLines` because
+// outcomes.jsonl is append-only (a key can appear more than once across its
+// history and the latest line is authoritative), and `currentLines` for the
+// same reason should a caller ever hand in more than one line per key in a
+// single pass (defensive; the normal caller emits at most one).
+function diffOutcomeGrades(currentLines, priorLedgerLines) {
+  const currentMap = new Map()
+  for (const line of (Array.isArray(currentLines) ? currentLines : [])) {
+    if (!line) continue
+    currentMap.set(outcomeLineKey(line), line)
+  }
+  const priorMap = new Map()
+  for (const line of (Array.isArray(priorLedgerLines) ? priorLedgerLines : [])) {
+    if (!line) continue
+    priorMap.set(outcomeLineKey(line), line)
+  }
+
+  const out = []
+  for (const [key, line] of currentMap) {
+    const prior = priorMap.get(key)
+    if (prior && OUTCOME_TERMINAL_GRADES.indexOf(prior.grade) !== -1) continue // skip-terminal
+    if (!prior || prior.grade !== line.grade) out.push(line)
+  }
+  return out
+}
+
+// summarizeOutcomeCoverage (issue #92): the small machine-readable rollup a
+// Tier 5 consumer (or a run's own Report phase) reads instead of walking
+// outcomes.jsonl itself. `observations` is this pass's raw per-target reads
+// (graded_count counts the non-null ones — a null entry is a target the
+// read-only probe failed to resolve, not a graded target); `lines` is the
+// full current-pass grade set (buildOutcomeLine output, BEFORE diffOutcomeGrades
+// trims it to new/changed-only — coverage describes the whole pass, not just
+// this pass's ledger delta); `sampleCapHit` passes through the caller's own
+// "did target selection hit cfg.sample_cap" flag verbatim, since only the
+// caller (which did the selecting) knows that.
+function summarizeOutcomeCoverage(observations, lines, sampleCapHit) {
+  let gradedCount = 0
+  for (const o of (Array.isArray(observations) ? observations : [])) {
+    if (o) gradedCount++
+  }
+  let negativeCount = 0
+  let pendingCount = 0
+  for (const line of (Array.isArray(lines) ? lines : [])) {
+    if (!line) continue
+    if (line.grade === 'pending') pendingCount++
+    else if (OUTCOME_NEGATIVE_GRADES.indexOf(line.grade) !== -1) negativeCount++
+  }
+  return {
+    graded_count: gradedCount,
+    negative_count: negativeCount,
+    pending_count: pendingCount,
+    sample_cap_hit: !!sampleCapHit,
+  }
+}
+
 // ---- TICKETMILL-TEST-HARNESS-SPLIT: tests/harness.js truncates the source at this
 // marker and evaluates only what precedes it; nothing from here down (including the
 // top-level await below) runs under the test harness's vm context. Do not remove or
@@ -5042,6 +5264,24 @@ if (Object.prototype.hasOwnProperty.call(PROFILE, 'contrarian_max_iterations')) 
   const cmi = PROFILE.contrarian_max_iterations
   if (!Number.isInteger(cmi) || cmi < 1) throw new Error('profile.contrarian_max_iterations must be an integer >= 1, got: ' + JSON.stringify(cmi))
   MAX_CONTRARIAN_ITERATIONS = cmi
+}
+// outcome grading (issue #92): OPTIONAL profile.outcome_grading overrides
+// OUTCOME_GRADING's hardcoded defaults (min_age_days:7, sample_cap:20 — see its
+// declaration) — same shape of guard as contrarian_max_iterations just above.
+// Absent profile key -> defaults stand untouched.
+if (Object.prototype.hasOwnProperty.call(PROFILE, 'outcome_grading')) {
+  const og = PROFILE.outcome_grading
+  if (!og || typeof og !== 'object' || Array.isArray(og)) throw new Error('profile.outcome_grading must be an object, got: ' + JSON.stringify(og))
+  const nextOG = Object.assign({}, OUTCOME_GRADING)
+  if (Object.prototype.hasOwnProperty.call(og, 'min_age_days')) {
+    if (!Number.isInteger(og.min_age_days) || og.min_age_days < 0) throw new Error('profile.outcome_grading.min_age_days must be an integer >= 0, got: ' + JSON.stringify(og.min_age_days))
+    nextOG.min_age_days = og.min_age_days
+  }
+  if (Object.prototype.hasOwnProperty.call(og, 'sample_cap')) {
+    if (!Number.isInteger(og.sample_cap) || og.sample_cap < 1) throw new Error('profile.outcome_grading.sample_cap must be an integer >= 1, got: ' + JSON.stringify(og.sample_cap))
+    nextOG.sample_cap = og.sample_cap
+  }
+  OUTCOME_GRADING = nextOG
 }
 REPO = PROFILE.repo || REPO
 LOGS = ROOT + '/' + String(PROFILE.logs_dir || 'logs/ticketmill').replace(/^\/+|\/+$/g, '')
