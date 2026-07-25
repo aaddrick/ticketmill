@@ -296,6 +296,13 @@ const MAX_LANE_ACCURACY_SAMPLES = 40
 // many different files across many fix rounds must not grow this per-issue
 // map unboundedly, matching the existing ctx.notes/ctx.settled caps.
 const MAX_TOUCH_FILES = 100
+// run completeness (issue #87 task 5): the token-reconciliation fraction
+// (aggregateTokens' reconcile_error — see its module comment for why it, not
+// the coarser `reconciles` boolean, is the honest signal) below which a run is
+// still trusted for downstream trend analysis. 5% mirrors the "small" bar that
+// comment already sets for gating efficiency metrics; not a correctness input,
+// only a display/trust-flag threshold.
+const MAX_RECONCILE_ERROR_FOR_TRUST = 0.05
 
 // ----- model policy (profile.models may override any stage key) -----
 const M = {
@@ -1640,6 +1647,41 @@ function verifyNotesBlock() {
   const vn = (PROFILE.verify_notes || [])
   if (!vn.length) return ''
   return '## Project verification notes (from the ticketmill profile)\n' + vn.map(function (n) { return '- ' + n }).join('\n')
+}
+
+// ----- gate findings tally (issue #87 task 3) -----
+// Per-gate (currently the two per-issue contrarian gates, 'approach' and
+// 'plan' — CHALLENGE_SCHEMA's findings carry a severity, unlike REVIEW_SCHEMA/
+// TASK_REVIEW_SCHEMA's untyped issues/pass-fail shape, so those are the gates
+// a "severity mix" can honestly describe) tally of finding counts, severity
+// mix, and how that gate ITERATION resolved:
+//   accepted            - verdict sound_with_caveats with zero critical/major
+//                          (the same condition that triggers settleDecision()).
+//   carried-unresolved  - the contrarian cap was reached with critical/major
+//                         findings still open (they ride into ctx.unresolved).
+//   re-litigated        - neither of the above: the loop revises and
+//                         re-challenges, so these findings get contested again
+//                         next iteration.
+//   dismissed           - the gate produced no adjudicated verdict at all
+//                         (challenger agent died) — any findings were never
+//                         actually judged.
+// One call per gate ITERATION (not per finding), so `disposition` tallies
+// outcomes while `severity` sums every finding's severity across every
+// iteration of that gate. Bounded implicitly: one entry per gate name, each
+// gate runs at most challengeCap (<= MAX_CONTRARIAN_ITERATIONS) times per issue.
+function recordGateOutcome(ctx, gate, findings, disposition) {
+  if (!ctx || !ctx.gate_findings) return
+  const key = String(gate || '').trim()
+  if (!key) return
+  if (!ctx.gate_findings[key]) ctx.gate_findings[key] = { count: 0, severity: { critical: 0, major: 0, minor: 0 }, disposition: {} }
+  const g = ctx.gate_findings[key]
+  for (const f of (findings || [])) {
+    g.count++
+    const sev = f && f.severity
+    if (sev === 'critical' || sev === 'major' || sev === 'minor') g.severity[sev]++
+  }
+  const d = String(disposition || '').trim() || 'unknown'
+  g.disposition[d] = (g.disposition[d] || 0) + 1
 }
 
 // Compact intent context for fix stages — they otherwise see only reviewer comments
@@ -3372,7 +3414,7 @@ async function implementIssue(ctx) {
       'Every concern goes in the findings ARRAY (objects with severity, summary, recommendation — keep each field to',
       '2-3 sentences), never only in prose. Keep summary under 200 words so the output stays well-formed.',
     ].join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
-    if (!ch) { log('#' + ctx.issue + ' contrarian(approach) died — proceeding with unchallenged approach (logged)'); pushDecision(ctx, 'Contrarian: Approach', 'SKIPPED — contrarian agent unavailable'); break }
+    if (!ch) { log('#' + ctx.issue + ' contrarian(approach) died — proceeding with unchallenged approach (logged)'); pushDecision(ctx, 'Contrarian: Approach', 'SKIPPED — contrarian agent unavailable'); recordGateOutcome(ctx, 'approach', [], 'dismissed'); break }
 
     approachCaveats = ch.caveats || []
     const criticalMajor = (ch.findings || []).filter(function (f) { return f.severity === 'critical' || f.severity === 'major' }).length
@@ -3381,6 +3423,7 @@ async function implementIssue(ctx) {
         (approachCaveats.length ? '**Caveats:**\n- ' + approachCaveats.join('\n- ') : 'No caveats'))
       settleDecision(ctx, 'implementation approach', 'approach challenge i' + iter,
         evalR.approach, evalR.rationale, evalR.alternatives_rejected)
+      recordGateOutcome(ctx, 'approach', ch.findings, 'accepted')
       break
     }
     log('#' + ctx.issue + ' contrarian(approach) i' + iter + ': ' + ch.verdict + ', ' + criticalMajor + ' critical/major — re-evaluating')
@@ -3391,6 +3434,7 @@ async function implementIssue(ctx) {
           ctx.unresolved.push('[approach gate, ' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
         }
       }
+      recordGateOutcome(ctx, 'approach', ch.findings, 'carried-unresolved')
       VERIFY_SKIPS.push('#' + ctx.issue + ': approach challenge capped at ' + challengeCap + ' iterations with unresolved caveats: ' + oneLine(ch.summary || '').slice(0, 200))
       const capNote = await stage(ctx, 'cap-note-approach', [
         'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (gh issue comment).',
@@ -3403,6 +3447,7 @@ async function implementIssue(ctx) {
       if (!capNote || !capNote.posted) log('#' + ctx.issue + ' cap note (approach) did not post — caveats live in the decision chain only')
       break
     }
+    recordGateOutcome(ctx, 'approach', ch.findings, 're-litigated')
     const re = await stage(ctx, 're-evaluate-i' + iter, [
       'Revise the implementation approach for issue #' + ctx.issue + ' based on contrarian feedback (verdict: ' + ch.verdict + '):',
       '', String(ch.summary || ''), '',
@@ -3515,7 +3560,7 @@ async function implementIssue(ctx) {
       'Every concern goes in the findings ARRAY (objects with severity, summary, recommendation — keep each field to',
       '2-3 sentences), never only in prose. Keep summary under 200 words so the output stays well-formed.',
     ].join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
-    if (!ch) { log('#' + ctx.issue + ' contrarian(plan) died — proceeding with unchallenged plan (logged)'); pushDecision(ctx, 'Contrarian: Plan', 'SKIPPED — contrarian agent unavailable'); break }
+    if (!ch) { log('#' + ctx.issue + ' contrarian(plan) died — proceeding with unchallenged plan (logged)'); pushDecision(ctx, 'Contrarian: Plan', 'SKIPPED — contrarian agent unavailable'); recordGateOutcome(ctx, 'plan', [], 'dismissed'); break }
 
     const criticalMajor = (ch.findings || []).filter(function (f) { return f.severity === 'critical' || f.severity === 'major' }).length
     if (ch.verdict === 'sound_with_caveats' && criticalMajor === 0) {
@@ -3523,6 +3568,7 @@ async function implementIssue(ctx) {
         ((ch.caveats || []).length ? '\n**Caveats:**\n- ' + ch.caveats.join('\n- ') : ''))
       settleDecision(ctx, 'task plan (' + tasks.length + ' tasks)', 'plan challenge i' + iter, planR.summary,
         (ch.caveats || []).length ? 'accepted with caveats: ' + ch.caveats.join('; ') : 'accepted without caveats', [])
+      recordGateOutcome(ctx, 'plan', ch.findings, 'accepted')
       break
     }
     if (iter === challengeCap) {
@@ -3532,6 +3578,7 @@ async function implementIssue(ctx) {
           ctx.unresolved.push('[plan gate, ' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
         }
       }
+      recordGateOutcome(ctx, 'plan', ch.findings, 'carried-unresolved')
       VERIFY_SKIPS.push('#' + ctx.issue + ': plan challenge capped at ' + challengeCap + ' iterations with unresolved caveats: ' + oneLine(ch.summary || '').slice(0, 200))
       const capNote = await stage(ctx, 'cap-note-plan', [
         'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (gh issue comment).',
@@ -3544,6 +3591,7 @@ async function implementIssue(ctx) {
       if (!capNote || !capNote.posted) log('#' + ctx.issue + ' cap note (plan) did not post — caveats live in the decision chain only')
       break
     }
+    recordGateOutcome(ctx, 'plan', ch.findings, 're-litigated')
     const rp = await stage(ctx, 're-plan-i' + iter, planPromptFor(
       'Contrarian verdict on the current plan: ' + ch.verdict + '\n\n' + (ch.summary || '') + '\n\nFindings:\n' +
       (ch.findings || []).map(function (f) { return '- [' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || '') }).join('\n') +
@@ -4224,6 +4272,45 @@ function releaseChangelogAnchor(version, runTag) {
   return '## [' + String(version) + '] - ' + String(runTag)
 }
 
+// computeCompleteness (issue #87 task 5): a pure trust flag for a run's own
+// telemetry, answering three questions the record can otherwise only be
+// TRUSTED to answer, never verified to answer:
+//   - did every issue's `metrics` block actually land (vs. a pool-catch stub
+//     or a ctx that died before metrics were ever attached)?
+//   - was `changed_files` captured for every issue that actually merged (a
+//     'completed' result whose probeChangedFiles() never ran or degraded)?
+//   - did the run's own token accounting reconcile (aggregateTokens'
+//     reconcile_error — see its module comment for why that fraction, not the
+//     coarser `reconciles` boolean, is the honest signal — kept under
+//     MAX_RECONCILE_ERROR_FOR_TRUST)?
+// Pure/above the split marker: takes the same `results` array and token
+// aggregate buildRunRecord already has in hand, never re-derives them.
+function computeCompleteness(results, tokenAgg) {
+  const list = Array.isArray(results) ? results : []
+  const t = tokenAgg || {}
+  let metricsMissing = 0
+  let changedFilesMissing = 0
+  let completedCount = 0
+  for (const r of list) {
+    if (!r || r.metrics == null) metricsMissing++
+    if (r && r.status === 'completed') {
+      completedCount++
+      if (r.changed_files == null) changedFilesMissing++
+    }
+  }
+  const reconcileError = isFiniteNumber(t.reconcile_error) ? t.reconcile_error : null
+  const tokensReconciled = reconcileError != null && reconcileError <= MAX_RECONCILE_ERROR_FOR_TRUST
+  return {
+    total_results: list.length,
+    metrics_missing: metricsMissing,
+    completed_count: completedCount,
+    changed_files_missing: changedFilesMissing,
+    tokens_reconciled: tokensReconciled,
+    reconcile_error: reconcileError,
+    trustworthy: metricsMissing === 0 && changedFilesMissing === 0 && tokensReconciled,
+  }
+}
+
 // buildRunRecord (issue #86): assemble the FULL, untruncated machine-readable record
 // for a run. Pure and above the split marker so tests can prove — at 18-issue+ scale —
 // that no per-issue metrics/timeline block is dropped. This object is what the outer
@@ -4233,11 +4320,13 @@ function releaseChangelogAnchor(version, runTag) {
 // cut the tail (an 18-issue run overflowed 30 000 chars, so the last issues' metrics
 // never reached disk). The Report agent now renders only the human-readable .md; the
 // bytes of the machine record never pass through a model. Shape is byte-for-byte the
-// prior `resultsJson` payload plus a `schema_version` and `run_tag` header.
+// prior `resultsJson` payload plus a `schema_version` and `run_tag` header, plus (issue
+// #87 task 5) a `completeness` trust flag — see computeCompleteness() just above.
 function buildRunRecord(f) {
   const t = f.tokenAgg || {}
   const m = f.mergeAgg || {}
   return {
+    completeness: computeCompleteness(f.results, t),
     schema_version: 1,
     run_tag: f.runTag,
     state: f.state,
@@ -4272,7 +4361,10 @@ function buildRunRecord(f) {
 // buildLedgerLine (issue #86): the compact one-object-per-run summary the mill skill
 // appends to <logs_dir>/runs.jsonl — the cross-run ledger every later observability
 // tier trends over. Deliberately flat and small (the full per-issue detail lives in
-// runs/<run_tag>.json); this is the index. Pure/above the split marker.
+// runs/<run_tag>.json); this is the index. Pure/above the split marker. Carries
+// `trustworthy` (issue #87 task 5, mirroring record.completeness.trustworthy) so a
+// cross-run trend line can be filtered to only the runs whose telemetry is complete,
+// without re-opening every run's full record to re-derive it.
 function buildLedgerLine(record) {
   const r = record || {}
   const t = r.tokens || {}
@@ -4290,6 +4382,7 @@ function buildLedgerLine(record) {
     reconcile_error: t.reconcile_error,
     verification_gaps: Array.isArray(r.verification_gaps) ? r.verification_gaps.length : 0,
     stop_tripped: !!(r.stop && r.stop.tripped),
+    trustworthy: !!(r.completeness && r.completeness.trustworthy),
   }
 }
 
