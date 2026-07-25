@@ -12,6 +12,22 @@
 //     degrade.
 //   - group estimates as the sum of per-member estimates, poisoned to null by any
 //     null member.
+//
+// Also covers issue #97 task 3 — the dry_run `cost_estimate` preview's pure
+// building blocks (all above the TICKETMILL-TEST-HARNESS-SPLIT marker, same as
+// estimateCost() itself):
+//   - HISTORY: the module-level binding that threads args.history through.
+//   - flagOversized(): the three oversized arms — structural (PRIMARY,
+//     OVERSIZE_GROUP_MEMBERS, history-free), pf_ceiling (SECONDARY,
+//     OVERSIZE_PF_CEILING, history-free, documented-evadable), and
+//     multiple_of_median (unit-invariant, requires real trusted history) —
+//     each boundary-tested at its named threshold.
+//   - globalHistoricalMedian(): the median-of-per-band-medians the
+//     multiple_of_median arm compares every estimate against.
+//   - buildBatchProjection(): the batch-wide rollup that never emits a bare
+//     summed total when any member estimate is null.
+//   - buildCostEstimate(): the public entry point composing all of the above,
+//     including the pf=[]-but-oversized-member-count acceptance case.
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
@@ -208,4 +224,213 @@ test('estimateCost: an issues[] entry may give pf as a number OR as a predicted_
   const byPredictedFiles = context.estimateCost(history, [{ issue: 2, predicted_files: ['a.js', 'b.js'] }])
   assert.strictEqual(byPfNumber.by_issue[0].estimate, 2000)
   assert.strictEqual(byPredictedFiles.by_issue[0].estimate, 2000)
+})
+
+// ============================================================================
+// HISTORY run arg threading (issue #97 task 3) — the top-level `HISTORY`
+// binding the dry_run cost_estimate preview (and a later task's live-run
+// pre-check) reads. Declared well above the TICKETMILL-TEST-HARNESS-SPLIT
+// marker (right next to CONCURRENCY/DRY_RUN), so it is directly readable via
+// harness.readGlobal() like any other module-level const.
+// ============================================================================
+
+test('HISTORY: threads args.history straight through when it is an array', function () {
+  const context = harness.boot({ args: { branch: 'main', history: [{ run_tag: 'a' }, { run_tag: 'b' }] } })
+  const history = harness.readGlobal(context, 'HISTORY')
+  assert.strictEqual(history.length, 2)
+  assert.strictEqual(history[0].run_tag, 'a')
+  assert.strictEqual(history[1].run_tag, 'b')
+})
+
+test('HISTORY: falls open to [] when args.history is omitted', function () {
+  const context = harness.boot({ args: { branch: 'main' } })
+  const history = harness.readGlobal(context, 'HISTORY')
+  assert.strictEqual(Array.isArray(history), true)
+  assert.strictEqual(history.length, 0)
+})
+
+test('HISTORY: falls open to [] when args.history is present but not an array (never throws)', function () {
+  const context = harness.boot({ args: { branch: 'main', history: 'not-an-array' } })
+  const history = harness.readGlobal(context, 'HISTORY')
+  assert.strictEqual(Array.isArray(history), true)
+  assert.strictEqual(history.length, 0)
+})
+
+// ============================================================================
+// Oversized-issue flags + batch projection (issue #97 task 3) — feeds the
+// dry_run `cost_estimate` block. flagOversized/buildBatchProjection/
+// globalHistoricalMedian/buildCostEstimate are all plain function declarations
+// above the split marker, so they attach directly to the vm context like
+// estimateCost() itself.
+// ============================================================================
+
+// ---- flagOversized: structural arm (PRIMARY, OVERSIZE_GROUP_MEMBERS) ----
+
+test('flagOversized: structural arm is false one below OVERSIZE_GROUP_MEMBERS, true exactly at it (boundary)', function () {
+  const context = harness.boot()
+  const threshold = harness.readGlobal(context, 'OVERSIZE_GROUP_MEMBERS')
+  const below = context.flagOversized({ member_count: threshold - 1, pf: 0 }, { estimate: null }, null)
+  const at = context.flagOversized({ member_count: threshold, pf: 0 }, { estimate: null }, null)
+  assert.strictEqual(below.structural, false)
+  assert.strictEqual(at.structural, true)
+})
+
+test('flagOversized: a group with pf=[] on every member (pf=0) still flags via the structural arm once member_count clears the threshold', function () {
+  const context = harness.boot()
+  const threshold = harness.readGlobal(context, 'OVERSIZE_GROUP_MEMBERS')
+  const flags = context.flagOversized({ member_count: threshold, pf: 0 }, { estimate: null }, null)
+  assert.strictEqual(flags.structural, true, 'structural must not depend on pf at all')
+  assert.strictEqual(flags.pf_ceiling, false, 'pf_ceiling correctly stays false when pf=0')
+  assert.strictEqual(flags.any, true, 'any must be true off the structural arm alone')
+})
+
+test('flagOversized: member_count defaults to 1 (never flags structurally) when omitted', function () {
+  const context = harness.boot()
+  const flags = context.flagOversized({ pf: 0 }, { estimate: null }, null)
+  assert.strictEqual(flags.structural, false)
+})
+
+// ---- flagOversized: pf_ceiling arm (SECONDARY, OVERSIZE_PF_CEILING, evadable) ----
+
+test('flagOversized: pf_ceiling arm is false one below OVERSIZE_PF_CEILING, true exactly at it (boundary)', function () {
+  const context = harness.boot()
+  const ceiling = harness.readGlobal(context, 'OVERSIZE_PF_CEILING')
+  const below = context.flagOversized({ member_count: 1, pf: ceiling - 1 }, { estimate: null }, null)
+  const at = context.flagOversized({ member_count: 1, pf: ceiling }, { estimate: null }, null)
+  assert.strictEqual(below.pf_ceiling, false)
+  assert.strictEqual(at.pf_ceiling, true)
+})
+
+// ---- flagOversized: multiple_of_median arm (unit-invariant, requires real history) ----
+
+test('flagOversized: multiple_of_median arm is false just under ESTIMATOR_OVERSIZED_MULTIPLE x the global median, true exactly at it (boundary)', function () {
+  const context = harness.boot()
+  const multiple = harness.readGlobal(context, 'ESTIMATOR_OVERSIZED_MULTIPLE')
+  const globalMedian = 1000
+  const below = context.flagOversized({ member_count: 1, pf: 0 }, { estimate: multiple * globalMedian - 1 }, globalMedian)
+  const at = context.flagOversized({ member_count: 1, pf: 0 }, { estimate: multiple * globalMedian }, globalMedian)
+  assert.strictEqual(below.multiple_of_median, false)
+  assert.strictEqual(at.multiple_of_median, true)
+})
+
+test('flagOversized: multiple_of_median is false (never throws) when the estimate is null', function () {
+  const context = harness.boot()
+  const flags = context.flagOversized({ member_count: 1, pf: 0 }, { estimate: null }, 1000)
+  assert.strictEqual(flags.multiple_of_median, false)
+})
+
+test('flagOversized: multiple_of_median is false (never throws) when the global median is null (no trusted history at all)', function () {
+  const context = harness.boot()
+  const flags = context.flagOversized({ member_count: 1, pf: 0 }, { estimate: 999999 }, null)
+  assert.strictEqual(flags.multiple_of_median, false)
+})
+
+test('flagOversized: any is the OR of all three arms — true when only one fires, false when none do', function () {
+  const context = harness.boot()
+  const noneFire = context.flagOversized({ member_count: 1, pf: 0 }, { estimate: 100 }, 1000)
+  assert.strictEqual(noneFire.any, false)
+  const onlyPfCeiling = context.flagOversized({ member_count: 1, pf: 9999 }, { estimate: 100 }, 1000)
+  assert.strictEqual(onlyPfCeiling.structural, false)
+  assert.strictEqual(onlyPfCeiling.multiple_of_median, false)
+  assert.strictEqual(onlyPfCeiling.any, true)
+})
+
+// ---- globalHistoricalMedian: median OF the per-band medians, not a global re-derivation ----
+
+test('globalHistoricalMedian: null when bands is empty', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.globalHistoricalMedian({}), null)
+  assert.strictEqual(context.globalHistoricalMedian(null), null)
+  assert.strictEqual(context.globalHistoricalMedian(undefined), null)
+})
+
+test('globalHistoricalMedian: the median of every band\'s own median, unweighted by sample count', function () {
+  const context = harness.boot()
+  const bands = { '1': { median: 10, count: 3 }, '2-3': { median: 20, count: 50 }, '4-7': { median: 30, count: 3 } }
+  assert.strictEqual(context.globalHistoricalMedian(bands), 20)
+})
+
+test('globalHistoricalMedian: ignores a band whose median is non-finite instead of throwing', function () {
+  const context = harness.boot()
+  const bands = { '1': { median: 10, count: 3 }, '2-3': { median: null, count: 0 } }
+  assert.strictEqual(context.globalHistoricalMedian(bands), 10)
+})
+
+// ---- buildBatchProjection: never a bare sum on partial coverage ----
+
+test('buildBatchProjection: full coverage sums every estimate and reports confidence "estimated"', function () {
+  const context = harness.boot()
+  const result = context.buildBatchProjection([{ estimate: 1000 }, { estimate: 2000 }, { estimate: 3000 }])
+  assert.strictEqual(result.total_issues, 3)
+  assert.strictEqual(result.estimable_count, 3)
+  assert.strictEqual(result.unknown_count, 0)
+  assert.strictEqual(result.projected_total, 6000)
+  assert.strictEqual(result.confidence, 'estimated')
+  assert.strictEqual(result.coverage_note, 'estimable 3 of 3, 0 unknown')
+})
+
+test('buildBatchProjection: ANY null estimate suppresses the total entirely — never a partial/understated sum', function () {
+  const context = harness.boot()
+  const result = context.buildBatchProjection([{ estimate: 1000 }, { estimate: null }, { estimate: 3000 }])
+  assert.strictEqual(result.projected_total, null, 'a bare partial sum (4000) would silently understate the true batch cost')
+  assert.strictEqual(result.confidence, 'insufficient')
+  assert.strictEqual(result.estimable_count, 2)
+  assert.strictEqual(result.unknown_count, 1)
+  assert.strictEqual(result.coverage_note, 'estimable 2 of 3, 1 unknown')
+})
+
+test('buildBatchProjection: an empty issue list is insufficient/null, not a false-positive full-coverage zero', function () {
+  const context = harness.boot()
+  const result = context.buildBatchProjection([])
+  assert.strictEqual(result.total_issues, 0)
+  assert.strictEqual(result.projected_total, null)
+  assert.strictEqual(result.confidence, 'insufficient')
+})
+
+test('buildBatchProjection: null/undefined input degrades cleanly instead of throwing', function () {
+  const context = harness.boot()
+  assert.doesNotThrow(function () { context.buildBatchProjection(null) })
+  assert.doesNotThrow(function () { context.buildBatchProjection(undefined) })
+})
+
+// ---- buildCostEstimate: the public integration entry point the dry_run preview calls ----
+
+test('buildCostEstimate: composes estimateCost + oversized flags + batch_projection into one object', function () {
+  const context = harness.boot()
+  const history = trustedBand(1, [900, 1000, 1100])
+  const result = context.buildCostEstimate(history, [{ issue: 9, pf: 1, member_count: 1 }])
+  assert.strictEqual(result.by_issue.length, 1)
+  assert.strictEqual(result.by_issue[0].estimate, 1000)
+  assert.strictEqual(result.by_issue[0].oversized.any, false)
+  assert.strictEqual(result.batch_projection.projected_total, 1000)
+  assert.strictEqual(result.batch_projection.confidence, 'estimated')
+})
+
+test('buildCostEstimate: a group with pf=[] on every member but member_count over OVERSIZE_GROUP_MEMBERS still flags oversized, even with zero history', function () {
+  const context = harness.boot()
+  const threshold = harness.readGlobal(context, 'OVERSIZE_GROUP_MEMBERS')
+  const members = []
+  for (let i = 0; i < threshold; i++) members.push({ issue: 100 + i, pf: 0 })
+  const bundle = { issue: 100, pf: 0, member_count: threshold, members: members }
+  const result = context.buildCostEstimate([], [bundle])
+  assert.strictEqual(result.by_issue[0].estimate, null, 'zero history — estimate itself is honestly null')
+  assert.strictEqual(result.by_issue[0].oversized.structural, true, 'the structural arm is history-free and must still fire')
+  assert.strictEqual(result.by_issue[0].oversized.any, true)
+  // batch_projection must not claim full coverage / a bare total when the
+  // one-and-only issue's own estimate is null.
+  assert.strictEqual(result.batch_projection.projected_total, null)
+  assert.strictEqual(result.batch_projection.confidence, 'insufficient')
+})
+
+test('buildCostEstimate: batch_projection carries a coverage indicator across a mix of estimable and unknown issues', function () {
+  const context = harness.boot()
+  const history = trustedBand(1, [900, 1000, 1100]) // band '1' only
+  const result = context.buildCostEstimate(history, [
+    { issue: 1, pf: 1, member_count: 1 }, // pf=1 -> band '1' -> estimate 1000
+    { issue: 2, pf: 10, member_count: 1 }, // pf=10 -> band '8-15', no history -> null
+  ])
+  assert.strictEqual(result.batch_projection.estimable_count, 1)
+  assert.strictEqual(result.batch_projection.unknown_count, 1)
+  assert.strictEqual(result.batch_projection.projected_total, null)
+  assert.strictEqual(result.batch_projection.coverage_note, 'estimable 1 of 2, 1 unknown')
 })

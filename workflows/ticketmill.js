@@ -265,6 +265,17 @@ let WORKTREES = null            // ROOT + '/.worktrees' once ROOT is known
 const RUN_TAG = A.run_label || A.date || 'run'
 const CONCURRENCY = Math.max(1, Math.min(5, Number(A.concurrency) || 2))
 const DRY_RUN = !!A.dry_run
+// HISTORY (issue #97 task 3): parsed runs.jsonl ledger lines (buildLedgerLine's
+// own output shape), read from disk and handed in by the `mill` skill — the
+// sandbox has no fs, so this is the same skill-does-IO / engine-does-pure-logic
+// split as buildLedgerLine's own write path (see estimateCost's module comment).
+// The skill passes this on EVERY invocation, live runs and dry_run alike — the
+// dry_run cost_estimate preview below is one consumer, but a later task's
+// live-run estimate-aware budget pre-check needs the same array, so it is
+// threaded once here rather than only inside the DRY_RUN branch. Falls open to
+// [] (never throws) so a caller that omits it, or an older skill build that
+// doesn't know about it yet, degrades to "no history" rather than failing.
+const HISTORY = Array.isArray(A.history) ? A.history : []
 
 // ----- caps -----
 let MAX_CONTRARIAN_ITERATIONS = 3 // overridable via profile.contrarian_max_iterations (see __seed / Select)
@@ -5302,6 +5313,143 @@ function estimateCost(history, issues) {
   }
 }
 
+// ----------------------------------------------------------------------------
+// Oversized-issue flags + batch projection (issue #97 task 3) — feeds the
+// `cost_estimate` block on the dry_run routing-plan preview (state:'dry_run'
+// return, below the split marker). Pure/above the split marker so every arm is
+// directly unit-testable; the dry_run wiring itself is a thin call site.
+// ----------------------------------------------------------------------------
+
+// OVERSIZE_GROUP_MEMBERS: the PRIMARY oversized signal — structural, history-
+// free, so it fires even for a brand-new batch with zero trusted history (the
+// multiple-of-median arm below needs a real estimate; this one never does). A
+// consolidation group this large still runs as ONE worktree/pipeline (shared
+// setup + PR + merge — see deriveUnits()'s module comment), so its token cost
+// is NOT the sum of N independently-bounded issues, it's one unbounded run
+// whose failure modes compound. This is exactly the incident shape the issue's
+// Research phase documented (one bundled issue burning ~15x the per-issue
+// norm). 4 covers "a couple of related issues merged for efficiency" (2-3
+// members, routine) while flagging anything larger as a pre-split candidate.
+const OVERSIZE_GROUP_MEMBERS = 4
+
+// OVERSIZE_PF_CEILING: a SECONDARY, also history-free oversized signal — a raw
+// predicted_files count at or above the top ESTIMATOR_PF_BANDS boundary (the
+// '16+' band starts at 16, see that array above). Deliberately documented as
+// EVADABLE, unlike OVERSIZE_GROUP_MEMBERS above: predicted_files is a
+// best-effort preflight probe that fails open to [] on ANY doubt (see the
+// preflight probe's own module comment) and is capped at 20 paths — an issue
+// whose real footprint the probe simply couldn't resolve reports pf=0 and
+// evades this check entirely. Never load-bearing on its own; always paired
+// with the structural arm above.
+const OVERSIZE_PF_CEILING = 16
+
+// ESTIMATOR_OVERSIZED_MULTIPLE: the UNIT-INVARIANT arm — flags an issue/group
+// whose own estimate is a large multiple of globalHistoricalMedian() (below),
+// regardless of which pf band it falls in, so an outlier in ANY band is judged
+// against the batch's overall typical cost, not just its own band's median
+// (which a singleton estimate always equals exactly, by construction). Unlike
+// the two structural arms above, this one requires real trusted history — null
+// when the estimate itself is null. 3x is deliberately conservative: the
+// incident this issue documents was ~15x the norm, but a pre-split nudge
+// should fire well before spend reaches that scale, not only once it already
+// has.
+const ESTIMATOR_OVERSIZED_MULTIPLE = 3
+
+// globalHistoricalMedian: a single unit-invariant reference cost, derived
+// ONLY from `bands` (estimateCost()'s own return — see its module comment:
+// "so a later consumer (task 3's oversized-multiple-of-median check) can read
+// the same trusted-band medians without re-deriving them from history a
+// second time"). Deliberately the median OF the per-band medians, not a
+// pf-band-specific number, so one reference cost applies uniformly to every
+// issue in the batch. Returns null when no band has any trusted sample.
+function globalHistoricalMedian(bands) {
+  const b = bands || {}
+  const medians = []
+  for (const band in b) {
+    if (!Object.prototype.hasOwnProperty.call(b, band)) continue
+    if (isFiniteNumber(b[band].median)) medians.push(b[band].median)
+  }
+  return medianOf(medians)
+}
+
+// flagOversized: combines all three arms for one queried item. `item` is the
+// ORIGINAL issues[] entry passed to buildCostEstimate (carries the raw
+// `pf`/`member_count` inputs the estimate alone doesn't preserve — estimateIssue()
+// returns pf_band, a string bucket, never the raw pf number); `est` is that
+// same item's estimateCost() by_issue row. The structural arm intentionally
+// reads ONLY item.member_count — a group with predicted_files=[] on every
+// member (pf=0, no pf_ceiling signal at all) must still flag once its member
+// count clears the threshold.
+function flagOversized(item, est, globalMedian) {
+  const it = item || {}
+  const structural = (isFiniteNumber(it.member_count) ? it.member_count : 1) >= OVERSIZE_GROUP_MEMBERS
+  const pfCeiling = isFiniteNumber(it.pf) && it.pf >= OVERSIZE_PF_CEILING
+  const multipleOfMedian = isFiniteNumber(est && est.estimate) && isFiniteNumber(globalMedian) && globalMedian > 0 &&
+    est.estimate >= ESTIMATOR_OVERSIZED_MULTIPLE * globalMedian
+  return {
+    structural: structural,
+    pf_ceiling: pfCeiling,
+    multiple_of_median: multipleOfMedian,
+    any: structural || pfCeiling || multipleOfMedian,
+  }
+}
+
+// buildBatchProjection: the batch-wide rollup. Deliberately NEVER emits a bare
+// summed total when ANY member's estimate is null — a partial sum silently
+// mislabeled as "the batch total" would UNDER-state true spend, defeating the
+// entire point of a pre-run budget signal. Instead it always carries a
+// coverage indicator so a caller can see exactly how much of the batch the
+// number covers, with the SAME confidence semantics per-issue estimates use
+// ('estimated' only on full coverage, else 'insufficient').
+function buildBatchProjection(byIssueEstimates) {
+  const list = Array.isArray(byIssueEstimates) ? byIssueEstimates : []
+  let known = 0
+  let estimableCount = 0
+  for (const e of list) {
+    if (isFiniteNumber(e && e.estimate)) { known += e.estimate; estimableCount++ }
+  }
+  const total = list.length
+  const unknownCount = total - estimableCount
+  const fullCoverage = total > 0 && unknownCount === 0
+  return {
+    total_issues: total,
+    estimable_count: estimableCount,
+    unknown_count: unknownCount,
+    projected_total: fullCoverage ? known : null,
+    confidence: fullCoverage ? 'estimated' : 'insufficient',
+    coverage_note: 'estimable ' + estimableCount + ' of ' + total + ', ' + unknownCount + ' unknown',
+  }
+}
+
+// buildCostEstimate (issue #97 task 3): the public pure entry point the
+// dry_run routing-plan preview (state:'dry_run' return, below the split
+// marker) calls. Wraps estimateCost() with the oversized flags and batch
+// projection above so the wiring below the split marker stays a thin,
+// untestable-but-trivial call site — every real decision lives here, fully
+// unit-testable.
+//   history - see estimateCost's own module comment (parsed runs.jsonl lines,
+//             the HISTORY run arg above).
+//   issues  - array of {issue, pf, member_count, members?} — `pf` is the raw
+//             predicted_files count (own for a singleton, union for a group),
+//             `member_count` the live member count, `members` (only present
+//             when member_count>1) an array of {issue, pf} per-member
+//             descriptors mirroring estimateCost()'s own group contract. See
+//             the dry_run call site for how these are derived from
+//             previewUnits.
+function buildCostEstimate(history, issues) {
+  const list = Array.isArray(issues) ? issues : []
+  const result = estimateCost(history, list)
+  const globalMedian = globalHistoricalMedian(result.bands)
+  const byIssue = result.by_issue.map(function (est, i) {
+    return Object.assign({}, est, { oversized: flagOversized(list[i], est, globalMedian) })
+  })
+  return {
+    by_issue: byIssue,
+    bands: result.bands,
+    batch_projection: buildBatchProjection(byIssue),
+  }
+}
+
 // ============================================================================
 // Outcome grading (issue #92): the read-only back-annotation pass that grades
 // a prior run's merged batch PRs against what actually happened afterward
@@ -5995,6 +6143,30 @@ if (DRY_RUN) {
   // every predicted_files entry (and therefore every heuristic lane here) may
   // be resolved against a stale origin/TARGET, not what a real run would fetch.
   const refPossiblyStale = !targetFetch || targetFetch.status !== 'success'
+  // Cost-estimate preview (issue #97 task 3) — built off the SAME previewUnits
+  // the lane-scheduling preview above already derived, so a unit's shape here
+  // matches the unit a real run would actually drain. Each unit becomes one
+  // buildCostEstimate() `issues[]` entry: `pf` is the unit's own predicted_files
+  // count (already the union for a group unit — deriveUnits() computes it that
+  // way, see its module comment), `member_count` its live member count, and
+  // `members` (only when >1) each member's OWN predicted_files count — NOT the
+  // union — mirroring estimateCost()'s group contract (each member bands on its
+  // own shape, see estimateIssue()'s module comment).
+  const costEstimateIssues = previewUnits.map(function (u) {
+    const memberCount = Array.isArray(u.members) ? u.members.length : 1
+    const item = {
+      issue: u.issue,
+      pf: (Array.isArray(u.predicted_files) ? u.predicted_files.length : 0),
+      member_count: memberCount,
+    }
+    if (memberCount > 1) {
+      item.members = u.members.map(function (m) {
+        return { issue: m.issue, pf: (Array.isArray(m.predicted_files) ? m.predicted_files.length : 0) }
+      })
+    }
+    return item
+  })
+  const costEstimate = buildCostEstimate(HISTORY, costEstimateIssues)
 
   return {
     state: 'dry_run', root: ROOT, repo: REPO, base_branch: BASE,
@@ -6027,6 +6199,19 @@ if (DRY_RUN) {
         ? 'preflight-fetch of origin/' + TARGET + ' failed — predicted_files (and every lane/DF signal above) may be grounded against a stale ref'
         : null,
     },
+    // Cost-estimate preview (issue #97 task 3) — see buildCostEstimate() above
+    // the split marker for the full per-issue/oversized/batch_projection
+    // contract. history_available reports whether the HISTORY run arg carried
+    // any lines at all, distinct from a per-issue 'insufficient' confidence
+    // (which can still happen WITH history if same-shape history is thin) —
+    // both are honest-degrade signals but at different scopes (whole-run vs.
+    // per-issue). Trusted history accrues only from effective_concurrency===1
+    // runs (see buildTrustedPfBands's module comment): a default
+    // concurrency:2 product batch's own history stays dark here indefinitely,
+    // by design — the structural (OVERSIZE_GROUP_MEMBERS) and pf_ceiling arms,
+    // plus the always-on hard budget floor, are what protect that usage
+    // pattern in the absence of a per-issue estimate.
+    cost_estimate: Object.assign({ history_available: HISTORY.length > 0 }, costEstimate),
     note: 'No changes made. Re-run without dry_run to execute.',
   }
 }
