@@ -127,3 +127,35 @@ test('runQualityLoop: halts immediately with zero agent calls when STOP is alrea
   assert.strictEqual(ctx.metrics.quality_iters, 0)
   assert.strictEqual(ctx.metrics.quality_degrades, 0)
 })
+
+test('runQualityLoop: each quality-fix round tallies its files_changed into ctx.touch_counts (issue #87 task 2) — a file fixed twice reads 2, a file fixed once reads 1', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {} }) // no simplify_globs -> matchesGlobs treats every file in-scope, so simplify runs every iteration (same as the "converges" test above)
+
+  let iter = 0
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) return { status: 'success', summary: 'nothing to simplify', commit: null, files_changed: [] }
+    if (label.indexOf(':quality-review-') !== -1) {
+      iter++
+      // Two rounds of "changes requested" before the third approves, so the
+      // fix stage below runs twice.
+      return iter <= 2
+        ? { result: 'changes_requested', comments: 'fix this', issues: ['x'], recommended_fix_agent: null, summary: 'needs work' }
+        : { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    if (label.indexOf(':quality-fix-') !== -1) {
+      // Round 1 touches both files; round 2 re-touches only one of them.
+      const files = iter === 1 ? ['src/foo.js', 'src/bar.js'] : ['src/foo.js']
+      return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: files }
+    }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 55 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['src/foo.js'])
+
+  assert.strictEqual(result, 'approved')
+  assert.strictEqual(ctx.touch_counts['src/foo.js'], 2)
+  assert.strictEqual(ctx.touch_counts['src/bar.js'], 1)
+})

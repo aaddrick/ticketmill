@@ -58,7 +58,7 @@ function freshMetrics() {
     approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0,
     task_review_attempts: 0, quality_iters: 0, quality_degrades: 0,
     test_iters: 0, browser_iters: 0, pr_review_iters: 0,
-    merge_auto_resolved: 0, merge_thrash: 0,
+    merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0,
   }
 }
 
@@ -194,6 +194,11 @@ function readGlobal(context, expr) {
  *   tokens    - { total, byModel, tracked } — stage()'s token-tracking finally-block
  *               target; starts zeroed/untracked like the real ctx, so a stage()-driving
  *               test only needs to override `budget` to exercise the instrumentation.
+ *   changed_files, added_files - null (issue #87 ctx analytics; unset until
+ *               probeChangedFiles() runs, matching processIssue()'s own default).
+ *   touch_counts - {} consumed by tallyTouches() (issue #87 task 2) — per-file
+ *               re-touch tally across fix-stage files_changed lists.
+ *   gate_findings - {} consumed by recordGateOutcome() (issue #87 task 3).
  * Pass `overrides` to set any field (e.g. `{ issue: 42 }`); deep fields like
  * `metrics`/`tokens` are shallow-merged over the zeroed defaults.
  */
@@ -219,6 +224,10 @@ function makeCtx(overrides) {
       engineOwnedIntentional: false,
       metrics: freshMetrics(),
       tokens: freshTokens(),
+      changed_files: null,
+      added_files: null,
+      touch_counts: {},
+      gate_findings: {},
     },
     o,
     { metrics: Object.assign(freshMetrics(), o.metrics) },

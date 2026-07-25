@@ -291,6 +291,18 @@ const MAX_LANE_PREDICTED_FILES = 60
 // small {issue, pr, predicted_files} tuple) — a human-readability/prompt-size
 // cap on the accuracy sample, not a correctness input.
 const MAX_LANE_ACCURACY_SAMPLES = 40
+// ctx analytics (issue #87): bounds the number of DISTINCT files tracked in
+// ctx.touch_counts (see tallyTouches()) — a pathological issue that revisits
+// many different files across many fix rounds must not grow this per-issue
+// map unboundedly, matching the existing ctx.notes/ctx.settled caps.
+const MAX_TOUCH_FILES = 100
+// run completeness (issue #87 task 5): the token-reconciliation fraction
+// (aggregateTokens' reconcile_error — see its module comment for why it, not
+// the coarser `reconciles` boolean, is the honest signal) below which a run is
+// still trusted for downstream trend analysis. 5% mirrors the "small" bar that
+// comment already sets for gating efficiency metrics; not a correctness input,
+// only a display/trust-flag threshold.
+const MAX_RECONCILE_ERROR_FOR_TRUST = 0.05
 
 // ----- model policy (profile.models may override any stage key) -----
 const M = {
@@ -1611,10 +1623,65 @@ function notesBlock(ctx) {
   if (!ctx.notes.length) return ''
   return '## Handoff notes from earlier agents in this run\n' + ctx.notes.map(function (n) { return '- ' + n }).join('\n')
 }
+
+// ----- within-issue re-touch tally (issue #87 task 2) -----
+// Counts how many times each file was revisited by a FIX_SCHEMA/
+// MERGE_RESOLVE_SCHEMA fix stage within this issue — churn/bumpiness signal
+// for downstream analytics. Deliberately a SEPARATE explicit call at each fix
+// site, NOT folded into collectNotes() above: collectNotes also fires at
+// initial-authorship stages (task implementation, simplify, browser-verify)
+// where a file appearing for the first time is authorship, not a re-touch.
+// Bounded like ctx.notes/ctx.settled (MAX_TOUCH_FILES) so a pathological
+// issue that revisits many distinct files across many fix rounds can't grow
+// ctx.touch_counts unboundedly; an existing tracked file's count still
+// increments past the cap, only NEW file keys stop being admitted.
+function tallyTouches(ctx, filesChanged) {
+  for (const f of (filesChanged || [])) {
+    const key = String(f || '').trim()
+    if (!key) continue
+    if (ctx.touch_counts[key] == null && Object.keys(ctx.touch_counts).length >= MAX_TOUCH_FILES) continue
+    ctx.touch_counts[key] = (ctx.touch_counts[key] || 0) + 1
+  }
+}
 function verifyNotesBlock() {
   const vn = (PROFILE.verify_notes || [])
   if (!vn.length) return ''
   return '## Project verification notes (from the ticketmill profile)\n' + vn.map(function (n) { return '- ' + n }).join('\n')
+}
+
+// ----- gate findings tally (issue #87 task 3) -----
+// Per-gate (currently the two per-issue contrarian gates, 'approach' and
+// 'plan' — CHALLENGE_SCHEMA's findings carry a severity, unlike REVIEW_SCHEMA/
+// TASK_REVIEW_SCHEMA's untyped issues/pass-fail shape, so those are the gates
+// a "severity mix" can honestly describe) tally of finding counts, severity
+// mix, and how that gate ITERATION resolved:
+//   accepted            - verdict sound_with_caveats with zero critical/major
+//                          (the same condition that triggers settleDecision()).
+//   carried-unresolved  - the contrarian cap was reached with critical/major
+//                         findings still open (they ride into ctx.unresolved).
+//   re-litigated        - neither of the above: the loop revises and
+//                         re-challenges, so these findings get contested again
+//                         next iteration.
+//   dismissed           - the gate produced no adjudicated verdict at all
+//                         (challenger agent died) — any findings were never
+//                         actually judged.
+// One call per gate ITERATION (not per finding), so `disposition` tallies
+// outcomes while `severity` sums every finding's severity across every
+// iteration of that gate. Bounded implicitly: one entry per gate name, each
+// gate runs at most challengeCap (<= MAX_CONTRARIAN_ITERATIONS) times per issue.
+function recordGateOutcome(ctx, gate, findings, disposition) {
+  if (!ctx || !ctx.gate_findings) return
+  const key = String(gate || '').trim()
+  if (!key) return
+  if (!ctx.gate_findings[key]) ctx.gate_findings[key] = { count: 0, severity: { critical: 0, major: 0, minor: 0 }, disposition: {} }
+  const g = ctx.gate_findings[key]
+  for (const f of (findings || [])) {
+    g.count++
+    const sev = f && f.severity
+    if (sev === 'critical' || sev === 'major' || sev === 'minor') g.severity[sev]++
+  }
+  const d = String(disposition || '').trim() || 'unknown'
+  g.disposition[d] = (g.disposition[d] || 0) + 1
 }
 
 // Compact intent context for fix stages — they otherwise see only reviewer comments
@@ -1898,6 +1965,27 @@ async function postNote(ctx, stageKey, status, error) {
   if (!noted || !noted.posted) log('#' + ctx.issue + ' halt note (' + stageKey + ') did not post — status is recorded in the run results only')
 }
 
+// frictionFields (issue #87): pure derived-friction snapshot for a unit's
+// result shape, shared by all three return sites (completed/fail/skip) so the
+// fields can't drift out of sync between them. Defensive the same way fail()
+// already is about partial ctx shapes (pool-catch results, a skip whose ctx
+// never grew unresolved/metrics) — never throws on a missing/partial ctx.
+//   unresolved_count: findings carried past a contrarian iteration cap.
+//   contrarian_capped: true iff any such finding exists.
+//   test_quality_fix_rounds: read straight off ctx.metrics (incremented at the
+//     test-quality-fix stage — see issue #87 task 2); 0 for an issue that never
+//     reached that stage.
+//   needs_human: mirrors the status this unit actually resolved to.
+function frictionFields(ctx, status) {
+  const unresolved = (ctx && ctx.unresolved) || []
+  return {
+    unresolved_count: unresolved.length,
+    contrarian_capped: unresolved.length > 0,
+    test_quality_fix_rounds: (ctx && ctx.metrics && ctx.metrics.test_quality_fix_rounds) || 0,
+    needs_human: status === 'needs_human',
+  }
+}
+
 // fail(): called exactly once per unit — every call site is a `return fail(...)`,
 // so this fires (and increments BATCH.failures) exactly ONCE per unit regardless
 // of how many members it covers. A failed GROUP is still one breaker increment,
@@ -1907,7 +1995,7 @@ async function fail(ctx, status, stageKey, error) {
   await postNote(ctx, stageKey, status, error)
   BATCH.failures++
   if (BATCH.failures >= MAX_BATCH_FAILURES) tripStop('circuit breaker: ' + BATCH.failures + ' issues failed')
-  return { issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx) }
+  return Object.assign({ issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx), changed_files: (ctx && ctx.changed_files) || null, added_files: (ctx && ctx.added_files) || null, touch_counts: (ctx && ctx.touch_counts) || {}, gate_findings: (ctx && ctx.gate_findings) || {} }, frictionFields(ctx, status))
 }
 
 // =============================================================================
@@ -2147,6 +2235,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!fix || fix.status === 'error') { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': fix degraded'); break }
     collectNotes(ctx, 'quality-fix', fix)
+    tallyTouches(ctx, fix.files_changed)
     if (!runSimplify && (fix.files_changed || []).some(inScope)) runSimplify = true
   }
 
@@ -2334,6 +2423,7 @@ async function runBrowserCheck(ctx, where) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!fix || fix.status === 'error') return { ok: false, error: 'browser-fix stage failed (' + where + ')' }
     collectNotes(ctx, 'browser-fix', fix)
+    tallyTouches(ctx, fix.files_changed)
   }
   return { ok: false, error: 'browser verification still failing after ' + MAX_BROWSER_ITERATIONS + ' iterations (' + where + ')' }
 }
@@ -2371,6 +2461,37 @@ async function runBrowserCheck(ctx, where) {
 // plumbing hiccup in this gate never blocks an otherwise-green issue.
 // Returns { ok: true } always.
 // =============================================================================
+// probeChangedFiles (issue #87): READ-ONLY diff probe that captures the FINAL
+// changed-file list for an issue, run once, unconditionally, from
+// reviewAndMerge() immediately before the merge stage — after the full
+// review/fix loop (pr-fix, merge-auto-resolve) has already landed, and before
+// the merge stage's own worktree teardown. This is deliberately a SEPARATE
+// probe from runEngineOwnedGate's own post-implement one just below: that gate
+// snapshots the diff right after implementation (its revert-or-not decision
+// needs the pre-review state), while this one snapshots the diff analytics
+// downstream (touch_counts, completeness scoring) actually want — the merged
+// result including any PR-review fixes or auto-resolve rebasing. Populates
+// ctx.changed_files/ctx.added_files. On a dead/degraded probe, leaves both
+// null (never []) so `!= null` distinguishes "captured, zero files" from
+// "probe never ran" for downstream completeness scoring.
+async function probeChangedFiles(ctx) {
+  const probe = await stage(ctx, 'changed-files-probe', [
+    'READ-ONLY probe for issue #' + ctx.issue + ': list every file this issue\'s implementation changed. Run exactly:',
+    'git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --name-only',
+    'Return changed_files (the output lines as an array; empty array if none).',
+    '',
+    'Also run this second command to find files newly created on this branch (absent from the batch baseline):',
+    'git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --diff-filter=A --name-only',
+    'Return added_files (the output lines as an array; empty array if none).',
+  ].join('\n'), stageOpts('probe'), DIFF_PROBE_SCHEMA)
+  if (!probe) {
+    log('#' + ctx.issue + ' changed-files probe died — degrading (recorded); ctx.changed_files stays null')
+    ctx.deferred.push('Changed-files probe: could not capture the final changed-file list for issue #' + ctx.issue + ' — retained-changed-files analytics for this issue will be incomplete.')
+    return
+  }
+  ctx.changed_files = probe.changed_files || []
+  ctx.added_files = probe.added_files || []
+}
 async function runEngineOwnedGate(ctx) {
   if (!ENGINE_OWNED.length) return { ok: true }
   const probe = await stage(ctx, 'engine-owned-probe', [
@@ -2459,6 +2580,7 @@ async function runEngineOwnedGate(ctx) {
     ctx.deferred.push('Engine-owned guardrail: automatic revert of incidental engine-owned change(s) to ' + revertFiles.join(', ') + ' FAILED — a human must verify/revert these paths manually before merge.')
     return { ok: true }
   }
+  tallyTouches(ctx, revert.files_changed)
   pushDecision(ctx, 'Engine-Owned Guardrail', 'Reverted incidental engine-owned change(s) to the batch baseline (origin/' + TARGET + '): ' + revertFiles.join(', ') + '. Commit: ' + (revert.commit || 'n/a') + '.')
   ctx.deferred.push('Engine-owned guardrail: incidental change(s) to ' + revertFiles.join(', ') + ' were reverted to the batch baseline — if this was actually intentional engine work, redo it as its own dedicated issue that names the path(s) so it is recognized as deliberate.')
   return { ok: true }
@@ -2541,6 +2663,7 @@ async function runTestLoop(ctx, forced) {
       ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
       if (!fix || fix.status === 'error') return { ok: false, error: 'test-fix stage failed — halting test loop' }
       collectNotes(ctx, 'test-fix', fix)
+      tallyTouches(ctx, fix.files_changed)
       continue
     }
 
@@ -2584,6 +2707,8 @@ async function runTestLoop(ctx, forced) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!qfix || qfix.status === 'error') return { ok: false, error: 'test-quality-fix stage failed — halting test loop' }
     collectNotes(ctx, 'test-quality-fix', qfix)
+    tallyTouches(ctx, qfix.files_changed)
+    ctx.metrics.test_quality_fix_rounds++
   }
   return { ok: false, error: 'test loop exceeded ' + MAX_TEST_ITERATIONS + ' iterations' }
 }
@@ -2711,6 +2836,7 @@ async function runMergeAutoResolve(ctx) {
     ].join('\n'), stageOpts('fix'), MERGE_RESOLVE_SCHEMA)
     if (!resolve) return { ok: false, error: 'conflict-resolver stage died — worktree left mid-rebase for human inspection' }
     collectNotes(ctx, 'merge-conflict-resolve', resolve)
+    tallyTouches(ctx, resolve.files_changed)
     if (resolve.status === 'aborted') return { ok: false, error: 'conflict resolver declined a semantic conflict (rebase aborted): ' + (resolve.summary || 'no reason given') }
   }
 
@@ -3288,7 +3414,7 @@ async function implementIssue(ctx) {
       'Every concern goes in the findings ARRAY (objects with severity, summary, recommendation — keep each field to',
       '2-3 sentences), never only in prose. Keep summary under 200 words so the output stays well-formed.',
     ].join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
-    if (!ch) { log('#' + ctx.issue + ' contrarian(approach) died — proceeding with unchallenged approach (logged)'); pushDecision(ctx, 'Contrarian: Approach', 'SKIPPED — contrarian agent unavailable'); break }
+    if (!ch) { log('#' + ctx.issue + ' contrarian(approach) died — proceeding with unchallenged approach (logged)'); pushDecision(ctx, 'Contrarian: Approach', 'SKIPPED — contrarian agent unavailable'); recordGateOutcome(ctx, 'approach', [], 'dismissed'); break }
 
     approachCaveats = ch.caveats || []
     const criticalMajor = (ch.findings || []).filter(function (f) { return f.severity === 'critical' || f.severity === 'major' }).length
@@ -3297,6 +3423,7 @@ async function implementIssue(ctx) {
         (approachCaveats.length ? '**Caveats:**\n- ' + approachCaveats.join('\n- ') : 'No caveats'))
       settleDecision(ctx, 'implementation approach', 'approach challenge i' + iter,
         evalR.approach, evalR.rationale, evalR.alternatives_rejected)
+      recordGateOutcome(ctx, 'approach', ch.findings, 'accepted')
       break
     }
     log('#' + ctx.issue + ' contrarian(approach) i' + iter + ': ' + ch.verdict + ', ' + criticalMajor + ' critical/major — re-evaluating')
@@ -3307,6 +3434,7 @@ async function implementIssue(ctx) {
           ctx.unresolved.push('[approach gate, ' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
         }
       }
+      recordGateOutcome(ctx, 'approach', ch.findings, 'carried-unresolved')
       VERIFY_SKIPS.push('#' + ctx.issue + ': approach challenge capped at ' + challengeCap + ' iterations with unresolved caveats: ' + oneLine(ch.summary || '').slice(0, 200))
       const capNote = await stage(ctx, 'cap-note-approach', [
         'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (gh issue comment).',
@@ -3319,6 +3447,7 @@ async function implementIssue(ctx) {
       if (!capNote || !capNote.posted) log('#' + ctx.issue + ' cap note (approach) did not post — caveats live in the decision chain only')
       break
     }
+    recordGateOutcome(ctx, 'approach', ch.findings, 're-litigated')
     const re = await stage(ctx, 're-evaluate-i' + iter, [
       'Revise the implementation approach for issue #' + ctx.issue + ' based on contrarian feedback (verdict: ' + ch.verdict + '):',
       '', String(ch.summary || ''), '',
@@ -3431,7 +3560,7 @@ async function implementIssue(ctx) {
       'Every concern goes in the findings ARRAY (objects with severity, summary, recommendation — keep each field to',
       '2-3 sentences), never only in prose. Keep summary under 200 words so the output stays well-formed.',
     ].join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
-    if (!ch) { log('#' + ctx.issue + ' contrarian(plan) died — proceeding with unchallenged plan (logged)'); pushDecision(ctx, 'Contrarian: Plan', 'SKIPPED — contrarian agent unavailable'); break }
+    if (!ch) { log('#' + ctx.issue + ' contrarian(plan) died — proceeding with unchallenged plan (logged)'); pushDecision(ctx, 'Contrarian: Plan', 'SKIPPED — contrarian agent unavailable'); recordGateOutcome(ctx, 'plan', [], 'dismissed'); break }
 
     const criticalMajor = (ch.findings || []).filter(function (f) { return f.severity === 'critical' || f.severity === 'major' }).length
     if (ch.verdict === 'sound_with_caveats' && criticalMajor === 0) {
@@ -3439,6 +3568,7 @@ async function implementIssue(ctx) {
         ((ch.caveats || []).length ? '\n**Caveats:**\n- ' + ch.caveats.join('\n- ') : ''))
       settleDecision(ctx, 'task plan (' + tasks.length + ' tasks)', 'plan challenge i' + iter, planR.summary,
         (ch.caveats || []).length ? 'accepted with caveats: ' + ch.caveats.join('; ') : 'accepted without caveats', [])
+      recordGateOutcome(ctx, 'plan', ch.findings, 'accepted')
       break
     }
     if (iter === challengeCap) {
@@ -3448,6 +3578,7 @@ async function implementIssue(ctx) {
           ctx.unresolved.push('[plan gate, ' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
         }
       }
+      recordGateOutcome(ctx, 'plan', ch.findings, 'carried-unresolved')
       VERIFY_SKIPS.push('#' + ctx.issue + ': plan challenge capped at ' + challengeCap + ' iterations with unresolved caveats: ' + oneLine(ch.summary || '').slice(0, 200))
       const capNote = await stage(ctx, 'cap-note-plan', [
         'Post a GitHub comment on issue #' + ctx.issue + ' in ' + REPO + ' (gh issue comment).',
@@ -3460,6 +3591,7 @@ async function implementIssue(ctx) {
       if (!capNote || !capNote.posted) log('#' + ctx.issue + ' cap note (plan) did not post — caveats live in the decision chain only')
       break
     }
+    recordGateOutcome(ctx, 'plan', ch.findings, 're-litigated')
     const rp = await stage(ctx, 're-plan-i' + iter, planPromptFor(
       'Contrarian verdict on the current plan: ' + ch.verdict + '\n\n' + (ch.summary || '') + '\n\nFindings:\n' +
       (ch.findings || []).map(function (f) { return '- [' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || '') }).join('\n') +
@@ -3740,6 +3872,7 @@ async function reviewAndMerge(ctx) {
     if (!fix || fix.status === 'error') return fail(ctx, 'needs_human', 'pr-fix', 'PR fix stage failed — PR #' + ctx.pr + ' left open for human review')
     pushDecision(ctx, 'PR Review Fix (i' + iter + ')', fix.summary || 'fixes applied')
     collectNotes(ctx, 'pr-fix', fix)
+    tallyTouches(ctx, fix.files_changed)
 
     const q = await runQualityLoop(ctx, 'pr-fix-i' + iter, 'post-review fixes for PR #' + ctx.pr, fix.files_changed)
     if (q === 'halted') return fail(ctx, 'halted', 'quality-loop', STOP.tripped ? 'stopped: ' + STOP.reason : 'quality degrade rate exceeded during PR fixes')
@@ -3776,6 +3909,13 @@ async function reviewAndMerge(ctx) {
   // stage's own preflight would otherwise escalate straight to needs_human) ----
   const mar = await runMergeAutoResolve(ctx)
   if (!mar.ok) return fail(ctx, STOP.tripped ? 'halted' : 'needs_human', 'merge-auto-resolve', mar.error + ' — PR #' + ctx.pr + ' left open for human review')
+
+  // ---- CHANGED-FILES PROBE (issue #87) — unconditional, once per issue, after
+  // the full review/fix loop has landed and before the worktree teardown below,
+  // so ctx.changed_files/ctx.added_files reflect the actual merged diff. Never
+  // gates the merge: probeChangedFiles() degrades to a recorded deferred note
+  // on a dead probe rather than failing the issue. ----
+  await probeChangedFiles(ctx)
 
   // ---- MERGE (preflight, squash merge, complete comment, follow-ups, cleanup) ----
   const deferredBlock = ctx.deferred.length ? ctx.deferred.map(function (d) { return '- ' + d }).join('\n') : ''
@@ -3833,7 +3973,7 @@ async function reviewAndMerge(ctx) {
   if (mar.resolved) ctx.metrics.merge_auto_resolved = (ctx.metrics.merge_auto_resolved || 0) + 1
 
   log('#' + ctx.issue + ' merged PR #' + ctx.pr + (merge.follow_up_issues && merge.follow_up_issues.length ? ' (follow-ups: ' + merge.follow_up_issues.join(', ') + ')' : ''))
-  return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx) }
+  return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx), changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings }, frictionFields(ctx, 'completed'))
 }
 
 // =============================================================================
@@ -3860,8 +4000,17 @@ async function processIssue(pre) {
     // ctx (not pre) so every stage downstream of this init sees the same
     // threaded value.
     engineOwnedIntentional: !!pre.engineOwnedIntentional,
-    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0 },
+    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0 },
     tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
+    // Retained-changed-files / friction signals (issue #87). null (not []) means
+    // "never captured" — probeChangedFiles() sets these once, unconditionally,
+    // from reviewAndMerge() right before the merge stage; a dead/degraded probe
+    // leaves them null so a `!= null` presence check downstream can tell "probe
+    // ran, zero files" apart from "probe never ran".
+    changed_files: null,
+    added_files: null,
+    touch_counts: {},   // per-file re-touch tally across fix-stage files_changed (tallyTouches(), issue #87 task 2)
+    gate_findings: {},  // per-gate finding tally/disposition (recordGateOutcome(), issue #87 task 3)
   }
   if (pre.resume_point === 'skip') {
     log('#' + ctx.issue + ' skipped: ' + pre.reason)
@@ -3873,7 +4022,7 @@ async function processIssue(pre) {
     // must NOT count as "shipped into TARGET" — see batchClosesIssues() below,
     // which is the sole reader of this field.
     const merged_into_target = pre.pr_state === 'merged' && pre.pr_base === TARGET
-    return { issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target }
+    return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target, changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings }, frictionFields(ctx, 'skipped'))
   }
   if (pre.resume_point === 'process_pr') {
     log('#' + ctx.issue + ' healing: open PR #' + ctx.pr + ' found — jumping to review/merge')
@@ -4123,6 +4272,50 @@ function releaseChangelogAnchor(version, runTag) {
   return '## [' + String(version) + '] - ' + String(runTag)
 }
 
+// computeCompleteness (issue #87 task 5): a pure trust flag for a run's own
+// telemetry, answering three questions the record can otherwise only be
+// TRUSTED to answer, never verified to answer:
+//   - did every issue's `metrics` block actually land (vs. a pool-catch stub
+//     or a ctx that died before metrics were ever attached)?
+//   - was `changed_files` captured for every issue that actually merged (a
+//     'completed' result whose probeChangedFiles() never ran or degraded)?
+//   - did the run's own token accounting reconcile (aggregateTokens'
+//     reconcile_error — see its module comment for why that fraction, not the
+//     coarser `reconciles` boolean, is the honest signal — kept under
+//     MAX_RECONCILE_ERROR_FOR_TRUST)?
+// Pure/above the split marker: takes the same `results` array and token
+// aggregate buildRunRecord already has in hand, never re-derives them.
+function computeCompleteness(results, tokenAgg) {
+  const list = Array.isArray(results) ? results : []
+  const t = tokenAgg || {}
+  let metricsMissing = 0
+  let changedFilesMissing = 0
+  let completedCount = 0
+  for (const r of list) {
+    // 'skipped' results (already-merged/duplicate/consolidation-member) are built
+    // with no metrics key at all by design (see the 'skip' return site) — that is
+    // a legitimate shape, not a pool-catch stub or a ctx that died mid-run, so it
+    // must not force trustworthy:false. A pool-catch 'failed' result also has no
+    // metrics key but IS a genuine failure mode and still counts.
+    if (!r || (r.status !== 'skipped' && r.metrics == null)) metricsMissing++
+    if (r && r.status === 'completed') {
+      completedCount++
+      if (r.changed_files == null) changedFilesMissing++
+    }
+  }
+  const reconcileError = isFiniteNumber(t.reconcile_error) ? t.reconcile_error : null
+  const tokensReconciled = reconcileError != null && reconcileError <= MAX_RECONCILE_ERROR_FOR_TRUST
+  return {
+    total_results: list.length,
+    metrics_missing: metricsMissing,
+    completed_count: completedCount,
+    changed_files_missing: changedFilesMissing,
+    tokens_reconciled: tokensReconciled,
+    reconcile_error: reconcileError,
+    trustworthy: metricsMissing === 0 && changedFilesMissing === 0 && tokensReconciled,
+  }
+}
+
 // buildRunRecord (issue #86): assemble the FULL, untruncated machine-readable record
 // for a run. Pure and above the split marker so tests can prove — at 18-issue+ scale —
 // that no per-issue metrics/timeline block is dropped. This object is what the outer
@@ -4132,11 +4325,13 @@ function releaseChangelogAnchor(version, runTag) {
 // cut the tail (an 18-issue run overflowed 30 000 chars, so the last issues' metrics
 // never reached disk). The Report agent now renders only the human-readable .md; the
 // bytes of the machine record never pass through a model. Shape is byte-for-byte the
-// prior `resultsJson` payload plus a `schema_version` and `run_tag` header.
+// prior `resultsJson` payload plus a `schema_version` and `run_tag` header, plus (issue
+// #87 task 5) a `completeness` trust flag — see computeCompleteness() just above.
 function buildRunRecord(f) {
   const t = f.tokenAgg || {}
   const m = f.mergeAgg || {}
   return {
+    completeness: computeCompleteness(f.results, t),
     schema_version: 1,
     run_tag: f.runTag,
     state: f.state,
@@ -4171,7 +4366,10 @@ function buildRunRecord(f) {
 // buildLedgerLine (issue #86): the compact one-object-per-run summary the mill skill
 // appends to <logs_dir>/runs.jsonl — the cross-run ledger every later observability
 // tier trends over. Deliberately flat and small (the full per-issue detail lives in
-// runs/<run_tag>.json); this is the index. Pure/above the split marker.
+// runs/<run_tag>.json); this is the index. Pure/above the split marker. Carries
+// `trustworthy` (issue #87 task 5, mirroring record.completeness.trustworthy) so a
+// cross-run trend line can be filtered to only the runs whose telemetry is complete,
+// without re-opening every run's full record to re-derive it.
 function buildLedgerLine(record) {
   const r = record || {}
   const t = r.tokens || {}
@@ -4189,6 +4387,7 @@ function buildLedgerLine(record) {
     reconcile_error: t.reconcile_error,
     verification_gaps: Array.isArray(r.verification_gaps) ? r.verification_gaps.length : 0,
     stop_tripped: !!(r.stop && r.stop.tripped),
+    trustworthy: !!(r.completeness && r.completeness.trustworthy),
   }
 }
 

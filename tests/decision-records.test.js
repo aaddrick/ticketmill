@@ -134,6 +134,52 @@ test('collectNotes: trims the accumulated notes list to the most recent 12', fun
   assert.strictEqual(ctx.notes[11], '[agent] note 12')
 })
 
+// ---- within-issue re-touch tally (tallyTouches) ----
+
+test('tallyTouches: a file touched across two calls accumulates to 2; a file seen once stays at 1', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({ issue: 9 })
+
+  context.tallyTouches(ctx, ['src/foo.js', 'src/bar.js'])
+  context.tallyTouches(ctx, ['src/foo.js'])
+
+  assert.strictEqual(ctx.touch_counts['src/foo.js'], 2)
+  assert.strictEqual(ctx.touch_counts['src/bar.js'], 1)
+})
+
+test('tallyTouches: blank/whitespace-only entries and a missing/undefined filesChanged are no-ops', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({ issue: 9 })
+
+  context.tallyTouches(ctx, ['', '   ', 'src/foo.js'])
+  context.tallyTouches(ctx, undefined)
+  context.tallyTouches(ctx, null)
+
+  assert.deepStrictEqual(Object.keys(ctx.touch_counts), ['src/foo.js'])
+  assert.strictEqual(ctx.touch_counts['src/foo.js'], 1)
+})
+
+test('tallyTouches: MAX_TOUCH_FILES caps how many DISTINCT files get admitted, but an already-tracked file keeps incrementing past the cap', function () {
+  const context = harness.boot()
+  const MAX_TOUCH_FILES = harness.readGlobal(context, 'MAX_TOUCH_FILES')
+  assert.strictEqual(typeof MAX_TOUCH_FILES, 'number')
+  const ctx = harness.makeCtx({ issue: 9 })
+
+  // Fill the tally to exactly the cap with distinct files.
+  for (let i = 0; i < MAX_TOUCH_FILES; i++) context.tallyTouches(ctx, ['file-' + i + '.js'])
+  assert.strictEqual(Object.keys(ctx.touch_counts).length, MAX_TOUCH_FILES)
+
+  // A brand-new file past the cap must NOT be admitted.
+  context.tallyTouches(ctx, ['one-too-many.js'])
+  assert.strictEqual(Object.keys(ctx.touch_counts).length, MAX_TOUCH_FILES)
+  assert.strictEqual(ctx.touch_counts['one-too-many.js'], undefined)
+
+  // But re-touching a file that was already tracked before the cap was hit
+  // still increments — the cap only blocks new keys, not existing ones.
+  context.tallyTouches(ctx, ['file-0.js'])
+  assert.strictEqual(ctx.touch_counts['file-0.js'], 2)
+})
+
 // ---- timeline ----
 
 test('timeline: renders "title — body" when a second line exists, title-only otherwise', function () {
