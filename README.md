@@ -144,7 +144,10 @@ The run narrates itself in the places you already look:
   and timelines, written deterministically by the mill skill so nothing is truncated)
   and appends one line to `runs.jsonl` (the cross-run ledger). It also writes
   `summary-<run_label>.md` (the human version) and appends to the running
-  `process-retrospective.md`.
+  `process-retrospective.md`. A read-only pass also back-annotates prior runs'
+  merged PRs with what actually happened to them (reverted, reopened, hotfixed, or
+  held up cleanly) and appends the result to `outcomes.jsonl`, so self-improvement
+  has an outcome signal alongside the process-friction one.
 - **Live.** While a run is going, `/workflows` in Claude Code shows the progress
   tree: which issues are in flight and which stage each one is in.
 
