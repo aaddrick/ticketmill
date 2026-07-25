@@ -4198,7 +4198,7 @@ async function reviewAndMerge(ctx) {
     const prReviewDisposition = prReviewClean ? 'accepted' : (iter === MAX_PR_REVIEW_ITERATIONS ? 'carried-unresolved' : 're-litigated')
     recordGateOutcome(ctx, 'pr-review', (spec.issues || []).concat(code.issues || []), prReviewDisposition)
 
-    if (spec.result === 'approved' && code.result === 'approved') { approved = true; break }
+    if (prReviewClean) { approved = true; break }
     if (iter === MAX_PR_REVIEW_ITERATIONS) break
 
     const fixAgent = pickFixAgent(code.recommended_fix_agent, null)
