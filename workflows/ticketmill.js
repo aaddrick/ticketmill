@@ -291,6 +291,11 @@ const MAX_LANE_PREDICTED_FILES = 60
 // small {issue, pr, predicted_files} tuple) — a human-readability/prompt-size
 // cap on the accuracy sample, not a correctness input.
 const MAX_LANE_ACCURACY_SAMPLES = 40
+// ctx analytics (issue #87): bounds the number of DISTINCT files tracked in
+// ctx.touch_counts (see tallyTouches()) — a pathological issue that revisits
+// many different files across many fix rounds must not grow this per-issue
+// map unboundedly, matching the existing ctx.notes/ctx.settled caps.
+const MAX_TOUCH_FILES = 100
 
 // ----- model policy (profile.models may override any stage key) -----
 const M = {
@@ -1611,6 +1616,26 @@ function notesBlock(ctx) {
   if (!ctx.notes.length) return ''
   return '## Handoff notes from earlier agents in this run\n' + ctx.notes.map(function (n) { return '- ' + n }).join('\n')
 }
+
+// ----- within-issue re-touch tally (issue #87 task 2) -----
+// Counts how many times each file was revisited by a FIX_SCHEMA/
+// MERGE_RESOLVE_SCHEMA fix stage within this issue — churn/bumpiness signal
+// for downstream analytics. Deliberately a SEPARATE explicit call at each fix
+// site, NOT folded into collectNotes() above: collectNotes also fires at
+// initial-authorship stages (task implementation, simplify, browser-verify)
+// where a file appearing for the first time is authorship, not a re-touch.
+// Bounded like ctx.notes/ctx.settled (MAX_TOUCH_FILES) so a pathological
+// issue that revisits many distinct files across many fix rounds can't grow
+// ctx.touch_counts unboundedly; an existing tracked file's count still
+// increments past the cap, only NEW file keys stop being admitted.
+function tallyTouches(ctx, filesChanged) {
+  for (const f of (filesChanged || [])) {
+    const key = String(f || '').trim()
+    if (!key) continue
+    if (ctx.touch_counts[key] == null && Object.keys(ctx.touch_counts).length >= MAX_TOUCH_FILES) continue
+    ctx.touch_counts[key] = (ctx.touch_counts[key] || 0) + 1
+  }
+}
 function verifyNotesBlock() {
   const vn = (PROFILE.verify_notes || [])
   if (!vn.length) return ''
@@ -2168,6 +2193,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!fix || fix.status === 'error') { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': fix degraded'); break }
     collectNotes(ctx, 'quality-fix', fix)
+    tallyTouches(ctx, fix.files_changed)
     if (!runSimplify && (fix.files_changed || []).some(inScope)) runSimplify = true
   }
 
@@ -2355,6 +2381,7 @@ async function runBrowserCheck(ctx, where) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!fix || fix.status === 'error') return { ok: false, error: 'browser-fix stage failed (' + where + ')' }
     collectNotes(ctx, 'browser-fix', fix)
+    tallyTouches(ctx, fix.files_changed)
   }
   return { ok: false, error: 'browser verification still failing after ' + MAX_BROWSER_ITERATIONS + ' iterations (' + where + ')' }
 }
@@ -2511,6 +2538,7 @@ async function runEngineOwnedGate(ctx) {
     ctx.deferred.push('Engine-owned guardrail: automatic revert of incidental engine-owned change(s) to ' + revertFiles.join(', ') + ' FAILED — a human must verify/revert these paths manually before merge.')
     return { ok: true }
   }
+  tallyTouches(ctx, revert.files_changed)
   pushDecision(ctx, 'Engine-Owned Guardrail', 'Reverted incidental engine-owned change(s) to the batch baseline (origin/' + TARGET + '): ' + revertFiles.join(', ') + '. Commit: ' + (revert.commit || 'n/a') + '.')
   ctx.deferred.push('Engine-owned guardrail: incidental change(s) to ' + revertFiles.join(', ') + ' were reverted to the batch baseline — if this was actually intentional engine work, redo it as its own dedicated issue that names the path(s) so it is recognized as deliberate.')
   return { ok: true }
@@ -2593,6 +2621,7 @@ async function runTestLoop(ctx, forced) {
       ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
       if (!fix || fix.status === 'error') return { ok: false, error: 'test-fix stage failed — halting test loop' }
       collectNotes(ctx, 'test-fix', fix)
+      tallyTouches(ctx, fix.files_changed)
       continue
     }
 
@@ -2636,6 +2665,8 @@ async function runTestLoop(ctx, forced) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!qfix || qfix.status === 'error') return { ok: false, error: 'test-quality-fix stage failed — halting test loop' }
     collectNotes(ctx, 'test-quality-fix', qfix)
+    tallyTouches(ctx, qfix.files_changed)
+    ctx.metrics.test_quality_fix_rounds++
   }
   return { ok: false, error: 'test loop exceeded ' + MAX_TEST_ITERATIONS + ' iterations' }
 }
@@ -2763,6 +2794,7 @@ async function runMergeAutoResolve(ctx) {
     ].join('\n'), stageOpts('fix'), MERGE_RESOLVE_SCHEMA)
     if (!resolve) return { ok: false, error: 'conflict-resolver stage died — worktree left mid-rebase for human inspection' }
     collectNotes(ctx, 'merge-conflict-resolve', resolve)
+    tallyTouches(ctx, resolve.files_changed)
     if (resolve.status === 'aborted') return { ok: false, error: 'conflict resolver declined a semantic conflict (rebase aborted): ' + (resolve.summary || 'no reason given') }
   }
 
@@ -3792,6 +3824,7 @@ async function reviewAndMerge(ctx) {
     if (!fix || fix.status === 'error') return fail(ctx, 'needs_human', 'pr-fix', 'PR fix stage failed — PR #' + ctx.pr + ' left open for human review')
     pushDecision(ctx, 'PR Review Fix (i' + iter + ')', fix.summary || 'fixes applied')
     collectNotes(ctx, 'pr-fix', fix)
+    tallyTouches(ctx, fix.files_changed)
 
     const q = await runQualityLoop(ctx, 'pr-fix-i' + iter, 'post-review fixes for PR #' + ctx.pr, fix.files_changed)
     if (q === 'halted') return fail(ctx, 'halted', 'quality-loop', STOP.tripped ? 'stopped: ' + STOP.reason : 'quality degrade rate exceeded during PR fixes')
