@@ -1967,7 +1967,14 @@ const STAGE_LABELS = { preflight: 'preflight (orchestration)', select: 'select-p
 //       per-call usage figure, so there is no way to split budget.spent()'s
 //       movement between concurrent callers. Overlapping stages each see (and
 //       get attributed) the same movement, so per-issue deltas over-count and
-//       the whole breakdown is labelled approximate (reconciles: false).
+//       the whole breakdown is labelled approximate (reconciles: false) —
+//       but ONLY when some per-issue row is actually tracked (anyTracked).
+//       If every per-issue row is untracked and the breakdown is carried
+//       entirely by stage buckets (below), there is no per-issue over-count
+//       to guard against — those buckets are region-boundary-bracketed
+//       outside the concurrent pool regardless of concurrency — so that
+//       stage-only breakdown still reconciles exactly (reconciles: true)
+//       even at concurrency > 1.
 //   byStage      - optional (normalizes to {}, so existing 3-arg callers are
 //                  unaffected): a flat { preflight, select, ... } map of
 //                  region-bracketed orchestration spend sampled OUTSIDE the
@@ -2032,13 +2039,16 @@ function aggregateTokens(results, spent, concurrency, byStage) {
   const runTotal = hasSpent ? spent : null
   const trackedAny = anyTracked || anyStage
   const tracked = trackedAny || hasSpent
-  const reconciles = concurrency === 1 && hasSpent && trackedAny
+  const reconciles = hasSpent && trackedAny && (concurrency === 1 || !anyTracked)
   const remainder = hasSpent ? Math.max(0, spent - sumDeltas) : null
   // reconcile_error (issue #90): the HONEST, concurrency-independent reconciliation
   // signal, unlike `reconciles` (which is defined true whenever concurrency===1 and
-  // some spend is tracked, WITHOUT ever comparing the attributed sum to the real
-  // total — so a concurrency:1 run reports reconciles:true even with a large
-  // unattributed gap). reconcile_error = |spent - attributed| / spent captures both
+  // some spend is tracked, OR whenever concurrency>1 but no per-issue row is tracked
+  // (trackedAny is carried entirely by exact, region-bracketed stage buckets, so
+  // there's no per-issue over-count to guard against) — in neither case ever
+  // comparing the attributed sum to the real total — so a concurrency:1 run reports
+  // reconciles:true even with a large unattributed gap). reconcile_error = |spent -
+  // attributed| / spent captures both
   // failure modes: the concurrency>1 over-count (attributed > spent, error grows past
   // 0) AND the concurrency:1 under-attribution (the ~26% of PR-review/merge/report
   // spend left unbracketed — attributed < spent). Downstream efficiency metrics
@@ -2070,7 +2080,7 @@ function aggregateTokens(results, spent, concurrency, byStage) {
       // of it vanishing into a "not tracked" line that contradicts "Run total: N".
       lines.push('_no per-issue or stage data attributed any spend this run — the "orchestration/unattributed" row ' +
         'below carries the full run total instead of leaving it implicit._')
-    } else if (concurrency > 1) {
+    } else if (concurrency > 1 && anyTracked) {
       lines.push('_approximate - overlapping concurrent stages over-count and do NOT reconcile to the run total._')
       lines.push('(A single shared monotonic counter cannot be split per concurrent call — agent() returns schema ' +
         'content only, no per-call usage — so simultaneous issues each see the same counter movement. The stage ' +

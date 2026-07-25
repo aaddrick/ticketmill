@@ -196,6 +196,40 @@ test('aggregateTokens: a resumed run with every per-issue row untracked but popu
   assert.ok(agg.markdown.includes('| orchestration/unattributed |'))
 })
 
+test('aggregateTokens: concurrency>1 with every per-issue row untracked but populated stage buckets reconciles exactly (issue #65) — the by_stage buckets are region-bracketed outside the concurrent pool, so there is no per-issue over-count to guard against even though concurrency > 1', function () {
+  const context = harness.boot()
+  const results = [
+    { issue: 1, tokens: { total: 0, byModel: {}, tracked: false } },
+    { issue: 2, status: 'skipped' },
+  ]
+  const byStage = { preflight: 3800000, select: 150000 }
+  const spent = 4000000
+  const agg = context.aggregateTokens(results, spent, 3, byStage)
+
+  // anyTracked is false (no per-issue row tracked) but anyStage is true, and
+  // concurrency > 1 — the exact shape the #65 fix flips from reconciles:false
+  // (mislabeled approximate) to reconciles:true (honestly exact: the stage
+  // buckets are sampled outside runPool(), the sole concurrent region).
+  assert.strictEqual(agg.reconciles, true)
+  assert.ok(agg.markdown.includes(
+    '_Reconciles exactly to the run total above — the "orchestration/unattributed" row below absorbs ' +
+    'whatever budget.spent() counted that no stage attributed._'
+  ))
+  assert.ok(!agg.markdown.includes(
+    'approximate - overlapping concurrent stages over-count and do NOT reconcile to the run total.'
+  ))
+
+  assert.strictEqual(agg.remainder, 50000) // 4000000 - 3800000 - 150000
+  assert.ok(agg.markdown.includes('| #1 | not tracked |'))
+  assert.ok(agg.markdown.includes('| #2 | not tracked |'))
+  assert.ok(agg.markdown.includes('| preflight (orchestration) |'))
+  assert.ok(agg.markdown.includes('| select-phase (orchestration) |'))
+  assert.ok(agg.markdown.includes('| orchestration/unattributed |'))
+
+  // The rendered Total row equals spent exactly.
+  assert.ok(/\|\s*\*\*Total\*\*\s*\|\s*\*\*4000000\*\*\s*\|/.test(agg.markdown))
+})
+
 // ---- degenerate case: spent available but zero attribution (no per-issue, no stage) ----
 
 test('aggregateTokens: Quality Review (task 1, iteration 1) fix — hasSpent true but trackedAny false still renders the remainder row instead of hiding the full spend behind "not tracked"', function () {

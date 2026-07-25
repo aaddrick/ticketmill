@@ -755,11 +755,18 @@ issue's run: `reconciles: true` when `spent` and some tracked data both
 exist. Above concurrency 1, several issues' stages run against the same
 shared monotonic counter, and `agent()` returns schema content only, never a
 per-call usage figure. There is no way to split a shared counter's movement
-across concurrent callers, so the per-issue rows over-count and the whole
-breakdown is labeled approximate (`reconciles: false`) rather than claiming a
-precision it doesn't have. The `STAGE_TOKENS` rows stay exact even then,
-since they're sampled outside the concurrent pool; only the per-issue rows
-above them over-count.
+across concurrent callers, so a per-issue row over-counts and the breakdown
+is labeled approximate (`reconciles: false`). That downgrade only applies
+when some per-issue row is actually tracked (`anyTracked`).
+
+A resumed run can carry its whole breakdown in `STAGE_TOKENS` buckets alone,
+with every per-issue row untracked. There's no per-issue over-count to guard
+against there: those buckets are sampled outside the concurrent pool, so
+they stay exact regardless of `CONCURRENCY`. `reconciles` stays `true` for
+that stage-only shape even above concurrency 1 (issue #65). The narrative
+footnote follows the same split. It warns about approximation only when
+`anyTracked` is true, so a stage-only breakdown above concurrency 1 renders
+with no warning, having earned none.
 
 The "orchestration/unattributed" remainder row (`spent` minus the summed
 per-issue and stage deltas, floored at 0) renders whenever `budget.spent()`
