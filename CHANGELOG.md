@@ -1,17 +1,103 @@
 # Changelog
 
-## 0.1.33 (2026-07-25)
+## 0.1.32 (2026-07-25)
 
-Tier 2/3 of the observability upgrade: a proactive token cost
-estimator and budget guard, so ticketmill can stop before the account
-ceiling instead of after. One issue (#97). Patch bump (0.1.32 ->
-0.1.33). Depends on the runs.jsonl ledger (#86) and pairs with the
-rework-tax reducer (#91), both already merged. Before this, the only
-budget guards were reactive — the 3-consecutive-death circuit breaker
-and the budget-exhausted-error trip — which only fire after the
-account limit is already killing agents. This adds a pre-run estimate
-and an always-on hard-floor guard that halt cleanly before spend gets
-that far.
+Tier 2b of the observability upgrade, milled as one batch of four
+issues (#89, #91, #92, #97): per-run friction and churn surfaced in
+the batch PR, two efficiency and quality reducers, an outcome-grading
+eval anchor, and a proactive token cost governor. Patch bump
+(0.1.31 -> 0.1.32). The batch spanned an initial run and a
+server-error resume; the merged run record notes the split.
+
+Per-run friction and churn (#89), surfaced in the batch-PR body where
+a human already reviews. This-run only: at current data volume
+cross-run trends mislead (Simpson's paradox), so trends are deferred
+to a later mill-review skill behind a run-count gate.
+
+- `computeFriction(results)` (#89): per issue and per stage, a
+  normalized score weighting iteration-vs-cap ratios,
+  `quality_degrades`, `test_quality_fix_rounds`, contrarian cap-outs
+  (unresolved and carried forward), `merge_thrash`, and
+  `needs_human`. Ranks the bumpiest stages and issues this run.
+- `computeChurn(results, {serializeGlobs, engineOwned})` (#89):
+  within-run churn read from the retained `changed_files` and
+  `touch_counts` (#87): files touched by many issues in the batch,
+  plus re-fix chains. Buckets by `serialize_globs` and engine-owned
+  paths so expected-hot files stay separate from surprising ones.
+- `composeFrictionChurn(...)` (#89): folds both into a `## Friction
+  & Churn` section rendered next to `## Verification Gaps` in the
+  batch-PR body. Renders when there is signal, omits cleanly when
+  there isn't.
+- Tests (#89): `tests/friction.test.js`, `tests/churn.test.js`, and
+  `tests/compose-friction-churn.test.js` cover a synthetic re-fix
+  chain and the hotspot threshold.
+
+Two efficiency and quality reducers (#91), pure JS, surfaced per run.
+
+- `computeReworkTax(results)` (#91): the fraction of tokens spent in
+  fix and retry loops (quality-fix, test-fix, test-quality-fix,
+  pr-fix, merge-conflict-resolve) versus first-pass work, per issue
+  and per run. Classifies and sums per-stage token deltas, which
+  required a `byStage:{}` accumulator on the `ctx.tokens` init. Gated
+  on #90 reconciliation: output is suppressed or explicitly scoped
+  when the run's tokens don't reconcile, so no efficiency headline
+  lands on untrustworthy data.
+- `computeGateYield(results)` (#91): per contrarian gate, findings
+  raised, an accepted-vs-dismissed ratio, and an escaped-defect
+  signal (a finding raised late at PR review that the earlier
+  approach and plan gates missed). Consumes the `gate_findings` tally
+  from #87. The ratio folds only literal accepted and dismissed
+  dispositions; carried-unresolved and re-litigated count toward the
+  gate total but not the ratio.
+- Tests (#91): `tests/rework-tax.test.js` pins a known rework
+  fraction and `tests/gate-yield.test.js` covers the escaped-defect
+  case.
+
+Outcome grading (#92): back-annotating merged PRs into an outcome
+ledger. Nearly all of ticketmill's signal to date is process friction
+(Tier 1/2a), not outcome quality, so friction-driven self-improvement
+is Goodhart-able: a run can look clean by every process metric while
+shipping a PR that gets reverted the next day. This adds a read-only
+pass that resolves what actually happened to a prior run's merged PRs
+and records it, so later tiers have an eval anchor.
+
+- Pure grading core (#92): `gradeFromObservation`/`buildOutcomeLine`/
+  `diffOutcomeGrades`/`summarizeOutcomeCoverage`, added above the
+  `TICKETMILL-TEST-HARNESS-SPLIT` marker alongside the existing
+  `buildRunRecord`/`buildLedgerLine` pair. Grades are asymmetric on
+  age: negative signals (reverted, reopened, hotfixed) grade
+  immediately at any age, while a clean grade is gated behind
+  `OUTCOME_GRADING.min_age_days` (default 7, overridable via
+  `profile.outcome_grading`) so a PR isn't declared clean before it's
+  had time to fail. `closed_unmerged`/`abandoned` are a terminal
+  escape hatch for targets that can never reach clean. Rows are keyed
+  by `run_tag`+`batch_pr`+`issue` (one per member issue) and stamped
+  `schema_version: 1`. 30 new unit tests (`tests/outcomes.test.js`).
+- Read-only Select-phase agent (#92): `outcomeGradePromise` fires
+  alongside `learnPromise` so its latency hides behind the existing
+  preflight probes. Per the fs/git/gh-free sandbox, the agent does
+  target discovery in-prompt (walks the run-history ledger, expands
+  member issues, skips already-terminally-graded targets, bounded by
+  `sample_cap`) and live `gh pr view`/`gh issue view`/`gh search`
+  reads, returning raw observations plus the verbatim prior ledger
+  lines only — never a grade decision. The engine grades post-hoc in
+  deterministic JS and adds `outcomes`/`outcomes_path`/
+  `outcomes_coverage` to the final return, next to `record`/`ledger`.
+- Deterministic ledger write (#92): `skills/mill/SKILL.md` seeds
+  `<logs_dir>/outcomes.jsonl` if absent and appends each returned
+  outcome as one compact JSON line, in run order. Append-only, like
+  the `runs.jsonl` step beside it — the skill never rewrites, dedups,
+  or drops a line; `diffOutcomeGrades` already decided what to emit.
+  `outcomes.jsonl` is a per-host, gitignored local artifact.
+
+Proactive token cost estimator and budget guard (#97), so ticketmill
+can stop before the account ceiling instead of after. Depends on the
+`runs.jsonl` ledger (#86) and pairs with the rework-tax reducer
+(#91). Before this, the only budget guards were reactive — the
+3-consecutive-death circuit breaker and the budget-exhausted-error
+trip — which only fire after the account limit is already killing
+agents. This adds a pre-run estimate and an always-on hard-floor
+guard that halt cleanly before spend gets that far.
 
 - Ledger schema foundation (#97): `buildRunRecord`/`buildLedgerLine`
   gain a compact `by_issue_shape` block (`{issue, pf, tokens, tracked,
@@ -48,51 +134,7 @@ that far.
   fields for the skill to relay.
 
 Engine copies stay byte-identical (lockstep-linted). Full
-test_command green.
-
-## 0.1.32 (2026-07-25)
-
-Tier 3 of the observability upgrade: outcome grading — back-annotating
-merged PRs into an outcome ledger. One issue (#92). Patch bump
-(0.1.31 -> 0.1.32). Nearly all of ticketmill's signal to date is
-process friction (Tier 1/2a), not outcome quality, so friction-driven
-self-improvement is Goodhart-able: a run can look clean by every
-process metric while shipping a PR that gets reverted the next day.
-This adds a read-only pass that resolves what actually happened to a
-prior run's merged PRs and records it, so later tiers have an eval
-anchor instead of only a friction signal.
-
-- Pure grading core (#92): `gradeFromObservation`/`buildOutcomeLine`/
-  `diffOutcomeGrades`/`summarizeOutcomeCoverage`, added above the
-  `TICKETMILL-TEST-HARNESS-SPLIT` marker alongside the existing
-  `buildRunRecord`/`buildLedgerLine` pair. Grades are asymmetric on
-  age: negative signals (reverted, reopened, hotfixed) grade
-  immediately at any age, while a clean grade is gated behind
-  `OUTCOME_GRADING.min_age_days` (default 7, overridable via
-  `profile.outcome_grading`) so a PR isn't declared clean before it's
-  had time to fail. `closed_unmerged`/`abandoned` are a terminal
-  escape hatch for targets that can never reach clean. Rows are keyed
-  by `run_tag`+`batch_pr`+`issue` (one per member issue) and stamped
-  `schema_version: 1`. 30 new unit tests (`tests/outcomes.test.js`).
-- Read-only Select-phase agent (#92): `outcomeGradePromise` fires
-  alongside `learnPromise` so its latency hides behind the existing
-  preflight probes. Per the fs/git/gh-free sandbox, the agent does
-  target discovery in-prompt (walks the run-history ledger, expands
-  member issues, skips already-terminally-graded targets, bounded by
-  `sample_cap`) and live `gh pr view`/`gh issue view`/`gh search`
-  reads, returning raw observations plus the verbatim prior ledger
-  lines only — never a grade decision. The engine grades post-hoc in
-  deterministic JS and adds `outcomes`/`outcomes_path`/
-  `outcomes_coverage` to the final return, next to `record`/`ledger`.
-- Deterministic ledger write (#92): `skills/mill/SKILL.md` seeds
-  `<logs_dir>/outcomes.jsonl` if absent and appends each returned
-  outcome as one compact JSON line, in run order. Append-only, like
-  the `runs.jsonl` step beside it — the skill never rewrites, dedups,
-  or drops a line; `diffOutcomeGrades` already decided what to emit.
-  `outcomes.jsonl` is a per-host, gitignored local artifact.
-
-Engine copies stay byte-identical (lockstep-linted). Full
-test_command green: 414 `node --test` cases + 32
+test_command green: 475 `node --test` cases + 32
 `setup-worktree.test.sh` cases.
 
 ## 0.1.31 (2026-07-25)
