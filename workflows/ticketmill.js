@@ -6145,14 +6145,26 @@ if (DRY_RUN) {
   const refPossiblyStale = !targetFetch || targetFetch.status !== 'success'
   // Cost-estimate preview (issue #97 task 3) — built off the SAME previewUnits
   // the lane-scheduling preview above already derived, so a unit's shape here
-  // matches the unit a real run would actually drain. Each unit becomes one
+  // matches the unit a real run would actually drain. Scoped to
+  // resume_point === 'implement' units ONLY (Quality Review, task 3 iteration
+  // 1): a 'skip' unit does no real work at all (processIssue's
+  // resume_point==='skip' early return) and a 'process_pr' unit pays only
+  // rework-tax, not a fresh implement-shaped run — charging either the SAME
+  // full pf-band-median estimate as a genuine implement would inflate
+  // batch_projection.projected_total and could spuriously trip
+  // oversized.multiple_of_median on an already-skipped/healed issue. A unit's
+  // own `.resume_point` is inherited straight from its preflight/primaryRef in
+  // deriveUnits(), so this filter needs no new plumbing. Task 4/5's live-run
+  // pre-check reuses this SAME filtered construction so the estimate map it
+  // builds off of stays unpolluted too. Each surviving unit becomes one
   // buildCostEstimate() `issues[]` entry: `pf` is the unit's own predicted_files
   // count (already the union for a group unit — deriveUnits() computes it that
   // way, see its module comment), `member_count` its live member count, and
   // `members` (only when >1) each member's OWN predicted_files count — NOT the
   // union — mirroring estimateCost()'s group contract (each member bands on its
   // own shape, see estimateIssue()'s module comment).
-  const costEstimateIssues = previewUnits.map(function (u) {
+  const costEstimateUnits = previewUnits.filter(function (u) { return u.resume_point === 'implement' })
+  const costEstimateIssues = costEstimateUnits.map(function (u) {
     const memberCount = Array.isArray(u.members) ? u.members.length : 1
     const item = {
       issue: u.issue,
