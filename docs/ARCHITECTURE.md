@@ -493,6 +493,79 @@ artifact, and target selection is bounded by
 pass stays cheap and history catches up over many runs instead of trying
 to grade everything at once.
 
+### Revisit risk: flagging a preflight from recent negative outcomes
+
+Outcome grading records whether a merged issue held up. Revisit risk reads
+that same ledger to warn the next issue before it starts. Issue #93 adds a
+Select-phase pass that flags a preflight when a file it's likely to touch
+was recently reverted, hot-fixed, or reopened, and threads that flag into
+the evaluate, approach-challenge, and plan prompts so the run treats the
+area with more care.
+
+**Same split as outcome grading, and the same PIN.** The Select sandbox
+still can't shell out, so a `revisit-risk` agent stage does the live
+reads. It cats `outcomes.jsonl` for `prior_ledger_lines` (raw, unparsed
+lines, the same contract as `OUTCOMES_SCHEMA`'s field of the same name),
+then for any ledger key already graded reverted, reopened, or hotfix
+within a target-selection window, resolves that regression's `files` with
+a live `gh` read. It fires alongside `learnPromise` and
+`outcomeGradePromise`, in the same `STAGE_TOKENS.preflight` bracket, and
+it is strictly read-only. `computeRevisitRisk`, above the
+`TICKETMILL-TEST-HARNESS-SPLIT` marker, is the only place that decides a
+flag. The agent itself never grades.
+
+**A quality-fix iteration closed a PIN violation.** The first pass
+trusted the agent's own last-line-wins parse of `outcomes.jsonl` as the
+flag decision, the exact thing #92's `OUTCOMES_SCHEMA` was built to rule
+out, and code review caught it with a `changes_requested` verdict.
+`deriveNegativeOutcomeEvents` fixes it: it re-derives grade, `decided_at`,
+and `merged_at` straight from `prior_ledger_lines`, using the same
+`outcomeLineKey` grouping and last-line-wins logic `diffOutcomeGrades`
+already uses, and keeps only keys whose current grade is in
+`OUTCOME_NEGATIVE_GRADES`. `attachRevisitFiles` then merges on just the
+one piece of the agent's output that's genuinely judgment-requiring: the
+live-`gh`-resolved `files` list, keyed by `{issue, batch_pr}`. A negative
+key the agent never resolved files for still comes through with
+`files: []`, never fabricated.
+
+**The recency anchor is when the risk became known, not when the change
+merged.** `computeRevisitRisk` ages each event off `decided_at`, falling
+back to `merged_at` only when `decided_at` is missing, and compares that
+age against `profile.revisit_risk.window_days` (default 30, the same
+override guard as `outcome_grading.min_age_days`). A preflight needs to
+know how recently the team learned an area is risky. A regression that
+merged months ago but was only reverted this week is still fresh news to
+a run starting today, even though the underlying merge is old.
+
+**Matching and corroboration.** A preflight flags when any of its
+`predicted_files` (normalized: case-sensitive, slash-normalized)
+intersects an in-window event's `files`, with one reason string per
+match. `refix_chains` (#89's within-issue re-fix counts) can only
+annotate a file that already flagged from a real event overlap; they
+never flag on their own. Churn alone has no proven link to a bad outcome,
+and in a monolith-shaped repo like this one it would flag almost every
+engine-touching issue.
+
+**Threaded like `engineOwnedIntentional`.** `deriveUnits()` OR-folds
+`revisit_risk` across a group's live members with `unionRevisitRisk`. One
+flagged member is enough to flag the whole unit, and reasons concatenate
+rather than dedupe, since each one already names its own file, issue, and
+grade. `processIssue` reads the value off `pre` onto `ctx` once at init,
+the same pattern `engineOwnedIntentional` uses just above it, so every
+stage downstream sees the identical value. Its own default,
+`{flagged: false, reasons: []}`, matches `computeRevisitRisk`'s clean
+no-op shape, so a preflight that never carried the field (a resume-skip
+stub, say) can't crash a downstream read.
+
+**Rendering is a clean no-op when nothing is flagged.** `revisitRiskBlock(ctx)`
+returns an empty string unless `ctx.revisit_risk.flagged` is true, so a
+run with no history match renders byte-identical evaluate,
+approach-challenge, and plan prompts to before this feature existed. When
+it does fire, `pushDecision` records it in the decision chain once, right
+after worktree setup, and each of the three prompt sites then renders it
+inline: the flagged file and its prior grade, and a push toward a
+conservative approach with added regression coverage.
+
 ### Engine-owned path guardrail: three regimes
 
 A worktree only sees committed state. A freshly forged agent file, or a
