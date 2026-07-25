@@ -99,7 +99,7 @@ test('buildRunRecord scales cleanly past the old 30000-char slice with no trunca
 test('buildRunRecord carries the schema header and threads token honesty fields', function () {
   const context = harness.boot()
   const record = makeRecord(context, fixtureResults(2))
-  assert.strictEqual(record.schema_version, 1)
+  assert.strictEqual(record.schema_version, 2)
   assert.strictEqual(record.run_tag, '2026-07-25')
   assert.strictEqual(record.state, 'completed')
   assert.strictEqual(record.base_branch, 'main')
@@ -110,12 +110,109 @@ test('buildRunRecord carries the schema header and threads token honesty fields'
   assert.strictEqual(record.tokens.reconciles, true)
 })
 
+// ---- issue #97 task 1: by_issue_shape + effective_concurrency ----
+//
+// The proactive cost-estimator's ONLY history input is this pair of fields
+// (joined here, in buildRunRecord/buildLedgerLine — not re-derived downstream).
+// buildIssueShapeRows joins `results` against `units` (predicted_files lives on
+// the unit, never the result) and tokenAgg.by_issue (per-result token totals),
+// by issue number rather than array position, so these tests fixture `units` and
+// `tokenAgg.by_issue` deliberately out of result order to prove the join is real.
+
+test('buildRunRecord threads effective_concurrency verbatim from the caller', function () {
+  const context = harness.boot()
+  const record = makeRecord(context, fixtureResults(1), { effectiveConcurrency: 1 })
+  assert.strictEqual(record.effective_concurrency, 1)
+})
+
+test('buildRunRecord defaults effective_concurrency to null when the caller omits it (never a false 0/undefined)', function () {
+  const context = harness.boot()
+  const record = makeRecord(context, fixtureResults(1))
+  assert.strictEqual(record.effective_concurrency, null)
+})
+
+test('buildRunRecord: by_issue_shape joins pf off units and tokens off tokenAgg.by_issue, by issue number (not array position)', function () {
+  const context = harness.boot()
+  const results = fixtureResults(2) // issues 100, 101
+  const units = [
+    { issue: 101, predicted_files: ['a.js', 'b.js', 'c.js'] }, // deliberately out of order
+    { issue: 100, predicted_files: ['x.js'] },
+  ]
+  const record = makeRecord(context, results, {
+    units: units,
+    tokenAgg: {
+      run_total: 3000, by_model: {}, by_stage: null, attributed: 3000,
+      reconcile_error: 0, tracked: true, reconciles: true,
+      by_issue: [
+        { issue: 101, total: 2000, by_model: {}, tracked: true }, // also out of order
+        { issue: 100, total: 1000, by_model: {}, tracked: true },
+      ],
+    },
+  })
+
+  assert.strictEqual(record.by_issue_shape.length, 2)
+  const row100 = record.by_issue_shape.find(function (r) { return r.issue === 100 })
+  const row101 = record.by_issue_shape.find(function (r) { return r.issue === 101 })
+  assert.ok(row100, 'issue 100 missing from by_issue_shape')
+  assert.ok(row101, 'issue 101 missing from by_issue_shape')
+  assert.strictEqual(row100.pf, 1)
+  assert.strictEqual(row100.tokens, 1000)
+  assert.strictEqual(row100.tracked, true)
+  assert.strictEqual(row100.member_count, 1)
+  assert.strictEqual(row101.pf, 3)
+  assert.strictEqual(row101.tokens, 2000)
+  assert.strictEqual(row101.member_count, 1)
+})
+
+test('buildRunRecord: a group-unit row carries member_count>1, the UNION predicted_files count, and the WHOLE-GROUP token total — never a per-member split', function () {
+  const context = harness.boot()
+  const results = fixtureResults(1) // single result, issue 100 — the group's primary
+  results[0].members = [100, 105, 110] // memberIssues(ctx) shape: a flat array of issue numbers, primary included
+  const units = [
+    // deriveUnits() already unions predicted_files across every live member before
+    // the unit reaches the pool — this fixture mirrors that pre-unioned shape.
+    { issue: 100, predicted_files: ['shared/a.js', 'shared/b.js', 'shared/c.js', 'shared/d.js'] },
+  ]
+  const record = makeRecord(context, results, {
+    units: units,
+    tokenAgg: {
+      run_total: 9000, by_model: {}, by_stage: null, attributed: 9000,
+      reconcile_error: 0, tracked: true, reconciles: true,
+      // aggregateTokens emits ONE row per result — for a group unit this total IS
+      // the whole group's spend, not the primary's alone.
+      by_issue: [{ issue: 100, total: 9000, by_model: {}, tracked: true }],
+    },
+  })
+
+  assert.strictEqual(record.by_issue_shape.length, 1)
+  const row = record.by_issue_shape[0]
+  assert.strictEqual(row.issue, 100)
+  assert.strictEqual(row.member_count, 3, 'group-unit row must flag member_count>1 so estimateCost never files it as a singleton')
+  assert.strictEqual(row.pf, 4, 'pf must be the union predicted_files count, not re-derived per member')
+  assert.strictEqual(row.tokens, 9000, 'tokens must be the whole-group total, not split across members')
+})
+
+test('buildRunRecord: by_issue_shape degrades cleanly when units/tokenAgg.by_issue are missing (pf 0, tokens null, tracked false, member_count from result.members)', function () {
+  const context = harness.boot()
+  const results = fixtureResults(1)
+  delete results[0].tokens // no tokens field at all on the result itself either
+  const record = makeRecord(context, results, {
+    tokenAgg: { run_total: null, by_model: {}, by_stage: null, attributed: 0, reconcile_error: null, tracked: false, reconciles: false, by_issue: [] },
+  })
+  const row = record.by_issue_shape[0]
+  assert.strictEqual(row.pf, 0)
+  assert.strictEqual(row.tokens, null)
+  assert.strictEqual(row.tracked, false)
+  assert.strictEqual(row.member_count, 1)
+})
+
 // ---- the compact ledger line ----
 
 test('buildLedgerLine is a compact single-line index carrying the trend fields', function () {
   const context = harness.boot()
   const record = makeRecord(context, fixtureResults(3), {
     verificationGaps: ['tests skipped for #101'],
+    effectiveConcurrency: 2,
     tokenAgg: { run_total: 42, by_issue: [], by_model: { opus: 42 }, by_stage: null, attributed: 30, reconcile_error: 0.2857, tracked: true, reconciles: false },
   })
   const line = context.buildLedgerLine(record)
@@ -127,8 +224,53 @@ test('buildLedgerLine is a compact single-line index carrying the trend fields',
   assert.strictEqual(line.reconcile_error, 0.2857)
   assert.strictEqual(line.verification_gaps, 1)
   assert.strictEqual(line.stop_tripped, false)
+  assert.strictEqual(line.effective_concurrency, 2)
   // "compact single line" is a hard contract — runs.jsonl is one object per line.
   assert.strictEqual(JSON.stringify(line).indexOf('\n'), -1)
+})
+
+// ---- issue #97 task 1: by_issue_shape / effective_concurrency on the ledger line ----
+//
+// estimateCost() (task 2) reduces over runs.jsonl (the ledger), not the full
+// per-run record file, so both fields must survive the record->ledger-line
+// compaction verbatim — including a group-unit row (member_count>1).
+
+test('buildLedgerLine carries by_issue_shape verbatim, including a group-unit row (member_count>1, union pf, whole-group tokens)', function () {
+  const context = harness.boot()
+  const results = fixtureResults(1)
+  results[0].members = [100, 105] // a 2-member group, primary issue 100
+  const units = [{ issue: 100, predicted_files: ['a.js', 'b.js'] }]
+  const record = makeRecord(context, results, {
+    effectiveConcurrency: 1,
+    units: units,
+    tokenAgg: {
+      run_total: 5000, by_model: {}, by_stage: null, attributed: 5000,
+      reconcile_error: 0, tracked: true, reconciles: true,
+      by_issue: [{ issue: 100, total: 5000, by_model: {}, tracked: true }],
+    },
+  })
+  const line = context.buildLedgerLine(record)
+
+  assert.strictEqual(line.effective_concurrency, 1)
+  assert.strictEqual(line.by_issue_shape.length, 1)
+  const row = line.by_issue_shape[0]
+  assert.strictEqual(row.issue, 100)
+  assert.strictEqual(row.member_count, 2)
+  assert.strictEqual(row.pf, 2)
+  assert.strictEqual(row.tokens, 5000)
+  assert.strictEqual(row.tracked, true)
+})
+
+test('buildLedgerLine defaults by_issue_shape to [] and effective_concurrency to null when the record omits them', function () {
+  const context = harness.boot()
+  const line = context.buildLedgerLine({})
+  // Array.isArray + length check, not deepStrictEqual([]) — the vm-constructed
+  // array is a different-realm Array (same shape, not reference-equal to a host
+  // Array), which deepStrictEqual treats as unequal (see harness.js's own
+  // "host-realm compare" note on the scale test above).
+  assert.ok(Array.isArray(line.by_issue_shape))
+  assert.strictEqual(line.by_issue_shape.length, 0)
+  assert.strictEqual(line.effective_concurrency, null)
 })
 
 test('buildLedgerLine reports stop_tripped and gap counts from a circuit-broken run', function () {

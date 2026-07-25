@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.1.33 (2026-07-25)
+
+Tier 2/3 of the observability upgrade: a proactive token cost
+estimator and budget guard, so ticketmill can stop before the account
+ceiling instead of after. One issue (#97). Patch bump (0.1.32 ->
+0.1.33). Depends on the runs.jsonl ledger (#86) and pairs with the
+rework-tax reducer (#91), both already merged. Before this, the only
+budget guards were reactive — the 3-consecutive-death circuit breaker
+and the budget-exhausted-error trip — which only fire after the
+account limit is already killing agents. This adds a pre-run estimate
+and an always-on hard-floor guard that halt cleanly before spend gets
+that far.
+
+- Ledger schema foundation (#97): `buildRunRecord`/`buildLedgerLine`
+  gain a compact `by_issue_shape` block (`{issue, pf, tokens, tracked,
+  member_count}` per issue, joined from units + `tokenAgg.by_issue` at
+  record-build time) and `effective_concurrency` (`min(CONCURRENCY,
+  lanes.length)`), so trusted single-lane runs are attributable even
+  when the run-level `CONCURRENCY` arg says otherwise.
+  `schema_version` 1 -> 2.
+- Pure `estimateCost(history, issues)` reducer (#97): flattens only
+  trusted `by_issue_shape` rows (`effective_concurrency===1`,
+  `member_count===1`, parent-run `reconcile_error` under a coarse
+  admission bar) into per-predicted-files-band medians, and degrades
+  honestly to `{estimate:null, confidence:'insufficient'}` on thin or
+  high-error history rather than guessing. Group units estimate as the
+  sum of each member's own band estimate, poisoned to `null` by any
+  unknown member.
+- `cost_estimate` on the `dry_run` preview (#97): per-issue
+  estimate+confidence, three independent oversized flags (structural
+  group size, predicted-files-band ceiling, multiple-of-global-median),
+  and a batch projection that never reports a bare total when any
+  member is unknown — it always carries an "estimable K of N, M
+  unknown" coverage note.
+- Always-on `token_budget` guard (#97): resolved from a run arg or
+  `profile.token_budget`, as an absolute OUTPUT-token ceiling or a
+  relative `"Nx"`-of-median form. A hard floor
+  (`spentTokens()>=budget`) trips a distinct `budget_halt` state with
+  its own `resume_hint` at any concurrency, with an estimate-aware
+  pre-check layered on top so a run can stop before starting an
+  oversized issue, not just after. Kept separate from the existing
+  death-signature circuit breaker.
+- `skills/mill/SKILL.md` (#97): reads `runs.jsonl` and passes it as
+  `args.history` on every invocation (live and `dry_run`), and
+  documents `token_budget`'s two forms and the `cost_estimate` preview
+  fields for the skill to relay.
+
+Engine copies stay byte-identical (lockstep-linted). Full
+test_command green.
+
 ## 0.1.32 (2026-07-25)
 
 Tier 3 of the observability upgrade: outcome grading — back-annotating

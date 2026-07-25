@@ -265,6 +265,17 @@ let WORKTREES = null            // ROOT + '/.worktrees' once ROOT is known
 const RUN_TAG = A.run_label || A.date || 'run'
 const CONCURRENCY = Math.max(1, Math.min(5, Number(A.concurrency) || 2))
 const DRY_RUN = !!A.dry_run
+// HISTORY (issue #97 task 3): parsed runs.jsonl ledger lines (buildLedgerLine's
+// own output shape), read from disk and handed in by the `mill` skill — the
+// sandbox has no fs, so this is the same skill-does-IO / engine-does-pure-logic
+// split as buildLedgerLine's own write path (see estimateCost's module comment).
+// The skill passes this on EVERY invocation, live runs and dry_run alike — the
+// dry_run cost_estimate preview below is one consumer, but a later task's
+// live-run estimate-aware budget pre-check needs the same array, so it is
+// threaded once here rather than only inside the DRY_RUN branch. Falls open to
+// [] (never throws) so a caller that omits it, or an older skill build that
+// doesn't know about it yet, degrades to "no history" rather than failing.
+const HISTORY = Array.isArray(A.history) ? A.history : []
 
 // ----- caps -----
 let MAX_CONTRARIAN_ITERATIONS = 3 // overridable via profile.contrarian_max_iterations (see __seed / Select)
@@ -1424,7 +1435,14 @@ function applyRealRunCollapseGuard(units, lanes, concurrency, serializeGlobs) {
 }
 
 // ----- batch state -----
-const STOP = { tripped: false, reason: '' }
+// STOP.kind (issue #97 task 4): null for the pre-existing reactive breakers
+// (BATCH.failures circuit breaker, recordAgentDeath's consecutive-death
+// breaker, isBudgetExhaustedError's real-exhaustion-message breaker — all
+// still surface as state:'circuit_breaker'), 'budget' ONLY for the new
+// proactive runPool()/drainUnit() token_budget guard below — distinct so the
+// final state/resume_hint can tell "an agent call actually failed/died" apart
+// from "we stopped BEFORE spending more, on purpose, before anything failed".
+const STOP = { tripped: false, reason: '', kind: null }
 const BATCH = { failures: 0, consecutiveDeaths: 0 }
 // STAGE_TOKENS: region-boundary token buckets for Select-phase orchestration
 // spend that has no per-issue ctx to attribute to (see aggregateTokens' byStage
@@ -1435,8 +1453,17 @@ const BATCH = { failures: 0, consecutiveDeaths: 0 }
 const STAGE_TOKENS = { preflight: 0, select: 0 }
 let LEARN = null // category digests distilled from process-retrospective.md (Select phase)
 
-function tripStop(reason) {
-  if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; log('STOP: ' + reason) }
+function tripStop(reason, kind) {
+  if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; STOP.kind = kind || null; log('STOP: ' + reason) }
+}
+
+// tripBudgetStop (issue #97 task 4): the proactive token_budget guard's own
+// trip path, always tagged kind:'budget' — see the STOP.kind module comment
+// above for why this must stay distinct from the plain tripStop(reason) the
+// reactive breakers (circuit breaker, consecutive deaths, real budget-
+// exhaustion error message) already use.
+function tripBudgetStop(reason) {
+  tripStop(reason, 'budget')
 }
 
 // isBudgetExhaustedError: only a real budget/token-exhaustion signature is
@@ -4489,7 +4516,27 @@ async function processIssue(pre) {
 // unit-level work — a throw partway through one lane can never tear down another
 // lane's in-flight or already-written results, and results.length always stays
 // items.length no matter what any single fn() call does.
-async function runPool(items, limit, fn, lanes) {
+//
+// budgetCtx (issue #97 task 4, OPTIONAL — undefined/omitted is a no-op, matching
+// every existing caller/test that doesn't pass a 5th arg): { budget, estimateByIssue }
+// where `budget` is the already-resolved OUTPUT-token ceiling (resolveTokenBudget's
+// output — null/non-finite means "guard off", checked once per call so a caller
+// never has to special-case "no budget set") and `estimateByIssue` is
+// buildBudgetEstimateMap()'s {issue -> estimate|null} lookup. Checked in drainUnit
+// immediately before STOP.tripped is consulted, so a fresh trip here funnels
+// through the exact same not_started result-shape as every other STOP reason —
+// no separate code path to drift from. Two layered checks, hard floor first:
+//   1. HARD FLOOR (PRIMARY, history-free, honest at ANY concurrency): spentTokens()
+//      is the real guarded monotonic run-wide counter (see its own module comment)
+//      — a plain >= budget compare needs no per-unit estimate at all, so it is the
+//      backstop even when history is empty or every estimate is null.
+//   2. ESTIMATE-AWARE PRE-CHECK (layered ON TOP, only reached if the hard floor
+//      didn't already trip): spentTokens() + estimateByIssue[unit.issue] > budget.
+//      Only fires when that unit's estimate is a finite number — a null estimate
+//      (insufficient history, or any group member unestimable) is left to the hard
+//      floor rather than guessed at, per estimateIssue()'s own "null poisons the
+//      sum" contract.
+async function runPool(items, limit, fn, lanes, budgetCtx) {
   const results = new Array(items.length)
   const laneList = (Array.isArray(lanes) && lanes.length)
     ? lanes
@@ -4548,6 +4595,24 @@ async function runPool(items, limit, fn, lanes) {
   }
 
   async function drainUnit(i) {
+    // token_budget guard (issue #97 task 4) — checked BEFORE STOP.tripped so a
+    // fresh trip here is caught by the very next check, immediately below,
+    // through the SAME not_started result shape every other STOP reason uses.
+    if (!STOP.tripped && budgetCtx && isFiniteNumber(budgetCtx.budget)) {
+      const spent = spentTokens()
+      if (isFiniteNumber(spent)) {
+        if (spent >= budgetCtx.budget) {
+          tripBudgetStop('token_budget hard floor reached: ' + spent + ' OUTPUT tokens spent >= budget ' +
+            budgetCtx.budget + ' — halting before issue #' + items[i].issue)
+        } else {
+          const est = budgetCtx.estimateByIssue ? budgetCtx.estimateByIssue[items[i].issue] : null
+          if (isFiniteNumber(est) && (spent + est) > budgetCtx.budget) {
+            tripBudgetStop('token_budget estimate-aware pre-check: ' + spent + ' OUTPUT tokens spent + ' + est +
+              ' estimated for issue #' + items[i].issue + ' would exceed budget ' + budgetCtx.budget)
+          }
+        }
+      }
+    }
     if (STOP.tripped) {
       // items[i] is a unit (deriveUnits() shape) — .members is always present
       // (a self-reference singleton, or real group members), never ctx-shaped.
@@ -4931,6 +4996,54 @@ function computeCompleteness(results, tokenAgg) {
   }
 }
 
+// buildIssueShapeRows (issue #97 task 1): per-unit "shape" summary joined from
+// `results` (this run's per-issue/per-group outcome records) and `units` (the
+// lane-scheduling units that produced them — index-aligned with `results`, see
+// runPool()'s own module comment, but looked up by issue number here rather than
+// position so a future reordering can never silently mismatch). Feeds the
+// history estimateCost() reduces over (issue #97 task 2): one row per unit —
+//   issue        - the unit's primary issue number (r.issue).
+//   pf           - predicted_files count. For a group unit (member_count > 1)
+//                  this is ALREADY the union over every member — deriveUnits()
+//                  computes it via unionField(memberRefs, 'predicted_files')
+//                  before the unit ever reaches the pool (see its module
+//                  comment) — never a per-member sum computed here.
+//   tokens       - this row's token total, joined off tokenAgg.by_issue (itself
+//                  one entry per result — for a group unit that IS the whole
+//                  group's total, not the primary's share of it alone).
+//   tracked      - whether `tokens` is a real, budget-derived number.
+//   member_count - result.members.length (memberIssues(ctx) at the result-build
+//                  site, line ~4378 — results never carry a raw groupId, only
+//                  the resolved member-issue list). >1 flags a group unit so
+//                  estimateCost() never files its union pf + whole-group total
+//                  into a singleton's pf-band.
+function buildIssueShapeRows(results, units, byIssue) {
+  const list = Array.isArray(results) ? results : []
+  const unitByIssue = {}
+  for (const u of (Array.isArray(units) ? units : [])) {
+    if (u && u.issue != null) unitByIssue[u.issue] = u
+  }
+  const tokenByIssue = {}
+  for (const row of (Array.isArray(byIssue) ? byIssue : [])) {
+    if (row && row.issue != null) tokenByIssue[row.issue] = row
+  }
+  const out = []
+  for (const r of list) {
+    if (!r || r.issue == null) continue
+    const u = unitByIssue[r.issue]
+    const pf = (u && Array.isArray(u.predicted_files)) ? u.predicted_files.length : 0
+    const tok = tokenByIssue[r.issue]
+    out.push({
+      issue: r.issue,
+      pf: pf,
+      tokens: (tok && isFiniteNumber(tok.total)) ? tok.total : null,
+      tracked: !!(tok && tok.tracked),
+      member_count: Array.isArray(r.members) ? r.members.length : 1,
+    })
+  }
+  return out
+}
+
 // buildRunRecord (issue #86): assemble the FULL, untruncated machine-readable record
 // for a run. Pure and above the split marker so tests can prove — at 18-issue+ scale —
 // that no per-issue metrics/timeline block is dropped. This object is what the outer
@@ -4941,7 +5054,14 @@ function computeCompleteness(results, tokenAgg) {
 // never reached disk). The Report agent now renders only the human-readable .md; the
 // bytes of the machine record never pass through a model. Shape is byte-for-byte the
 // prior `resultsJson` payload plus a `schema_version` and `run_tag` header, plus (issue
-// #87 task 5) a `completeness` trust flag — see computeCompleteness() just above.
+// #87 task 5) a `completeness` trust flag — see computeCompleteness() just above — plus
+// (issue #97 task 1) `by_issue_shape`/`effective_concurrency`, the estimator's raw
+// history input. `f.units` is optional (defaults to [], pf falls open to 0) so every
+// existing caller/fixture that predates issue #97 keeps working unchanged.
+// `f.effectiveConcurrency` mirrors the dry_run lane preview's own
+// `Math.min(CONCURRENCY, lanes.length)` (see the routing-plan preview above) — the
+// caller passes it through rather than this pure function re-deriving it, since
+// CONCURRENCY/lanes are real-run-only bindings outside buildRunRecord's inputs.
 function buildRunRecord(f) {
   const t = f.tokenAgg || {}
   const m = f.mergeAgg || {}
@@ -4952,12 +5072,13 @@ function buildRunRecord(f) {
   const gy = f.gateYieldAgg || {}
   return {
     completeness: computeCompleteness(f.results, t),
-    schema_version: 1,
+    schema_version: 2,
     run_tag: f.runTag,
     state: f.state,
     base_branch: f.baseBranch,
     batch_branch: f.batchBranch,
     batch_pr: f.batchPr,
+    effective_concurrency: isFiniteNumber(f.effectiveConcurrency) ? f.effectiveConcurrency : null,
     stop: f.stop,
     counts: f.counts,
     verification_gaps: f.verificationGaps,
@@ -5022,6 +5143,7 @@ function buildRunRecord(f) {
       escaped_defects: gy.escaped_defects,
     },
     consolidation_groups: f.consolidationGroups,
+    by_issue_shape: buildIssueShapeRows(f.results, f.units, t.by_issue),
     results: f.results,
   }
 }
@@ -5032,7 +5154,11 @@ function buildRunRecord(f) {
 // runs/<run_tag>.json); this is the index. Pure/above the split marker. Carries
 // `trustworthy` (issue #87 task 5, mirroring record.completeness.trustworthy) so a
 // cross-run trend line can be filtered to only the runs whose telemetry is complete,
-// without re-opening every run's full record to re-derive it.
+// without re-opening every run's full record to re-derive it. Also carries
+// `by_issue_shape` and `effective_concurrency` verbatim off the record (issue #97
+// task 1) — estimateCost() (task 2) reduces over exactly this ledger, not the full
+// per-run record, so the shape rows and their trust signal (effective_concurrency)
+// must live here, not only in runs/<run_tag>.json.
 function buildLedgerLine(record) {
   const r = record || {}
   const t = r.tokens || {}
@@ -5042,6 +5168,7 @@ function buildLedgerLine(record) {
     base_branch: r.base_branch,
     batch_branch: r.batch_branch,
     batch_pr: r.batch_pr,
+    effective_concurrency: isFiniteNumber(r.effective_concurrency) ? r.effective_concurrency : null,
     counts: r.counts,
     issues: Array.isArray(r.results) ? r.results.length : 0,
     tokens_total: t.run_total,
@@ -5051,7 +5178,437 @@ function buildLedgerLine(record) {
     verification_gaps: Array.isArray(r.verification_gaps) ? r.verification_gaps.length : 0,
     stop_tripped: !!(r.stop && r.stop.tripped),
     trustworthy: !!(r.completeness && r.completeness.trustworthy),
+    by_issue_shape: Array.isArray(r.by_issue_shape) ? r.by_issue_shape : [],
   }
+}
+
+// ============================================================================
+// estimateCost (issue #97 task 2): a pure, sandbox-safe token-cost estimator
+// over the runs.jsonl ledger — the substrate #86/task 1 built. The engine has
+// no fs, so the `mill` skill reads runs.jsonl and hands the parsed lines in as
+// `history` (this is the same skill-does-IO / engine-does-pure-logic split as
+// buildLedgerLine's write path). Deliberately conservative: an estimate is
+// only ever a band median off TRUSTED history, and the function would rather
+// say "insufficient" than print a number nobody should act on.
+// ============================================================================
+
+// ESTIMATOR_PF_BAND_EDGES / pfBandKey: the cheap issue-shape bucket the
+// estimator medians over — predicted_files count, the only signal that is (a)
+// pure, (b) available for a brand-new issue at dry_run (preflight already
+// computes it), and (c) recoverable from history (by_issue_shape.pf, task 1).
+// Bands widen geometrically because pf itself is noisy at the low end (a
+// 1-file fix and a 2-file fix are practically the same shape) and predicted_files
+// is capped at 20 (MAX_LANE_PREDICTED_FILES-adjacent cap in preflight), so a
+// single open-ended top band covers everything past 15.
+const ESTIMATOR_PF_BANDS = [
+  { max: 0, key: '0' },
+  { max: 1, key: '1' },
+  { max: 3, key: '2-3' },
+  { max: 7, key: '4-7' },
+  { max: 15, key: '8-15' },
+  { max: Infinity, key: '16+' },
+]
+function pfBandKey(pf) {
+  const n = isFiniteNumber(pf) ? pf : 0
+  for (const b of ESTIMATOR_PF_BANDS) {
+    if (n <= b.max) return b.key
+  }
+  return ESTIMATOR_PF_BANDS[ESTIMATOR_PF_BANDS.length - 1].key
+}
+
+// ESTIMATOR_MAX_RECONCILE_ERROR: a coarse PATHOLOGY guard on the estimator's
+// history input — deliberately NOT the strict MAX_RECONCILE_ERROR_FOR_TRUST
+// (0.05, run-record.js line ~305) used to gate the run-level `trustworthy`
+// flag and rework-tax. Per aggregateTokens' own module comment, an
+// effective_concurrency===1 run STILL, by design, leaves ~26% of spend
+// (PR-review/merge/report overhead) unattributed to any single issue — that
+// ~0.26 reconcile_error is the EXPECTED shape of good history here, not a
+// defect, so re-applying the 0.05 bar would starve the estimator down to
+// near-zero trusted rows. 0.5 instead rejects only genuinely pathological
+// runs (a real accounting failure, a stale/corrupt ledger line) while keeping
+// the normal ~0.26 case in the trusted pool.
+const ESTIMATOR_MAX_RECONCILE_ERROR = 0.5
+
+// ESTIMATOR_MIN_BAND_SAMPLES: the smallest trusted-row count a pf-band needs
+// before its median is reported as a real number. A median of 1-2 points
+// isn't a central tendency, it's just "whatever those 1-2 issues happened to
+// cost" — 3 is the smallest sample where the median stops being a single
+// data point in disguise. Below this, the band degrades honestly to
+// {estimate: null, confidence: 'insufficient'} rather than print a number
+// that looks precise but is actually noise.
+const ESTIMATOR_MIN_BAND_SAMPLES = 3
+
+// medianOf: plain numeric median of an already-non-empty array. Pure/no
+// mutation of the caller's array (sorts a copy). Returns null on empty input
+// so callers never have to special-case it themselves.
+function medianOf(values) {
+  const v = (values || []).slice().sort(function (a, b) { return a - b })
+  const n = v.length
+  if (n === 0) return null
+  const mid = Math.floor(n / 2)
+  return n % 2 === 1 ? v[mid] : (v[mid - 1] + v[mid]) / 2
+}
+
+// buildTrustedPfBands: flattens `history` (an array of parsed runs.jsonl
+// ledger lines, i.e. buildLedgerLine's own output shape) into per-pf-band
+// token samples, keeping ONLY rows that clear every trust gate:
+//   - the row's PARENT RUN has effective_concurrency === 1 (issue #97's
+//     Revised Evaluation i1: recovers the default serialize_globs single-lane
+//     case with exact per-issue attribution — concurrency>1 runs are excluded
+//     wholesale, not row-by-row, since attribution is ambiguous for every row
+//     in that run, not just some).
+//   - the row's PARENT RUN's reconcile_error is finite and <=
+//     ESTIMATOR_MAX_RECONCILE_ERROR (the coarse pathology bar above, not
+//     MAX_RECONCILE_ERROR_FOR_TRUST).
+//   - the row itself has member_count === 1 (issue #97's Revised Plan i2: a
+//     group-unit row carries the union pf + WHOLE-GROUP token total under
+//     task 1's contract — filing that into a singleton pf-band would
+//     over-estimate every future singleton issue in that band).
+//   - the row itself is tracked with a finite token total (buildIssueShapeRows
+//     already sets tokens:null/tracked:false together when untracked, but
+//     both are checked here so the gate reads as self-contained, not
+//     dependent on that invariant holding forever).
+// Returns { [bandKey]: { median, count } } for every band with >=1 trusted
+// sample — NOT necessarily >= ESTIMATOR_MIN_BAND_SAMPLES; estimateIssue()
+// applies that threshold per-lookup so a caller inspecting `bands` directly
+// (e.g. a future oversized-multiple-of-median check) can still see the raw
+// sample count behind a band that estimateIssue() itself would call
+// insufficient.
+function buildTrustedPfBands(history) {
+  const runs = Array.isArray(history) ? history : []
+  const buckets = {}
+  for (const run of runs) {
+    if (!run) continue
+    if (run.effective_concurrency !== 1) continue
+    const re = run.reconcile_error
+    if (!(isFiniteNumber(re) && re <= ESTIMATOR_MAX_RECONCILE_ERROR)) continue
+    const rows = Array.isArray(run.by_issue_shape) ? run.by_issue_shape : []
+    for (const row of rows) {
+      if (!row) continue
+      if (row.member_count !== 1) continue
+      if (!row.tracked) continue
+      if (!isFiniteNumber(row.tokens)) continue
+      const band = pfBandKey(row.pf)
+      if (!buckets[band]) buckets[band] = []
+      buckets[band].push(row.tokens)
+    }
+  }
+  const stats = {}
+  for (const band in buckets) {
+    if (!Object.prototype.hasOwnProperty.call(buckets, band)) continue
+    stats[band] = { median: medianOf(buckets[band]), count: buckets[band].length }
+  }
+  return stats
+}
+
+// estimateIssue: one queried issue/unit's estimate off `bandStats` (band ->
+// {median, count} from buildTrustedPfBands). Band-median-else-null, NEVER a
+// global fallback (an issue with zero same-band history gets null, not some
+// other band's number pretending to be shape-matched). A group unit (members
+// array with >1 entries — each entry itself an {issue, predicted_files}-
+// shaped descriptor, mirroring the units deriveUnits() builds) estimates as
+// the SUM of its own members' individual estimates, each banded on that
+// MEMBER's own predicted_files count — not the group's unioned pf — so a
+// bundle's estimate reflects what its parts actually cost separately. Any
+// null member poisons the sum to null (honest: a partial sum would understate
+// the group and silently defeat a budget guard reading it).
+function estimateIssue(it, bandStats) {
+  const issueNum = it && it.issue
+  const members = Array.isArray(it && it.members) ? it.members : null
+  if (members && members.length > 1) {
+    let sum = 0
+    let anyNull = false
+    for (const m of members) {
+      const est = estimateIssue(m, bandStats)
+      if (est.estimate == null) anyNull = true
+      else sum += est.estimate
+    }
+    return {
+      issue: issueNum,
+      pf_band: null,
+      member_count: members.length,
+      estimate: anyNull ? null : sum,
+      confidence: anyNull ? 'insufficient' : 'estimated',
+    }
+  }
+  const pf = isFiniteNumber(it && it.pf) ? it.pf
+    : (Array.isArray(it && it.predicted_files) ? it.predicted_files.length : 0)
+  const band = pfBandKey(pf)
+  const stats = bandStats[band]
+  const trusted = !!stats && stats.count >= ESTIMATOR_MIN_BAND_SAMPLES
+  return {
+    issue: issueNum,
+    pf_band: band,
+    member_count: 1,
+    estimate: trusted ? stats.median : null,
+    confidence: trusted ? 'estimated' : 'insufficient',
+  }
+}
+
+// estimateCost (issue #97 task 2): the public pure reducer.
+//   history - array of parsed runs.jsonl lines (buildLedgerLine's shape).
+//             Missing/malformed entries degrade cleanly (see
+//             buildTrustedPfBands) rather than throwing.
+//   issues  - array of {issue, predicted_files} descriptors to estimate (a
+//             brand-new issue at dry_run has no history of its own, only its
+//             own preflight-predicted shape), optionally carrying `members`
+//             for a consolidated group (see estimateIssue above).
+// Returns { by_issue: [...], bands: {...} } — `bands` is exposed (not just
+// consumed internally) so a later consumer (task 3's oversized-multiple-of-
+// median check) can read the same trusted-band medians without re-deriving
+// them from `history` a second time.
+function estimateCost(history, issues) {
+  const bandStats = buildTrustedPfBands(history)
+  const list = Array.isArray(issues) ? issues : []
+  const byIssue = list.map(function (it) { return estimateIssue(it, bandStats) })
+  return {
+    by_issue: byIssue,
+    bands: bandStats,
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Oversized-issue flags + batch projection (issue #97 task 3) — feeds the
+// `cost_estimate` block on the dry_run routing-plan preview (state:'dry_run'
+// return, below the split marker). Pure/above the split marker so every arm is
+// directly unit-testable; the dry_run wiring itself is a thin call site.
+// ----------------------------------------------------------------------------
+
+// OVERSIZE_GROUP_MEMBERS: the PRIMARY oversized signal — structural, history-
+// free, so it fires even for a brand-new batch with zero trusted history (the
+// multiple-of-median arm below needs a real estimate; this one never does). A
+// consolidation group this large still runs as ONE worktree/pipeline (shared
+// setup + PR + merge — see deriveUnits()'s module comment), so its token cost
+// is NOT the sum of N independently-bounded issues, it's one unbounded run
+// whose failure modes compound. This is exactly the incident shape the issue's
+// Research phase documented (one bundled issue burning ~15x the per-issue
+// norm). 4 covers "a couple of related issues merged for efficiency" (2-3
+// members, routine) while flagging anything larger as a pre-split candidate.
+const OVERSIZE_GROUP_MEMBERS = 4
+
+// OVERSIZE_PF_CEILING: a SECONDARY, also history-free oversized signal — a raw
+// predicted_files count at or above the top ESTIMATOR_PF_BANDS boundary (the
+// '16+' band starts at 16, see that array above). Deliberately documented as
+// EVADABLE, unlike OVERSIZE_GROUP_MEMBERS above: predicted_files is a
+// best-effort preflight probe that fails open to [] on ANY doubt (see the
+// preflight probe's own module comment) and is capped at 20 paths — an issue
+// whose real footprint the probe simply couldn't resolve reports pf=0 and
+// evades this check entirely. Never load-bearing on its own; always paired
+// with the structural arm above.
+const OVERSIZE_PF_CEILING = 16
+
+// ESTIMATOR_OVERSIZED_MULTIPLE: the UNIT-INVARIANT arm — flags an issue/group
+// whose own estimate is a large multiple of globalHistoricalMedian() (below),
+// regardless of which pf band it falls in, so an outlier in ANY band is judged
+// against the batch's overall typical cost, not just its own band's median
+// (which a singleton estimate always equals exactly, by construction). Unlike
+// the two structural arms above, this one requires real trusted history — null
+// when the estimate itself is null. 3x is deliberately conservative: the
+// incident this issue documents was ~15x the norm, but a pre-split nudge
+// should fire well before spend reaches that scale, not only once it already
+// has.
+const ESTIMATOR_OVERSIZED_MULTIPLE = 3
+
+// globalHistoricalMedian: a single unit-invariant reference cost, derived
+// ONLY from `bands` (estimateCost()'s own return — see its module comment:
+// "so a later consumer (task 3's oversized-multiple-of-median check) can read
+// the same trusted-band medians without re-deriving them from history a
+// second time"). Deliberately the median OF the per-band medians, not a
+// pf-band-specific number, so one reference cost applies uniformly to every
+// issue in the batch. Returns null when no band has any trusted sample.
+function globalHistoricalMedian(bands) {
+  const b = bands || {}
+  const medians = []
+  for (const band in b) {
+    if (!Object.prototype.hasOwnProperty.call(b, band)) continue
+    if (isFiniteNumber(b[band].median)) medians.push(b[band].median)
+  }
+  return medianOf(medians)
+}
+
+// flagOversized: combines all three arms for one queried item. `item` is the
+// ORIGINAL issues[] entry passed to buildCostEstimate (carries the raw
+// `pf`/`member_count` inputs the estimate alone doesn't preserve — estimateIssue()
+// returns pf_band, a string bucket, never the raw pf number); `est` is that
+// same item's estimateCost() by_issue row. The structural arm intentionally
+// reads ONLY item.member_count — a group with predicted_files=[] on every
+// member (pf=0, no pf_ceiling signal at all) must still flag once its member
+// count clears the threshold.
+function flagOversized(item, est, globalMedian) {
+  const it = item || {}
+  const structural = (isFiniteNumber(it.member_count) ? it.member_count : 1) >= OVERSIZE_GROUP_MEMBERS
+  const pfCeiling = isFiniteNumber(it.pf) && it.pf >= OVERSIZE_PF_CEILING
+  const multipleOfMedian = isFiniteNumber(est && est.estimate) && isFiniteNumber(globalMedian) && globalMedian > 0 &&
+    est.estimate >= ESTIMATOR_OVERSIZED_MULTIPLE * globalMedian
+  return {
+    structural: structural,
+    pf_ceiling: pfCeiling,
+    multiple_of_median: multipleOfMedian,
+    any: structural || pfCeiling || multipleOfMedian,
+  }
+}
+
+// buildBatchProjection: the batch-wide rollup. Deliberately NEVER emits a bare
+// summed total when ANY member's estimate is null — a partial sum silently
+// mislabeled as "the batch total" would UNDER-state true spend, defeating the
+// entire point of a pre-run budget signal. Instead it always carries a
+// coverage indicator so a caller can see exactly how much of the batch the
+// number covers, with the SAME confidence semantics per-issue estimates use
+// ('estimated' only on full coverage, else 'insufficient').
+function buildBatchProjection(byIssueEstimates) {
+  const list = Array.isArray(byIssueEstimates) ? byIssueEstimates : []
+  let known = 0
+  let estimableCount = 0
+  for (const e of list) {
+    if (isFiniteNumber(e && e.estimate)) { known += e.estimate; estimableCount++ }
+  }
+  const total = list.length
+  const unknownCount = total - estimableCount
+  const fullCoverage = total > 0 && unknownCount === 0
+  return {
+    total_issues: total,
+    estimable_count: estimableCount,
+    unknown_count: unknownCount,
+    projected_total: fullCoverage ? known : null,
+    confidence: fullCoverage ? 'estimated' : 'insufficient',
+    coverage_note: 'estimable ' + estimableCount + ' of ' + total + ', ' + unknownCount + ' unknown',
+  }
+}
+
+// buildCostEstimate (issue #97 task 3): the public pure entry point the
+// dry_run routing-plan preview (state:'dry_run' return, below the split
+// marker) calls. Wraps estimateCost() with the oversized flags and batch
+// projection above so the wiring below the split marker stays a thin,
+// untestable-but-trivial call site — every real decision lives here, fully
+// unit-testable.
+//   history - see estimateCost's own module comment (parsed runs.jsonl lines,
+//             the HISTORY run arg above).
+//   issues  - array of {issue, pf, member_count, members?} — `pf` is the raw
+//             predicted_files count (own for a singleton, union for a group),
+//             `member_count` the live member count, `members` (only present
+//             when member_count>1) an array of {issue, pf} per-member
+//             descriptors mirroring estimateCost()'s own group contract. See
+//             the dry_run call site for how these are derived from
+//             previewUnits.
+function buildCostEstimate(history, issues) {
+  const list = Array.isArray(issues) ? issues : []
+  const result = estimateCost(history, list)
+  const globalMedian = globalHistoricalMedian(result.bands)
+  const byIssue = result.by_issue.map(function (est, i) {
+    return Object.assign({}, est, { oversized: flagOversized(list[i], est, globalMedian) })
+  })
+  return {
+    by_issue: byIssue,
+    bands: result.bands,
+    batch_projection: buildBatchProjection(byIssue),
+  }
+}
+
+// ----------------------------------------------------------------------------
+// token_budget resolution + per-unit estimate map (issue #97 task 4) — feeds
+// runPool()'s always-on hard-floor/estimate-aware guard (see that function's
+// own budgetCtx module comment). Pure/above the split marker, like the rest of
+// the estimator, so every arm is directly unit-testable; the Select-phase call
+// site (real PROFILE/units/HISTORY) is a thin, untestable-but-trivial wiring
+// point, same posture as buildCostEstimate's own dry_run call site.
+// ----------------------------------------------------------------------------
+
+// parseTokenBudgetSpec: normalizes ONE raw token_budget value (a run arg OR a
+// profile field — both accept the exact same shapes) into {kind, amount} /
+// {kind, multiple}, or null when the value is absent/unusable so callers can
+// fall through to the next source cleanly. Two accepted forms:
+//   - ABSOLUTE OUTPUT-token count: a positive finite number, or a numeric
+//     string ("500000") — budget.spent() (spentTokens()) is OUTPUT tokens only
+//     (see its own module comment), so this ceiling is in the same unit.
+//   - RELATIVE multiple-of-historical-median: a string shaped "<N>x"
+//     (case-insensitive, e.g. "5x") or an object {multiple_of_median: N} — the
+//     unit-INVARIANT form (works regardless of what a "normal" issue costs in
+//     this repo), resolved against globalHistoricalMedian() by the caller
+//     (resolveTokenBudget, below) since that requires `bands`, which this
+//     function deliberately does not take (keeps the parse step trivially
+//     testable without any history fixture).
+function parseTokenBudgetSpec(raw) {
+  if (raw == null) return null
+  if (isFiniteNumber(raw) && raw > 0) return { kind: 'absolute', amount: raw }
+  if (typeof raw === 'string') {
+    const mx = /^\s*(\d+(?:\.\d+)?)\s*x\s*$/i.exec(raw)
+    if (mx) {
+      const mult = Number(mx[1])
+      return isFiniteNumber(mult) && mult > 0 ? { kind: 'multiple', multiple: mult } : null
+    }
+    const n = Number(raw)
+    return isFiniteNumber(n) && n > 0 ? { kind: 'absolute', amount: n } : null
+  }
+  if (typeof raw === 'object' && isFiniteNumber(raw.multiple_of_median) && raw.multiple_of_median > 0) {
+    return { kind: 'multiple', multiple: raw.multiple_of_median }
+  }
+  return null
+}
+
+// resolveTokenBudget (issue #97 task 4): run arg wins over the profile field —
+// same "run arg -> profile field" precedence CONCURRENCY/BROWSER/etc already
+// use — and a relative ("Nx") spec is multiplied by globalHistoricalMedian(bands),
+// the SAME trusted-band medians buildCostEstimate's own multiple_of_median
+// oversized arm reads (see that function's module comment: "so a later
+// consumer ... can read the same trusted-band medians without re-deriving them
+// from history a second time"), so "5x" means "5x THIS batch's own trusted
+// historical per-issue median", not some other reference cost. Degrades to
+// {budget: null, ...} — guard OFF, never a false floor — when: neither source
+// sets a usable value, OR a relative spec is given but no trusted history
+// exists yet to multiply (globalHistoricalMedian returns null on zero trusted
+// bands, matching the estimator's own honest-degrade posture). `degraded`
+// (present only on that second case) is a human-readable line the Select-phase
+// call site logs — never thrown, a mis-set token_budget must not halt the run
+// itself.
+function resolveTokenBudget(runArgValue, profileValue, bands) {
+  const fromArg = parseTokenBudgetSpec(runArgValue)
+  const spec = fromArg || parseTokenBudgetSpec(profileValue)
+  if (!spec) return { budget: null, source: null, spec: null }
+  const source = fromArg ? 'arg' : 'profile'
+  if (spec.kind === 'absolute') return { budget: spec.amount, source: source, spec: spec }
+  const median = globalHistoricalMedian(bands)
+  if (!isFiniteNumber(median) || median <= 0) {
+    return {
+      budget: null, source: source, spec: spec,
+      degraded: 'relative token_budget (' + spec.multiple + 'x) needs trusted historical data; none available yet — guard is off this run',
+    }
+  }
+  return { budget: spec.multiple * median, source: source, spec: spec }
+}
+
+// buildBudgetEstimateMap (issue #97 task 4): the estimate-aware pre-check's
+// history-derived input. Built ONCE at Select from the SAME `history` run arg
+// the skill passes on EVERY invocation — live runs and dry_run alike (see the
+// HISTORY module comment above) — NOT scoped inside the DRY_RUN branch,
+// otherwise the pre-check would be completely dead on a real run (Revised Plan
+// iteration 2, Minor finding). Mirrors the dry_run cost_estimate preview's own
+// unit -> issues[] shaping (task 3's costEstimateUnits/costEstimateIssues call
+// site) but keyed by issue number for O(1) per-unit lookup in drainUnit,
+// instead of an index-aligned array.
+//
+// A unit whose resume_point isn't 'implement' (skip/process_pr) is charged 0,
+// not left unestimated and not charged a full band-median guess — a
+// 'process_pr' unit pays only rework-tax and a 'skip' unit does no real work
+// at all (processIssue's own resume_point==='skip' early return), so a fresh
+// implement-shaped historical estimate would misrepresent what either actually
+// costs, exactly the reasoning the dry_run preview's own resume_point-filter
+// already documents.
+function buildBudgetEstimateMap(history, units) {
+  const list = Array.isArray(units) ? units : []
+  const implementUnits = list.filter(function (u) { return u && u.resume_point === 'implement' })
+  const issues = implementUnits.map(function (u) {
+    const memberCount = Array.isArray(u.members) ? u.members.length : 1
+    const item = { issue: u.issue, pf: (Array.isArray(u.predicted_files) ? u.predicted_files.length : 0), member_count: memberCount }
+    if (memberCount > 1) {
+      item.members = u.members.map(function (m) { return { issue: m.issue, pf: (Array.isArray(m.predicted_files) ? m.predicted_files.length : 0) } })
+    }
+    return item
+  })
+  const estimate = buildCostEstimate(history, issues)
+  const map = {}
+  list.forEach(function (u) { if (u) map[u.issue] = 0 }) // default: non-'implement' units cost ~0 — see module comment
+  estimate.by_issue.forEach(function (est, i) { map[implementUnits[i].issue] = est.estimate })
+  return { estimateByIssue: map, bands: estimate.bands }
 }
 
 // ============================================================================
@@ -5747,6 +6304,42 @@ if (DRY_RUN) {
   // every predicted_files entry (and therefore every heuristic lane here) may
   // be resolved against a stale origin/TARGET, not what a real run would fetch.
   const refPossiblyStale = !targetFetch || targetFetch.status !== 'success'
+  // Cost-estimate preview (issue #97 task 3) — built off the SAME previewUnits
+  // the lane-scheduling preview above already derived, so a unit's shape here
+  // matches the unit a real run would actually drain. Scoped to
+  // resume_point === 'implement' units ONLY (Quality Review, task 3 iteration
+  // 1): a 'skip' unit does no real work at all (processIssue's
+  // resume_point==='skip' early return) and a 'process_pr' unit pays only
+  // rework-tax, not a fresh implement-shaped run — charging either the SAME
+  // full pf-band-median estimate as a genuine implement would inflate
+  // batch_projection.projected_total and could spuriously trip
+  // oversized.multiple_of_median on an already-skipped/healed issue. A unit's
+  // own `.resume_point` is inherited straight from its preflight/primaryRef in
+  // deriveUnits(), so this filter needs no new plumbing. Task 4/5's live-run
+  // pre-check reuses this SAME filtered construction so the estimate map it
+  // builds off of stays unpolluted too. Each surviving unit becomes one
+  // buildCostEstimate() `issues[]` entry: `pf` is the unit's own predicted_files
+  // count (already the union for a group unit — deriveUnits() computes it that
+  // way, see its module comment), `member_count` its live member count, and
+  // `members` (only when >1) each member's OWN predicted_files count — NOT the
+  // union — mirroring estimateCost()'s group contract (each member bands on its
+  // own shape, see estimateIssue()'s module comment).
+  const costEstimateUnits = previewUnits.filter(function (u) { return u.resume_point === 'implement' })
+  const costEstimateIssues = costEstimateUnits.map(function (u) {
+    const memberCount = Array.isArray(u.members) ? u.members.length : 1
+    const item = {
+      issue: u.issue,
+      pf: (Array.isArray(u.predicted_files) ? u.predicted_files.length : 0),
+      member_count: memberCount,
+    }
+    if (memberCount > 1) {
+      item.members = u.members.map(function (m) {
+        return { issue: m.issue, pf: (Array.isArray(m.predicted_files) ? m.predicted_files.length : 0) }
+      })
+    }
+    return item
+  })
+  const costEstimate = buildCostEstimate(HISTORY, costEstimateIssues)
 
   return {
     state: 'dry_run', root: ROOT, repo: REPO, base_branch: BASE,
@@ -5779,6 +6372,19 @@ if (DRY_RUN) {
         ? 'preflight-fetch of origin/' + TARGET + ' failed — predicted_files (and every lane/DF signal above) may be grounded against a stale ref'
         : null,
     },
+    // Cost-estimate preview (issue #97 task 3) — see buildCostEstimate() above
+    // the split marker for the full per-issue/oversized/batch_projection
+    // contract. history_available reports whether the HISTORY run arg carried
+    // any lines at all, distinct from a per-issue 'insufficient' confidence
+    // (which can still happen WITH history if same-shape history is thin) —
+    // both are honest-degrade signals but at different scopes (whole-run vs.
+    // per-issue). Trusted history accrues only from effective_concurrency===1
+    // runs (see buildTrustedPfBands's module comment): a default
+    // concurrency:2 product batch's own history stays dark here indefinitely,
+    // by design — the structural (OVERSIZE_GROUP_MEMBERS) and pf_ceiling arms,
+    // plus the always-on hard budget floor, are what protect that usage
+    // pattern in the absence of a per-issue estimate.
+    cost_estimate: Object.assign({ history_available: HISTORY.length > 0 }, costEstimate),
     note: 'No changes made. Re-run without dry_run to execute.',
   }
 }
@@ -5895,12 +6501,33 @@ if (guard.dissolvedCount) {
 }
 if (lanes.length < units.length) log('lane scheduling: ' + lanes.length + ' lane(s) for ' + units.length + ' unit(s) — effective concurrency ' + Math.min(CONCURRENCY, lanes.length) + '/' + CONCURRENCY)
 
+// ---- Process: token_budget guard (issue #97 task 4) — resolve once, before
+// runPool() drains, off the HISTORY run arg (threaded on EVERY invocation, live
+// runs and dry_run alike — see the HISTORY module comment) and this run's real
+// `units`, so the estimate-aware pre-check has a live map even on a real run
+// (Revised Plan iteration 2, Minor finding: it would otherwise only ever fire
+// inside the dry_run preview). run arg -> profile field precedence, matching
+// every other run-arg/profile-fallback field above.
+const budgetEstimate = buildBudgetEstimateMap(HISTORY, units)
+const tokenBudgetResolved = resolveTokenBudget(A.token_budget, PROFILE && PROFILE.token_budget, budgetEstimate.bands)
+if (tokenBudgetResolved.degraded) log('token_budget: ' + tokenBudgetResolved.degraded)
+if (isFiniteNumber(tokenBudgetResolved.budget)) {
+  log('token_budget: guard armed at ' + tokenBudgetResolved.budget + ' OUTPUT tokens (source: ' + tokenBudgetResolved.source +
+    (tokenBudgetResolved.spec && tokenBudgetResolved.spec.kind === 'multiple' ? ', ' + tokenBudgetResolved.spec.multiple + 'x historical median' : '') + ')')
+}
+const TOKEN_BUDGET_CTX = { budget: tokenBudgetResolved.budget, estimateByIssue: budgetEstimate.estimateByIssue }
+
 // ---- Process: per-issue pipeline with issue-level concurrency + breakers ----
-const results = await runPool(units, CONCURRENCY, processIssue, lanes)
+const results = await runPool(units, CONCURRENCY, processIssue, lanes, TOKEN_BUDGET_CTX)
 
 const counts = {}
 for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1
-const state = STOP.tripped ? 'circuit_breaker'
+// state (issue #97 task 4): 'budget_halt' is distinct from 'circuit_breaker' —
+// STOP.kind === 'budget' ONLY when the proactive token_budget guard tripped
+// (see the STOP.kind module comment); every other STOP reason (BATCH.failures,
+// consecutive agent deaths, a real budget-exhaustion error message) still
+// reports 'circuit_breaker', unchanged.
+const state = STOP.tripped ? (STOP.kind === 'budget' ? 'budget_halt' : 'circuit_breaker')
   : (results.some(function (r) { return r.status !== 'completed' && r.status !== 'skipped' }) ? 'completed_with_errors' : 'completed')
 log('Batch done: ' + JSON.stringify(counts) + ' state=' + state + (STOP.tripped ? ' (' + STOP.reason + ')' : ''))
 
@@ -6131,10 +6758,11 @@ if (shippedIssues.length) {
 // agent only renders the human .md, so the record bytes never pass through a model.
 const runRecord = buildRunRecord({
   runTag: RUN_TAG, state: state, baseBranch: BASE, batchBranch: TARGET, batchPr: batchPr,
+  effectiveConcurrency: Math.min(CONCURRENCY, lanes.length),
   stop: STOP, counts: counts, verificationGaps: VERIFY_SKIPS, tokensSpent: spentTokens(),
   tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, frictionChurnAgg: FRICTION_CHURN_AGG,
   reworkTaxAgg: REWORK_TAX_AGG, gateYieldAgg: GATE_YIELD_AGG,
-  consolidationGroups: finalGroups, results: results,
+  consolidationGroups: finalGroups, results: results, units: units,
 })
 const resultsJson = JSON.stringify(runRecord, null, 2)
 const report = await agent([
@@ -6264,6 +6892,15 @@ return {
   summary_table: report ? report.markdown_summary : null,
   lane_prediction_accuracy: retro ? (retro.lane_prediction_accuracy || null) : null,
   stopped: STOP.tripped ? STOP.reason : null,
+  // resume_hint (issue #97 task 4): a budget_halt gets its OWN hint, distinct
+  // from the reactive death-signature breaker's hint below — a proactive
+  // pre-spend stop is not "an agent kept dying", it needs a token_budget-
+  // specific nudge (raise the budget, or resume with the same/a smaller batch)
+  // rather than the generic "usage limit or API outage, try again later" framing.
   resume_hint: state === 'completed' ? null :
-    'Re-run ticketmill with the same args PLUS batch_branch: "' + TARGET + '" (so healing lands on the same integration branch) — the Select-phase preflight skips merged/closed issues, routes open PRs straight to review/merge, and continues partial branches. For exact journal replay use Workflow({scriptPath, resumeFromRunId}).',
+    (state === 'budget_halt'
+      ? 'token_budget reached before the batch finished (' + STOP.reason + '). Re-run ticketmill with the same args PLUS ' +
+        'batch_branch: "' + TARGET + '" to continue — the Select-phase preflight skips merged/closed issues and continues ' +
+        'partial branches — after raising token_budget or splitting the remaining issues into a smaller batch.'
+      : 'Re-run ticketmill with the same args PLUS batch_branch: "' + TARGET + '" (so healing lands on the same integration branch) — the Select-phase preflight skips merged/closed issues, routes open PRs straight to review/merge, and continues partial branches. For exact journal replay use Workflow({scriptPath, resumeFromRunId}).'),
 }

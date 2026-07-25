@@ -731,6 +731,80 @@ stays semantic instead. `recordAgentDeath()`'s existing three-consecutive-
 death circuit breaker is the backstop for any true exhaustion the tightened
 match still misses.
 
+### Cost estimator and token_budget guard: stopping before the ceiling, not after
+
+Everything above stops a run only once something has already gone wrong: the
+circuit breaker after three failures, the consecutive-death counter after
+three dead agents, the budget-exhaustion match after a real exhaustion error.
+Issue #97 adds a second, proactive layer that estimates a run's spend before
+it starts and can halt it before the account ceiling is ever reached.
+
+**The ledger gains a shape row.** `buildIssueShapeRows()` joins each result
+against its scheduling unit and its `tokenAgg.by_issue` entry into a compact
+`{issue, pf, tokens, tracked, member_count}` record, one per unit. A group
+unit's `pf` is already the union across members (`deriveUnits`' own
+contract), and its `tokens` is the whole group's total, never the primary
+issue's share alone. `buildRunRecord` carries these rows as `by_issue_shape`,
+plus `effective_concurrency` (`min(CONCURRENCY, lanes.length)`, the same
+number the lane-scheduling preview already logs), and `buildLedgerLine`
+copies both onto the `runs.jsonl` line verbatim. `schema_version` moves 1 ->
+2 for the addition. This is the estimator's only input: an issue's shape,
+and whether the run it happened in was single-lane enough to trust.
+
+**`estimateCost` medians over trusted rows only.** `buildTrustedPfBands()`
+keeps a `by_issue_shape` row only when its parent run has
+`effective_concurrency === 1` (attribution is only exact at that
+concurrency, see "Token tracking" above), `member_count === 1` (a group's
+whole-group total would inflate a singleton's band), and a `reconcile_error`
+at or under 0.5. That bar is deliberately coarser than the 0.05 one
+`computeReworkTax` uses to trust a run's own numbers: a clean single-lane
+run still leaves roughly a quarter of its spend as orchestration overhead
+that no per-issue row claims, the same shape `aggregateTokens` already
+documents, so the strict bar would starve the estimator down to almost no
+history at all. Rows are bucketed by predicted-files band (`0`, `1`, `2-3`,
+`4-7`, `8-15`, `16+`), and a band only reports a median once it holds 3 or
+more samples. Below that it degrades to `{estimate: null, confidence:
+'insufficient'}` rather than print a number built from one or two data
+points. A group's estimate is the sum of its members' own individual
+estimates, each banded on its own shape. Any unknown member poisons the sum
+to null instead of quietly understating it.
+
+**The dry_run preview surfaces the estimate before a run is even launched.**
+`buildCostEstimate()` wraps the estimator with three independent oversized
+flags and a batch projection. `structural` fires on a 4+ member
+consolidation group and needs no history at all. `pf_ceiling` fires on a
+predicted-files count at the top band, also history-free, but is evadable:
+the predicted-files probe fails open to `[]` on any doubt, so an
+under-predicted issue simply won't trip it. `multiple_of_median` fires when
+an estimate is 3x or more of the batch's own historical median, and needs
+trusted history to fire at all. The batch projection never reports a bare
+`projected_total` when any issue's estimate is null. It carries a
+`coverage_note` ("estimable K of N, M unknown") instead, so the preview
+never reads more confident than the data underneath it.
+
+**The `token_budget` guard runs underneath every real run, always on.**
+`resolveTokenBudget()` accepts an absolute OUTPUT-token ceiling or a
+relative `"Nx"` multiple of the batch's own historical median, run arg
+winning over `profile.token_budget`. A relative spec with no trusted history
+to multiply degrades to "guard off" rather than a false floor. Two checks
+layer inside `drainUnit`, ahead of the existing `STOP.tripped` check: a hard
+floor (`spentTokens() >= budget`) that needs no estimate at all, and an
+estimate-aware pre-check layered on top of it (`spent + estimateByIssue[issue]
+> budget`) that only fires when that unit carries a real number. `STOP`
+gained a `kind` field so this proactive trip stays distinct from every
+reactive breaker above: `state` reports `budget_halt`, not
+`circuit_breaker`, and carries its own `resume_hint` (raise the budget or
+split the remaining issues, then resume with `batch_branch`) instead of the
+generic "an agent kept dying" framing the reactive breakers use.
+
+**The sandbox has no filesystem, so the skill does the reading.**
+`skills/mill/SKILL.md` reads `runs.jsonl`, parses each line, and passes the
+array as `history` on every `Workflow()` call, dry_run and a live run alike,
+because the estimator and the pre-check are both pure functions over that
+array, not a file read. Skipping this step on a live run leaves the
+estimate-aware pre-check permanently dark. The hard floor still runs either
+way, since it needs no history to work.
+
 ### Claims interop
 
 Ticketmill honors fresh claims left by its ancestor engine ("## Batch Processing
@@ -915,6 +989,10 @@ lanes on `depends_on` and predicted-file overlap alone.
   carrying resume instructions; the claim is released.
 - Three issue failures, or three consecutive agent deaths -> circuit breaker:
   remaining issues are marked `not_started`, the report carries a resume plan.
+- `token_budget` reached or projected to be exceeded -> `budget_halt`, a state
+  distinct from `circuit_breaker`: the run stopped on purpose, before starting
+  an issue, not because an agent failed. Its own `resume_hint` names raising
+  the budget or splitting the remaining issues as the next step.
 - Quality loop degrades (non-fatal) but 3 degrades in a rolling window of 5 halt
   the issue: that rate signals a systemic problem, not flakiness.
 - Reviewer death at the PR gate -> `needs_human`, PR left open; reviewer death at

@@ -76,6 +76,7 @@ it from your request; these are the knobs it can turn:
 | `dry_run` | Read-only preview: probes every issue and reports the routing plan |
 | `run_label` (alias `date`) | Tag for claims and report filenames. Pass today's date so reports don't collide |
 | `batch_branch` | Resume a prior run by reusing its `Batch_<timestamp>` branch |
+| `token_budget` | Halt the run BEFORE it overspends: an absolute OUTPUT-token count, or a relative `"Nx"` / `{multiple_of_median}` form. Run arg wins over the profile field of the same name — see the `mill` skill's `token_budget` section |
 | `root`, `repo` | Auto-discovered from git and gh; pass explicitly if the bootstrap probe fails |
 
 `concurrency` is parallelism across issues within one run: each pipeline gets
