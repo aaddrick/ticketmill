@@ -783,37 +783,36 @@ const OUTCOMES_SCHEMA = {
   },
 }
 // REVISIT_RISK_SCHEMA (issue #93): the read-only Select-phase revisit-risk
-// probe's raw-observation payload. Same PIN as OUTCOMES_SCHEMA just above: the
-// agent returns raw, issue-attributed regression events ONLY — it never
-// decides a flag itself. That decision is computeRevisitRisk's job (the
-// deterministic pure core placed above the TICKETMILL-TEST-HARNESS-SPLIT
-// marker), which does the normalized-path intersection against each
-// preflight's predicted_files.
+// probe's raw-observation payload. Same PIN as OUTCOMES_SCHEMA just above, and
+// the same fix (quality-fix iteration 1, code review verdict changes_requested)
+// that closed OUTCOMES_SCHEMA's own equivalent gap: the agent's in-prompt
+// last-line-wins parse of outcomes.jsonl (steps 1a-1c below) is TARGET
+// SELECTION ONLY — deciding which keys are worth spending a live `gh` call on
+// to resolve `files`. It is NOT what gets trusted as the flag decision. The
+// RETURNED events[] therefore carries only `files` (the genuinely
+// judgment-requiring live-gh resolution) keyed by {issue, batch_pr} — no
+// `grade`/`decided_at`/`merged_at`. `prior_ledger_lines` carries the RAW,
+// UNPARSED outcomes.jsonl lines (mirrors OUTCOMES_SCHEMA.prior_ledger_lines
+// verbatim), and `deriveNegativeOutcomeEvents` (above the
+// TICKETMILL-TEST-HARNESS-SPLIT marker, beside computeRevisitRisk) is the ONLY
+// place that re-derives last-line-wins + the OUTCOME_NEGATIVE_GRADES filter
+// from that raw text — the same JSON.parse-drop-bad-lines + outcomeLineKey
+// grouping diffOutcomeGrades already uses. computeRevisitRisk itself still
+// does the normalized-path intersection against each preflight's
+// predicted_files, unchanged.
 const REVISIT_RISK_SCHEMA = {
-  type: 'object', required: ['events', 'refix_chains', 'now'],
+  type: 'object', required: ['events', 'prior_ledger_lines', 'refix_chains', 'now'],
   properties: {
-    // events: a flat list of issue-attributed negative-outcome events (grade
-    // mirrors OUTCOME_NEGATIVE_GRADES: reverted/reopened/hotfix) the probe found
-    // by reading outcomes.jsonl (last-line-wins per {run_tag,batch_pr,issue}),
-    // one entry per graded target whose current grade is negative.
+    // events: `files` resolved per surviving candidate key — nothing else.
+    // The candidate's grade/decided_at/merged_at are re-derived from
+    // prior_ledger_lines (see module comment above), never trusted from here.
     events: {
       type: 'array',
       items: {
-        type: 'object', required: ['issue', 'grade', 'files'],
+        type: 'object', required: ['issue', 'batch_pr', 'files'],
         properties: {
           issue: { type: 'integer' },
           batch_pr: { type: ['integer', 'null'] },
-          grade: { enum: ['reverted', 'reopened', 'hotfix'] },
-          // decided_at: the outcome ledger line's own decided_at (when THIS
-          // negative grade was decided/observed) — the PRIMARY recency anchor.
-          // merged_at (the batch PR's original merge time, from the ledger's
-          // signals.merged_at) is the FALLBACK, used only when decided_at is
-          // missing (e.g. an older ledger line predating this field). See
-          // computeRevisitRisk's module comment for why decided_at
-          // (observation time), not merged_at (event time), is the deliberate
-          // recency-anchor polarity (approach-challenge caveat 2).
-          decided_at: { type: ['string', 'null'] },
-          merged_at: { type: ['string', 'null'] },
           // files: the issue-attributed regression locus. hotfix resolves this
           // via `gh pr view <signals.hotfix_pr> --json files`; reverted via a
           // best-effort live revert-commit diff (else []); reopened is always
@@ -824,11 +823,22 @@ const REVISIT_RISK_SCHEMA = {
         },
       },
     },
+    // prior_ledger_lines: the RAW text lines of outcomes.jsonl, verbatim and
+    // UNPARSED — same contract as OUTCOMES_SCHEMA.prior_ledger_lines just
+    // above. deriveNegativeOutcomeEvents JSON.parses each line itself post-hoc.
+    prior_ledger_lines: { type: 'array', items: { type: 'string' } },
     // refix_chains: issue #89's within-issue re-fix chains (computeChurn),
     // read straight off runs/<tag>.json's friction_churn.churn.refix_chains —
     // corroboration-only. computeRevisitRisk never lets these independently
     // flag a file; they only annotate a file that already flagged from a real
-    // events[] overlap.
+    // events[] overlap. Reviewed alongside the events[]/prior_ledger_lines fix
+    // above (quality-fix iteration 1): unlike a grade (a judgment call over
+    // possibly-conflicting ledger lines), this is a mechanical verbatim copy of
+    // an already-computed {issue, file, count} entry at a known JSON path — no
+    // decision is made, same category as OUTCOMES_SCHEMA's own target-discovery
+    // step reading a run record's results[] entries directly (outcomeGradePromise
+    // step 1b) — so it is deliberately left as direct extraction rather than a
+    // raw-file-content pass-through.
     refix_chains: {
       type: 'array',
       items: {
@@ -5954,10 +5964,15 @@ function summarizeOutcomeCoverage(observations, lines, sampleCapHit) {
 // gradeFromObservation's raw-observation-in/deterministic-decision-out shape
 // per #92's PIN (the Select-phase revisit probe returns raw events only; this
 // pure function is the only place that decides a flag). Takes `preflights`
-// (each carrying predicted_files, PREFLIGHT_SCHEMA), `observations`
-// (REVISIT_RISK_SCHEMA's raw payload: events[] + refix_chains[] + now), and
-// `cfg` (defaults to REVISIT_RISK; pass an explicit object to override
-// window_days in tests). Returns a NEW array (mirrors
+// (each carrying predicted_files, PREFLIGHT_SCHEMA), `observations` (an
+// {events, refix_chains, now} object — `events` here is NOT the probe's raw
+// REVISIT_RISK_SCHEMA.events[] directly; the caller builds it by running
+// deriveNegativeOutcomeEvents over prior_ledger_lines and merging the probe's
+// `files` on top via attachRevisitFiles, see the Select-phase post-hoc call
+// site below — so by the time it reaches here, grade/decided_at/merged_at are
+// already JS-derived and authoritative, never agent-supplied), and `cfg`
+// (defaults to REVISIT_RISK; pass an explicit object to override window_days
+// in tests). Returns a NEW array (mirrors
 // attachEngineOwnedIntentional's non-mutating shape) — every preflight comes
 // back with a `revisit_risk = { flagged, reasons }` field attached;
 // `{ flagged: false, reasons: [] }` is the clean no-op shape acceptance
@@ -6031,6 +6046,66 @@ function computeRevisitRisk(preflights, observations, cfg) {
       }
     }
     return Object.assign({}, p, { revisit_risk: { flagged: flagged, reasons: reasons } })
+  })
+}
+
+// deriveNegativeOutcomeEvents (issue #93 quality-fix, iteration 1 — code review
+// verdict changes_requested): the deterministic last-line-wins +
+// OUTCOME_NEGATIVE_GRADES filter over outcomes.jsonl's RAW, unparsed lines
+// (REVISIT_RISK_SCHEMA.prior_ledger_lines) — this is the ONLY place that
+// decides which {run_tag,batch_pr,issue} keys are "negative right now". It
+// mirrors diffOutcomeGrades' own last-line-wins grouping (same outcomeLineKey,
+// same JSON.parse-drop-bad-lines-rather-than-abort tolerance) but reads the
+// OTHER direction: instead of skipping already-terminal keys, it keeps only
+// keys whose current grade is a member of OUTCOME_NEGATIVE_GRADES.
+//
+// Why this exists: the revisit-risk probe's own in-prompt parse of
+// outcomes.jsonl (REVISIT_RISK_SCHEMA's module comment, steps 1a-1c) is
+// target-selection scaffolding ONLY — it decides which keys are worth a live
+// gh call to resolve `files` for for. Before this fix, the agent's own
+// last-line-wins/grade judgment was what got returned and trusted, the exact
+// PIN violation #92's OUTCOMES_SCHEMA was built to avoid. This function is
+// what closes that gap: computeRevisitRisk's `events` input is now built
+// EXCLUSIVELY from this function's output (grade/decided_at/merged_at) plus
+// the agent's raw `files` resolution merged on by the caller — never from the
+// agent's own per-event grade.
+function deriveNegativeOutcomeEvents(priorLedgerLines) {
+  const lines = (Array.isArray(priorLedgerLines) ? priorLedgerLines : [])
+    .map(function (line) { try { return JSON.parse(line) } catch (e) { return null } })
+    .filter(Boolean)
+  const lastByKey = new Map()
+  for (const line of lines) lastByKey.set(outcomeLineKey(line), line) // append-only ledger: later lines win
+  const out = []
+  for (const line of lastByKey.values()) {
+    if (OUTCOME_NEGATIVE_GRADES.indexOf(line.grade) === -1) continue
+    out.push({
+      issue: line.issue,
+      batch_pr: line.batch_pr != null ? line.batch_pr : null,
+      grade: line.grade,
+      decided_at: line.decided_at != null ? line.decided_at : null,
+      merged_at: (line.signals && line.signals.merged_at != null) ? line.signals.merged_at : null,
+    })
+  }
+  return out
+}
+
+// attachRevisitFiles (issue #93 quality-fix, iteration 1): merges the agent's
+// raw `files` resolution (REVISIT_RISK_SCHEMA.events[], keyed by {issue,
+// batch_pr} — the only judgment-requiring part of the probe, a live gh read)
+// onto deriveNegativeOutcomeEvents' JS-derived, authoritative negative-event
+// set. A negative ledger key the agent never resolved files for (out of its
+// own target-selection window, a failed gh call, or a dead/failed probe
+// entirely) still comes through with files:[] — fail open, never fabricate,
+// same ethos as the probe's own per-field fallbacks.
+function attachRevisitFiles(negativeEvents, agentEvents) {
+  const filesByKey = new Map()
+  for (const e of (Array.isArray(agentEvents) ? agentEvents : [])) {
+    if (!e) continue
+    filesByKey.set(String(e.issue) + '::' + String(e.batch_pr != null ? e.batch_pr : null), Array.isArray(e.files) ? e.files : [])
+  }
+  return (negativeEvents || []).map(function (e) {
+    const key = String(e.issue) + '::' + String(e.batch_pr != null ? e.batch_pr : null)
+    return Object.assign({}, e, { files: filesByKey.has(key) ? filesByKey.get(key) : [] })
   })
 }
 
@@ -6302,12 +6377,15 @@ const outcomeGradePromise = agent([
 // — same STAGE_TOKENS.preflight R1 bracket (see the comment above learnPromise).
 // STRICTLY READ-ONLY: cat outcomes.jsonl/runs.jsonl/runs/<tag>.json under LOGS,
 // `gh pr view`/`gh search commits`/`gh pr list`/`gh api` — no git fetch, no local
-// writes, no repo mutations of any kind. Same PIN as outcomeGradePromise: this
-// agent returns raw, issue-attributed negative-outcome events + refix_chains
-// only — it NEVER decides a flag itself. computeRevisitRisk (the deterministic
-// pure core above the TICKETMILL-TEST-HARNESS-SPLIT marker) is the only place
-// that turns these into a revisit_risk flag, post-hoc, just after outcomeGradeR
-// below.
+// writes, no repo mutations of any kind. Same PIN as outcomeGradePromise, and
+// (quality-fix iteration 1) the same shape: step 1's own last-line-wins parse of
+// outcomes.jsonl is TARGET SELECTION ONLY, to decide which keys are worth a live
+// gh call — the agent never decides a flag, and (as of this fix) never even
+// returns a grade. It returns raw prior_ledger_lines (verbatim, unparsed) plus
+// `files` per resolved candidate; deriveNegativeOutcomeEvents and
+// computeRevisitRisk (the deterministic pure core above the
+// TICKETMILL-TEST-HARNESS-SPLIT marker) are the only places that turn these into
+// a revisit_risk flag, post-hoc, just after outcomeGradeR below.
 const revisitRiskPromise = agent([
   'READ-ONLY revisit-risk pass over ' + REPO + '\'s ticketmill run history under ' + LOGS + '.',
   'NO repo mutations of any kind: no git fetch, no local file writes, no gh command that changes state —',
@@ -6316,16 +6394,19 @@ const revisitRiskPromise = agent([
   '0. now: run `date -u +%Y-%m-%dT%H:%M:%SZ` and return it verbatim as `now`.',
   '',
   '1. Negative-outcome events — issue-attributed regression loci:',
-  '   a. cat ' + LOGS + '/outcomes.jsonl (if missing/empty: events = [] — skip straight to step 2, there is no history',
-  '      yet). Each line is one compact JSON object {run_tag, batch_pr, issue, grade, signals, decided_at}',
-  '      (schema_version 1). Group lines by {run_tag, batch_pr, issue} and, per key, keep ONLY the LAST line (the',
-  '      ledger is append-only; later lines override earlier ones for the same key).',
-  '   b. Keep only keys whose current (last-line-wins) grade is one of reverted / reopened / hotfix. Drop every other',
-  '      grade (pending/clean/closed_unmerged/abandoned are not evidence of a regression).',
+  '   a. cat ' + LOGS + '/outcomes.jsonl (if missing/empty: events = [], prior_ledger_lines = [] — skip straight to',
+  '      step 2, there is no history yet). Return its raw lines VERBATIM, one array entry per line, as',
+  '      prior_ledger_lines — do not parse, reshape, or interpret them for the RETURNED array; the caller does that.',
+  '   b. For TARGET SELECTION only (deciding which keys are worth a live gh call below — NOT for what you return),',
+  '      parse each line yourself: {run_tag, batch_pr, issue, grade, signals, decided_at} (schema_version 1). Group',
+  '      by {run_tag, batch_pr, issue} and, per key, keep ONLY the LAST line (the ledger is append-only; later lines',
+  '      override earlier ones for the same key). Keep only keys whose current (last-line-wins) grade is one of',
+  '      reverted / reopened / hotfix (pending/clean/closed_unmerged/abandoned are not evidence of a regression).',
   '   c. Drop any survivor whose age is already outside the ' + REVISIT_RISK.window_days + '-day window: age in whole',
   '      days from its own decided_at field (fall back to signals.merged_at ONLY if decided_at is missing) to `now`',
   '      from step 0. This is a target-selection optimization only, to keep this pass\'s gh-call budget cheap — if in',
-  '      doubt, keep the survivor; the engine deterministically re-checks the real window itself afterward.',
+  '      doubt, keep the survivor; the engine deterministically re-checks the real window itself afterward from',
+  '      prior_ledger_lines, independent of this selection.',
   '   d. For each surviving key, resolve `files` (the regression locus) by grade — fail open to [] on ANY doubt, never',
   '      fabricate a path:',
   '      - hotfix: gh pr view <signals.hotfix_pr> --repo ' + REPO + ' --json files,mergedAt. files = the returned',
@@ -6337,8 +6418,8 @@ const revisitRiskPromise = agent([
   '        if the revert itself was a PR, gh pr view <that PR> --json files). If no revert commit/PR is clearly',
   '        identifiable, or any command fails, files = [].',
   '      - reopened: files = [] always (no recoverable regression locus without a squashed diff to compare).',
-  '   e. Return one entry per surviving key: {issue, batch_pr, grade, decided_at, merged_at (from signals.merged_at,',
-  '      else null), files}.',
+  '   e. Return one entry per surviving key: {issue, batch_pr, files} — grade/decided_at/merged_at are NOT part of',
+  '      the returned entry; the caller re-derives those itself from prior_ledger_lines (step a).',
   '',
   '2. refix_chains (issue #89 within-issue re-fix chains — corroboration-only, never resolve files/gh calls for these):',
   '   a. cat ' + LOGS + '/runs.jsonl (if missing/empty: refix_chains = []). For each DISTINCT run_tag on those lines,',
@@ -6347,8 +6428,8 @@ const revisitRiskPromise = agent([
   '   b. From each record\'s friction_churn.churn.refix_chains array (if present), collect every {issue, file, count}',
   '      entry verbatim (drop its bucket field — not needed here).',
   '',
-  'Return events (array, from step 1e — even if empty), refix_chains (array, from step 2b — even if empty), and now',
-  '(from step 0).',
+  'Return events (array, from step 1e — even if empty), prior_ledger_lines (array, from step 1a — even if empty),',
+  'refix_chains (array, from step 2b — even if empty), and now (from step 0).',
 ].join('\n'), { label: 'revisit-risk', phase: 'Select', schema: REVISIT_RISK_SCHEMA, model: M.probe.model, effort: M.probe.effort })
   .catch(function (e) { log('revisit-risk pass failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
 
@@ -6501,19 +6582,36 @@ if (outcomeGradeR) {
 }
 
 // ---- Select: revisit-risk post-hoc (issue #93) — turn revisitRiskR's raw,
-// judgment-free events into a flag decision using the deterministic pure core
-// above the TICKETMILL-TEST-HARNESS-SPLIT marker (computeRevisitRisk). The agent
-// never decides a flag itself — only this JS does. Runs unconditionally (not
-// gated on `if (revisitRiskR)` like the outcome-grading block above) because
-// computeRevisitRisk's own observations-defaulting (`obs = observations || {}`,
-// `events`/`refix_chains` each defaulting to []) is what normalizes a dead/failed
-// probe to the clean, non-flagging { flagged: false, reasons: [] } shape
+// judgment-free payload into a flag decision using the deterministic pure core
+// above the TICKETMILL-TEST-HARNESS-SPLIT marker. The agent never decides a
+// flag itself, and (quality-fix iteration 1: code review verdict
+// changes_requested — the agent's own events[].grade was being trusted
+// verbatim, the exact PIN violation #92's OUTCOMES_SCHEMA was built to avoid)
+// as of this fix it never even returns a grade: deriveNegativeOutcomeEvents
+// re-derives the authoritative negative-event set (grade/decided_at/merged_at)
+// from revisitRiskR.prior_ledger_lines (raw, unparsed outcomes.jsonl lines —
+// same JSON.parse-drop-bad-lines + outcomeLineKey grouping diffOutcomeGrades
+// uses above), and attachRevisitFiles merges on ONLY `files` (the genuinely
+// judgment-requiring live-gh resolution) from the agent's raw events[],
+// matched by {issue, batch_pr}. computeRevisitRisk then does the
+// window/normalized-path matching, unchanged. Runs unconditionally (not gated
+// on `if (revisitRiskR)` like the outcome-grading block above) because every
+// helper in this chain defaults empty/null input to [] — a dead/failed probe
+// normalizes to the clean, non-flagging { flagged: false, reasons: [] } shape
 // acceptance criterion 2 requires — every preflight gets a revisit_risk field
 // either way, never a missing one.
-preflights = computeRevisitRisk(preflights, revisitRiskR || {}, REVISIT_RISK)
+const revisitNegativeEvents = attachRevisitFiles(
+  deriveNegativeOutcomeEvents(revisitRiskR && revisitRiskR.prior_ledger_lines),
+  revisitRiskR && revisitRiskR.events
+)
+preflights = computeRevisitRisk(preflights, {
+  events: revisitNegativeEvents,
+  refix_chains: (revisitRiskR && revisitRiskR.refix_chains) || [],
+  now: revisitRiskR && revisitRiskR.now,
+}, REVISIT_RISK)
 if (revisitRiskR) {
   const revisitFlaggedCount = preflights.filter(function (p) { return p.revisit_risk && p.revisit_risk.flagged }).length
-  log('revisit risk: ' + (Array.isArray(revisitRiskR.events) ? revisitRiskR.events.length : 0) + ' negative-outcome event(s) observed, ' +
+  log('revisit risk: ' + revisitNegativeEvents.length + ' negative-outcome event(s) observed, ' +
     revisitFlaggedCount + ' preflight(s) flagged')
 } else {
   log('revisit-risk pass failed or returned nothing (non-fatal) — no revisit_risk flags this run')
