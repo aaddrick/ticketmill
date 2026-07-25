@@ -1548,6 +1548,7 @@ async function stage(ctx, key, prompt, opts, schema, tries) {
         ctx.tokens.total += delta
         const model = opts && opts.model
         if (model) ctx.tokens.byModel[model] = (ctx.tokens.byModel[model] || 0) + delta
+        if (ctx.tokens.byStage) ctx.tokens.byStage[key] = (ctx.tokens.byStage[key] || 0) + delta
         ctx.tokens.tracked = true
       }
     } catch (e) {
@@ -4168,6 +4169,15 @@ async function reviewAndMerge(ctx) {
     const code = reviews[1]
     if (!spec || !code) return fail(ctx, 'needs_human', 'pr-review', 'a PR reviewer died — PR #' + ctx.pr + ' left open for human review')
 
+    // gate_findings tally (issue #91): one call per PR-review iteration, mirroring
+    // the approach/plan gates recorded above — this is the only gate #87 left
+    // unwired, so an "escaped defect" (finding absent at approach/plan, present
+    // here) was previously undetectable. 'accepted' means at least one reviewer
+    // requested changes (the findings drove a fix); 'approved' means the gate
+    // passed clean this iteration.
+    const prReviewDisposition = (spec.result === 'changes_requested' || code.result === 'changes_requested') ? 'accepted' : 'approved'
+    recordGateOutcome(ctx, 'pr-review', (spec.issues || []).concat(code.issues || []), prReviewDisposition)
+
     if (spec.result === 'approved' && code.result === 'approved') { approved = true; break }
     if (iter === MAX_PR_REVIEW_ITERATIONS) break
 
@@ -4320,7 +4330,7 @@ async function processIssue(pre) {
     // threaded value.
     engineOwnedIntentional: !!pre.engineOwnedIntentional,
     metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0 },
-    tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
+    tokens: { total: 0, byModel: {}, byStage: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
     // Retained-changed-files / friction signals (issue #87). null (not []) means
     // "never captured" — probeChangedFiles() sets these once, unconditionally,
     // from reviewAndMerge() right before the merge stage; a dead/degraded probe

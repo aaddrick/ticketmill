@@ -67,7 +67,7 @@ function freshMetrics() {
 // when `ctx && ctx.tokens` is truthy, so any fixture ctx omitting this field
 // silently no-ops through that instrumentation instead of exercising it.
 function freshTokens() {
-  return { total: 0, byModel: {}, tracked: false }
+  return { total: 0, byModel: {}, byStage: {}, tracked: false }
 }
 
 /** Read workflows/ticketmill.js as text (never executed directly). */
