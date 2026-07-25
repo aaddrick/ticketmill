@@ -1191,6 +1191,25 @@ function unionField(memberRefs, field) {
 // THIS group — that dependency is already satisfied by the merge (both issues land
 // in the same unit), so keeping it would dangle a lane edge onto an issue number
 // that no longer exists as its own unit once grouped.
+//
+// revisit_risk (issue #93): OR-folded across a group's live memberRefs exactly
+// like engineOwnedIntentional above and for the same reason — a member whose
+// OWN revisit_risk is flagged must not go invisible just because pickPrimary
+// chose a different (unflagged) member as primary. reasons are concatenated
+// (not deduped: each reason already names the specific file/issue/grade it
+// came from, so two members flagging on genuinely different evidence should
+// both surface). A singleton unit needs no fold: Object.assign({}, p, {...})
+// below already spreads p's OWN revisit_risk through untouched.
+function unionRevisitRisk(memberRefs) {
+  let flagged = false
+  const reasons = []
+  for (const m of memberRefs) {
+    const rr = m && m.revisit_risk
+    if (rr && rr.flagged) flagged = true
+    if (rr && Array.isArray(rr.reasons)) reasons.push.apply(reasons, rr.reasons)
+  }
+  return { flagged: flagged, reasons: reasons }
+}
 function deriveUnits(reconciledMap, livePreflights) {
   const byIssue = {}
   for (const p of livePreflights || []) byIssue[p.issue] = p
@@ -1206,7 +1225,8 @@ function deriveUnits(reconciledMap, livePreflights) {
     memberRefs.forEach(function (m) { memberIssueSet[m.issue] = true })
     const predictedFiles = unionField(memberRefs, 'predicted_files')
     const dependsOn = unionField(memberRefs, 'depends_on').filter(function (n) { return !memberIssueSet[n] })
-    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale, engineOwnedIntentional: engineOwnedIntentional, predicted_files: predictedFiles, depends_on: dependsOn }))
+    const revisitRisk = unionRevisitRisk(memberRefs)
+    units.push(Object.assign({}, primaryRef, { members: memberRefs, groupId: g.groupId, subsystem: g.subsystem, rationale: g.rationale, engineOwnedIntentional: engineOwnedIntentional, predicted_files: predictedFiles, depends_on: dependsOn, revisit_risk: revisitRisk }))
   })
   for (const p of (livePreflights || [])) {
     if (consumed[p.issue]) continue
@@ -1807,6 +1827,27 @@ function verifyNotesBlock() {
   const vn = (PROFILE.verify_notes || [])
   if (!vn.length) return ''
   return '## Project verification notes (from the ticketmill profile)\n' + vn.map(function (n) { return '- ' + n }).join('\n')
+}
+
+// ----- revisit risk (issue #93) -----
+// Terse render of ctx.revisit_risk (threaded from the preflight probe via
+// deriveUnits/processIssue above) into the evaluate/approach-challenge/plan
+// prompts. Mirrors notesBlock/verifyNotesBlock's empty-string-when-nothing-
+// to-say shape: an unflagged ctx.revisit_risk ({flagged:false}, the default
+// every ctx gets) makes this return '' so a run with no history match produces
+// byte-identical prompts to before this feature existed — acceptance
+// criterion 2 (clean no-op) holds all the way through to prompt text, not
+// just the data layer.
+function revisitRiskBlock(ctx) {
+  const rr = ctx && ctx.revisit_risk
+  if (!rr || !rr.flagged) return ''
+  return [
+    '## Revisit risk flag (recent outcome/churn history)',
+    'A file this issue is likely to touch was recently reverted, hot-fixed, or reopened:',
+    (rr.reasons || []).map(function (r) { return '- ' + r }).join('\n'),
+    'Prefer a CONSERVATIVE approach: minimize surface area and avoid speculative rework in this area, and add',
+    'regression coverage (a test that would have caught the earlier regression) alongside the fix.',
+  ].join('\n')
 }
 
 // ----- gate findings tally (issue #87 task 3, issue #91 wired in pr-review) -----
@@ -3789,6 +3830,15 @@ async function implementIssue(ctx) {
   ctx.worktree = setup.worktree
   ctx.branch = setup.branch
 
+  // Revisit risk (issue #93): record the flag in the decision chain ONCE, right
+  // after setup and before the stages that render revisitRiskBlock(ctx) into
+  // their prompts — mirrors the one-time settleDecision-adjacent pushDecision
+  // pattern elsewhere (e.g. Research just below) rather than re-pushing it at
+  // every prompt site that also renders it inline.
+  if (ctx.revisit_risk && ctx.revisit_risk.flagged) {
+    pushDecision(ctx, 'Revisit Risk', (ctx.revisit_risk.reasons || []).map(function (r) { return '- ' + r }).join('\n'))
+  }
+
   // ---- RESEARCH ----
   // Group unit: read EVERY member's issue, not just the primary — and keep each
   // member's requirements attributed to its own issue number rather than blended
@@ -3833,7 +3883,8 @@ async function implementIssue(ctx) {
   let evalR = await stage(ctx, 'evaluate', [
     'Evaluate the best implementation approach for issue #' + ctx.issue + '.',
     '',
-    '## Decision chain', decisionChain(ctx), '',
+    '## Decision chain', decisionChain(ctx),
+    revisitRiskBlock(ctx), '',
     'Determine: (1) recommended approach — if prior work exists, how this builds on or diverges from it;',
     '(2) rationale; (3) risks; (4) alternatives considered; (5) if prior attempts failed, how this addresses that feedback.',
     'Also classify complexity: "trivial" (mechanical/text-only/config edits with no behavior risk),',
@@ -3872,7 +3923,8 @@ async function implementIssue(ctx) {
       '',
       'Stress-test the proposed implementation approach for issue #' + ctx.issue + ' (challenge iteration ' + iter + ').',
       '',
-      '## Decision chain', decisionChain(ctx), '',
+      '## Decision chain', decisionChain(ctx),
+      revisitRiskBlock(ctx), '',
       'The evaluate stage proposed:',
       'Approach: ' + (evalR.approach || ''), 'Rationale: ' + (evalR.rationale || ''), '',
       'FIRST read the full pipeline trail — gh issue view ' + ctx.issue + ' --repo ' + REPO + ' --comments — it is the',
@@ -3978,7 +4030,7 @@ async function implementIssue(ctx) {
         'Create an implementation plan for issue #' + ctx.issue + ' in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + '.',
       '',
       '## Decision chain', decisionChain(ctx),
-      settledBlock(ctx), '',
+      settledBlock(ctx), revisitRiskBlock(ctx), '',
       revision || '',
     ]
     if (isGroupUnit) lines.push('This is a CONSOLIDATED GROUP unit spanning member issues: ' + fmtIssues(memberIssues(ctx)) + '.')
@@ -4498,6 +4550,14 @@ async function processIssue(pre) {
     // ctx (not pre) so every stage downstream of this init sees the same
     // threaded value.
     engineOwnedIntentional: !!pre.engineOwnedIntentional,
+    // revisit_risk (issue #93): threaded the same way as engineOwnedIntentional
+    // just above — deriveUnits() OR-folds/concats this across a group's live
+    // memberRefs (or spreads a singleton's own value through); read off ctx
+    // (not pre) by revisitRiskBlock() so every prompt site downstream of this
+    // init sees the same value. Empty-shape default ({flagged:false,
+    // reasons:[]}) matches computeRevisitRisk's clean no-op shape so a preflight
+    // that never carried revisit_risk (e.g. a resume-skip stub) never crashes.
+    revisit_risk: (pre.revisit_risk && typeof pre.revisit_risk === 'object') ? pre.revisit_risk : { flagged: false, reasons: [] },
     metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0 },
     tokens: { total: 0, byModel: {}, byStage: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
     // Retained-changed-files / friction signals (issue #87). null (not []) means
