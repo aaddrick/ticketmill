@@ -6098,13 +6098,14 @@ function deriveNegativeOutcomeEvents(priorLedgerLines) {
 // entirely) still comes through with files:[] — fail open, never fabricate,
 // same ethos as the probe's own per-field fallbacks.
 function attachRevisitFiles(negativeEvents, agentEvents) {
+  function eventKey(e) { return String(e.issue) + '::' + String(e.batch_pr != null ? e.batch_pr : null) }
   const filesByKey = new Map()
   for (const e of (Array.isArray(agentEvents) ? agentEvents : [])) {
     if (!e) continue
-    filesByKey.set(String(e.issue) + '::' + String(e.batch_pr != null ? e.batch_pr : null), Array.isArray(e.files) ? e.files : [])
+    filesByKey.set(eventKey(e), Array.isArray(e.files) ? e.files : [])
   }
   return (negativeEvents || []).map(function (e) {
-    const key = String(e.issue) + '::' + String(e.batch_pr != null ? e.batch_pr : null)
+    const key = eventKey(e)
     return Object.assign({}, e, { files: filesByKey.has(key) ? filesByKey.get(key) : [] })
   })
 }
