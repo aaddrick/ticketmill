@@ -1898,6 +1898,27 @@ async function postNote(ctx, stageKey, status, error) {
   if (!noted || !noted.posted) log('#' + ctx.issue + ' halt note (' + stageKey + ') did not post — status is recorded in the run results only')
 }
 
+// frictionFields (issue #87): pure derived-friction snapshot for a unit's
+// result shape, shared by all three return sites (completed/fail/skip) so the
+// fields can't drift out of sync between them. Defensive the same way fail()
+// already is about partial ctx shapes (pool-catch results, a skip whose ctx
+// never grew unresolved/metrics) — never throws on a missing/partial ctx.
+//   unresolved_count: findings carried past a contrarian iteration cap.
+//   contrarian_capped: true iff any such finding exists.
+//   test_quality_fix_rounds: read straight off ctx.metrics (incremented at the
+//     test-quality-fix stage — see issue #87 task 2); 0 for an issue that never
+//     reached that stage.
+//   needs_human: mirrors the status this unit actually resolved to.
+function frictionFields(ctx, status) {
+  const unresolved = (ctx && ctx.unresolved) || []
+  return {
+    unresolved_count: unresolved.length,
+    contrarian_capped: unresolved.length > 0,
+    test_quality_fix_rounds: (ctx && ctx.metrics && ctx.metrics.test_quality_fix_rounds) || 0,
+    needs_human: status === 'needs_human',
+  }
+}
+
 // fail(): called exactly once per unit — every call site is a `return fail(...)`,
 // so this fires (and increments BATCH.failures) exactly ONCE per unit regardless
 // of how many members it covers. A failed GROUP is still one breaker increment,
@@ -1907,7 +1928,7 @@ async function fail(ctx, status, stageKey, error) {
   await postNote(ctx, stageKey, status, error)
   BATCH.failures++
   if (BATCH.failures >= MAX_BATCH_FAILURES) tripStop('circuit breaker: ' + BATCH.failures + ' issues failed')
-  return { issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx) }
+  return Object.assign({ issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx), changed_files: (ctx && ctx.changed_files) || null, added_files: (ctx && ctx.added_files) || null, touch_counts: (ctx && ctx.touch_counts) || {}, gate_findings: (ctx && ctx.gate_findings) || {} }, frictionFields(ctx, status))
 }
 
 // =============================================================================
@@ -2371,6 +2392,37 @@ async function runBrowserCheck(ctx, where) {
 // plumbing hiccup in this gate never blocks an otherwise-green issue.
 // Returns { ok: true } always.
 // =============================================================================
+// probeChangedFiles (issue #87): READ-ONLY diff probe that captures the FINAL
+// changed-file list for an issue, run once, unconditionally, from
+// reviewAndMerge() immediately before the merge stage — after the full
+// review/fix loop (pr-fix, merge-auto-resolve) has already landed, and before
+// the merge stage's own worktree teardown. This is deliberately a SEPARATE
+// probe from runEngineOwnedGate's own post-implement one just below: that gate
+// snapshots the diff right after implementation (its revert-or-not decision
+// needs the pre-review state), while this one snapshots the diff analytics
+// downstream (touch_counts, completeness scoring) actually want — the merged
+// result including any PR-review fixes or auto-resolve rebasing. Populates
+// ctx.changed_files/ctx.added_files. On a dead/degraded probe, leaves both
+// null (never []) so `!= null` distinguishes "captured, zero files" from
+// "probe never ran" for downstream completeness scoring.
+async function probeChangedFiles(ctx) {
+  const probe = await stage(ctx, 'changed-files-probe', [
+    'READ-ONLY probe for issue #' + ctx.issue + ': list every file this issue\'s implementation changed. Run exactly:',
+    'git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --name-only',
+    'Return changed_files (the output lines as an array; empty array if none).',
+    '',
+    'Also run this second command to find files newly created on this branch (absent from the batch baseline):',
+    'git -C ' + ctx.worktree + ' diff origin/' + TARGET + '...HEAD --diff-filter=A --name-only',
+    'Return added_files (the output lines as an array; empty array if none).',
+  ].join('\n'), stageOpts('probe'), DIFF_PROBE_SCHEMA)
+  if (!probe) {
+    log('#' + ctx.issue + ' changed-files probe died — degrading (recorded); ctx.changed_files stays null')
+    ctx.deferred.push('Changed-files probe: could not capture the final changed-file list for issue #' + ctx.issue + ' — retained-changed-files analytics for this issue will be incomplete.')
+    return
+  }
+  ctx.changed_files = probe.changed_files || []
+  ctx.added_files = probe.added_files || []
+}
 async function runEngineOwnedGate(ctx) {
   if (!ENGINE_OWNED.length) return { ok: true }
   const probe = await stage(ctx, 'engine-owned-probe', [
@@ -3777,6 +3829,13 @@ async function reviewAndMerge(ctx) {
   const mar = await runMergeAutoResolve(ctx)
   if (!mar.ok) return fail(ctx, STOP.tripped ? 'halted' : 'needs_human', 'merge-auto-resolve', mar.error + ' — PR #' + ctx.pr + ' left open for human review')
 
+  // ---- CHANGED-FILES PROBE (issue #87) — unconditional, once per issue, after
+  // the full review/fix loop has landed and before the worktree teardown below,
+  // so ctx.changed_files/ctx.added_files reflect the actual merged diff. Never
+  // gates the merge: probeChangedFiles() degrades to a recorded deferred note
+  // on a dead probe rather than failing the issue. ----
+  await probeChangedFiles(ctx)
+
   // ---- MERGE (preflight, squash merge, complete comment, follow-ups, cleanup) ----
   const deferredBlock = ctx.deferred.length ? ctx.deferred.map(function (d) { return '- ' + d }).join('\n') : ''
   // Group unit: release the claim on EVERY member, not just the primary — every
@@ -3833,7 +3892,7 @@ async function reviewAndMerge(ctx) {
   if (mar.resolved) ctx.metrics.merge_auto_resolved = (ctx.metrics.merge_auto_resolved || 0) + 1
 
   log('#' + ctx.issue + ' merged PR #' + ctx.pr + (merge.follow_up_issues && merge.follow_up_issues.length ? ' (follow-ups: ' + merge.follow_up_issues.join(', ') + ')' : ''))
-  return { issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx) }
+  return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx), changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings }, frictionFields(ctx, 'completed'))
 }
 
 // =============================================================================
@@ -3860,8 +3919,17 @@ async function processIssue(pre) {
     // ctx (not pre) so every stage downstream of this init sees the same
     // threaded value.
     engineOwnedIntentional: !!pre.engineOwnedIntentional,
-    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0 },
+    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0 },
     tokens: { total: 0, byModel: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
+    // Retained-changed-files / friction signals (issue #87). null (not []) means
+    // "never captured" — probeChangedFiles() sets these once, unconditionally,
+    // from reviewAndMerge() right before the merge stage; a dead/degraded probe
+    // leaves them null so a `!= null` presence check downstream can tell "probe
+    // ran, zero files" apart from "probe never ran".
+    changed_files: null,
+    added_files: null,
+    touch_counts: {},   // per-file re-touch tally across fix-stage files_changed (tallyTouches(), issue #87 task 2)
+    gate_findings: {},  // per-gate finding tally/disposition (recordGateOutcome(), issue #87 task 3)
   }
   if (pre.resume_point === 'skip') {
     log('#' + ctx.issue + ' skipped: ' + pre.reason)
@@ -3873,7 +3941,7 @@ async function processIssue(pre) {
     // must NOT count as "shipped into TARGET" — see batchClosesIssues() below,
     // which is the sole reader of this field.
     const merged_into_target = pre.pr_state === 'merged' && pre.pr_base === TARGET
-    return { issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target }
+    return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target, changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings }, frictionFields(ctx, 'skipped'))
   }
   if (pre.resume_point === 'process_pr') {
     log('#' + ctx.issue + ' healing: open PR #' + ctx.pr + ' found — jumping to review/merge')
