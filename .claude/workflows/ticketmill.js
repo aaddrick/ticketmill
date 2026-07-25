@@ -4621,6 +4621,218 @@ function releaseChangelogAnchor(version, runTag) {
   return '## [' + String(version) + '] - ' + String(runTag)
 }
 
+// Fixed classification list for computeReworkTax (issue #91): a per-issue
+// ctx.tokens.byStage KEY (the literal `key` argument stage() was called with —
+// see its finally-block above) is rework spend if it starts with one of these
+// prefixes, else it counts as first-pass work. 'test-quality-fix' is ordered
+// before the shorter 'quality-fix'/'test-fix' prefixes it could otherwise be
+// mistaken for under a substring (rather than anchored-start) check — a
+// 'test-quality-fix-iN' key contains 'quality-fix' as a substring — so the
+// more specific compound prefix is tried first and this order is load-bearing
+// even though isReworkStageKey() below uses an anchored check today.
+const REWORK_STAGE_PREFIXES = ['test-quality-fix', 'quality-fix', 'test-fix', 'pr-fix', 'merge-conflict-resolve']
+
+function isReworkStageKey(key) {
+  const k = String(key || '')
+  return REWORK_STAGE_PREFIXES.some(function (p) { return k.indexOf(p) === 0 })
+}
+
+// computeReworkTax (issue #91): per-issue and per-run fraction of TRACKED
+// token spend that went into fix/retry loops (REWORK_STAGE_PREFIXES) vs
+// first-pass work, classified from the per-stage deltas stage() already
+// retains on ctx.tokens.byStage (issue #91 task 1) — no new instrumentation,
+// pure math over data aggregateTokens' caller already has in hand.
+//
+// Gating: MUST key off tokenAgg.reconcile_error (issue #90's honest,
+// concurrency-independent reconciliation signal) being <=
+// MAX_RECONCILE_ERROR_FOR_TRUST, NEVER the coarser `reconciles` boolean —
+// see aggregateTokens' own module comment for why. Under concurrency>1,
+// overlapping issues' stages attribute the SAME shared counter movement to
+// each of their own byStage keys (the exact over-count aggregateTokens
+// documents), so an untrusted reconcile_error taints per-issue rework
+// fractions too, not just the run total. When reconcile_error is null
+// (tokens never tracked this run) or exceeds the threshold, the run-level
+// fraction/signal are suppressed with an explicit reason rather than
+// rendered as if trustworthy; the raw per-issue sums are still returned
+// (never blanked) so a machine consumer can see what was computed without
+// the run treating it as a trusted metric.
+//
+// Null-safe: a result with no `.tokens`, `.tokens.tracked === false`, or no
+// `.tokens.byStage` contributes nothing (tracked:false row), never throws.
+// Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+function computeReworkTax(results, tokenAgg) {
+  const list = Array.isArray(results) ? results : []
+  const t = tokenAgg || {}
+  const reconcileError = isFiniteNumber(t.reconcile_error) ? t.reconcile_error : null
+  const trusted = reconcileError != null && reconcileError <= MAX_RECONCILE_ERROR_FOR_TRUST
+
+  const byIssue = []
+  let runRework = 0
+  let runFirstPass = 0
+  let anyTracked = false
+
+  for (const r of list) {
+    const tok = r && r.tokens
+    const stage = tok && tok.tracked ? tok.byStage : null
+    if (!stage) {
+      byIssue.push({ issue: r && r.issue, rework: null, first_pass: null, fraction: null, tracked: false })
+      continue
+    }
+    anyTracked = true
+    let rework = 0
+    let firstPass = 0
+    for (const key in stage) {
+      if (!Object.prototype.hasOwnProperty.call(stage, key)) continue
+      const v = stage[key] || 0
+      if (isReworkStageKey(key)) rework += v
+      else firstPass += v
+    }
+    runRework += rework
+    runFirstPass += firstPass
+    const denom = rework + firstPass
+    byIssue.push({ issue: r.issue, rework: rework, first_pass: firstPass, fraction: denom > 0 ? rework / denom : null, tracked: true })
+  }
+
+  const runDenom = runRework + runFirstPass
+  const runFraction = runDenom > 0 ? runRework / runDenom : null
+  const suppressedReason = !trusted
+    ? (reconcileError == null
+      ? 'token accounting reconcile_error is unavailable this run — rework tax cannot be trusted, suppressed'
+      : 'token reconcile_error (' + reconcileError.toFixed(3) + ') exceeds the trust threshold (' + MAX_RECONCILE_ERROR_FOR_TRUST + ') — rework tax suppressed')
+    : null
+  const hasSignal = trusted && anyTracked && runRework > 0
+
+  const lines = []
+  lines.push('## Rework Tax')
+  lines.push('')
+  if (!trusted) {
+    lines.push('_Suppressed — ' + suppressedReason + '._')
+  } else if (!anyTracked) {
+    lines.push('No per-stage token data tracked this run — rework tax not computed.')
+  } else if (!hasSignal) {
+    lines.push('No rework spend this run — every tracked token went to first-pass work.')
+  } else {
+    lines.push('Run-wide: **' + (runFraction * 100).toFixed(1) + '%** of tracked tokens went to rework/retry loops (' +
+      runRework + ' of ' + runDenom + ').')
+    lines.push('')
+    lines.push('| Issue | Rework | First-pass | Rework % |')
+    lines.push('| --- | --- | --- | --- |')
+    for (const row of byIssue) {
+      if (!row.tracked) continue
+      lines.push('| #' + row.issue + ' | ' + row.rework + ' | ' + row.first_pass + ' | ' +
+        (row.fraction == null ? '—' : (row.fraction * 100).toFixed(1) + '%') + ' |')
+    }
+  }
+
+  return {
+    by_issue: byIssue,
+    run_rework: runRework,
+    run_first_pass: runFirstPass,
+    run_fraction: runFraction,
+    reconcile_error: reconcileError,
+    trusted: trusted,
+    suppressed_reason: suppressedReason,
+    has_signal: hasSignal,
+    markdown: lines.join('\n'),
+  }
+}
+
+// computeGateYield (issue #91): per-gate yield off the gate_findings tally
+// recordGateOutcome() already builds per issue (issue #87 task 3's
+// approach/plan wiring, issue #91 task 1's pr-review wiring) — count,
+// severity mix, and an accepted-vs-dismissed ratio summed across every
+// issue's per-gate tally this run.
+//
+// Escaped-defect signal (count-based, per the issue's own literal
+// definition): an issue whose 'pr-review' gate raised findings (count > 0)
+// while its EARLY gates ('approach', 'plan') raised none — a defect that
+// could only be caught this late because nothing upstream ever saw it, not
+// merely a finding re-litigated across iterations of the SAME gate.
+//
+// Defensive the same way aggregateMergeAutoResolve/computeFriction are about
+// a null/empty results array or a result missing .gate_findings — degrades
+// to a clean, empty, has_signal:false rollup, never throws.
+// Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+function computeGateYield(results) {
+  const list = Array.isArray(results) ? results : []
+  const ESCAPE_GATE = 'pr-review'
+  const EARLY_GATES = ['approach', 'plan']
+
+  const byGate = {}
+  function gateBucket(key) {
+    if (!byGate[key]) byGate[key] = { count: 0, severity: { critical: 0, major: 0, minor: 0 }, accepted: 0, dismissed: 0 }
+    return byGate[key]
+  }
+
+  const byIssue = []
+  const escapedDefects = []
+
+  for (const r of list) {
+    const gf = (r && r.gate_findings) || {}
+    for (const key in gf) {
+      if (!Object.prototype.hasOwnProperty.call(gf, key)) continue
+      const g = gf[key] || {}
+      const bucket = gateBucket(key)
+      bucket.count += Number(g.count) || 0
+      const sev = g.severity || {}
+      bucket.severity.critical += Number(sev.critical) || 0
+      bucket.severity.major += Number(sev.major) || 0
+      bucket.severity.minor += Number(sev.minor) || 0
+      const disp = g.disposition || {}
+      bucket.accepted += Number(disp.accepted) || 0
+      bucket.dismissed += Number(disp.dismissed) || 0
+    }
+
+    const escapeCount = Number((gf[ESCAPE_GATE] || {}).count) || 0
+    const earlyCount = EARLY_GATES.reduce(function (sum, k) { return sum + (Number((gf[k] || {}).count) || 0) }, 0)
+    const escaped = escapeCount > 0 && earlyCount === 0
+    if (escaped) escapedDefects.push({ issue: r && r.issue, count: escapeCount })
+    byIssue.push({ issue: r && r.issue, escaped: escaped })
+  }
+
+  const gateKeys = Object.keys(byGate).sort()
+  for (const key of gateKeys) {
+    const b = byGate[key]
+    b.ratio = (b.accepted + b.dismissed) > 0 ? b.accepted / (b.accepted + b.dismissed) : null
+  }
+
+  const hasSignal = escapedDefects.length > 0 || gateKeys.some(function (k) { return byGate[k].count > 0 })
+
+  const lines = []
+  lines.push('## Gate Yield')
+  lines.push('')
+  if (!gateKeys.length) {
+    lines.push('No gate findings recorded this run.')
+  } else {
+    lines.push('| Gate | Findings | Critical | Major | Minor | Accepted:Dismissed |')
+    lines.push('| --- | --- | --- | --- | --- | --- |')
+    for (const key of gateKeys) {
+      const b = byGate[key]
+      lines.push('| ' + key + ' | ' + b.count + ' | ' + b.severity.critical + ' | ' + b.severity.major + ' | ' + b.severity.minor + ' | ' +
+        (b.ratio == null ? '—' : b.accepted + ':' + b.dismissed) + ' |')
+    }
+  }
+  if (escapedDefects.length) {
+    lines.push('')
+    lines.push('Escaped defects (findings at "' + ESCAPE_GATE + '" that every earlier gate missed):')
+    lines.push('')
+    lines.push('| Issue | Findings at ' + ESCAPE_GATE + ' |')
+    lines.push('| --- | --- |')
+    for (const e of escapedDefects) lines.push('| #' + e.issue + ' | ' + e.count + ' |')
+  } else if (gateKeys.length) {
+    lines.push('')
+    lines.push('No escaped defects this run.')
+  }
+
+  return {
+    by_gate: byGate,
+    by_issue: byIssue,
+    escaped_defects: escapedDefects,
+    has_signal: hasSignal,
+    markdown: lines.join('\n'),
+  }
+}
+
 // computeCompleteness (issue #87 task 5): a pure trust flag for a run's own
 // telemetry, answering three questions the record can otherwise only be
 // TRUSTED to answer, never verified to answer:
@@ -4682,6 +4894,8 @@ function buildRunRecord(f) {
   const fc = f.frictionChurnAgg || {}
   const fcFriction = fc.friction || {}
   const fcChurn = fc.churn || {}
+  const rt = f.reworkTaxAgg || {}
+  const gy = f.gateYieldAgg || {}
   return {
     completeness: computeCompleteness(f.results, t),
     schema_version: 1,
@@ -4730,6 +4944,28 @@ function buildRunRecord(f) {
         refix_chains: fcChurn.refix_chains,
         buckets: fcChurn.buckets,
       },
+    },
+    // rework_tax / gate_yield (issue #91): machine-readable fields only (no
+    // markdown, same as friction_churn above) — additive top-level keys, safe
+    // against #86's zero-field-loss tests. rework_tax carries `trusted` /
+    // `suppressed_reason` alongside the raw sums so a consumer can see WHY a
+    // run's rework fraction was (or wasn't) trusted without re-deriving it
+    // from tokens.reconcile_error.
+    rework_tax: {
+      has_signal: !!rt.has_signal,
+      trusted: !!rt.trusted,
+      reconcile_error: rt.reconcile_error,
+      suppressed_reason: rt.suppressed_reason,
+      run_fraction: rt.run_fraction,
+      run_rework: rt.run_rework,
+      run_first_pass: rt.run_first_pass,
+      by_issue: rt.by_issue,
+    },
+    gate_yield: {
+      has_signal: !!gy.has_signal,
+      by_gate: gy.by_gate,
+      by_issue: gy.by_issue,
+      escaped_defects: gy.escaped_defects,
     },
     consolidation_groups: f.consolidationGroups,
     results: f.results,
@@ -5330,6 +5566,13 @@ const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
 // is the module-level array populated at Select. ----
 const FRICTION_CHURN_AGG = composeFrictionChurn(results, { serializeGlobs: serializeGlobs, engineOwned: ENGINE_OWNED })
 
+// ---- Rework tax & gate yield (issue #91): JS-computed run-level rollups,
+// injected verbatim below. REWORK_TAX_AGG is gated on TOKEN_AGG.reconcile_error
+// (see computeReworkTax's own module comment for why), so it must be computed
+// AFTER TOKEN_AGG above, never before. ----
+const REWORK_TAX_AGG = computeReworkTax(results, TOKEN_AGG)
+const GATE_YIELD_AGG = computeGateYield(results)
+
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
 // shippedIssues (issue #30): the union, across THIS pass's completions and any
@@ -5474,6 +5717,14 @@ if (shippedIssues.length) {
       ? '   - this "## Friction & Churn" section, injected VERBATIM (already computed in JS — do not recompute,\n' +
         '     re-sum, or add commentary beyond copying it in):\n' + FRICTION_CHURN_AGG.markdown
       : '   - (no friction or churn signal this run)',
+    REWORK_TAX_AGG.has_signal
+      ? '   - this "## Rework Tax" section, injected VERBATIM (already computed in JS — do not recompute, re-sum,\n' +
+        '     or add commentary beyond copying it in):\n' + REWORK_TAX_AGG.markdown
+      : '   - (no rework-tax signal this run)',
+    GATE_YIELD_AGG.has_signal
+      ? '   - this "## Gate Yield" section, injected VERBATIM (already computed in JS — do not recompute, re-sum,\n' +
+        '     or add commentary beyond copying it in):\n' + GATE_YIELD_AGG.markdown
+      : '   - (no gate-yield signal this run)',
     '   - a note that per-issue PRs were squash-merged into ' + TARGET + ' with full review trails on each issue.',
     '   - this "## Merge Auto-Resolution" section, injected VERBATIM (already computed in JS — do not recompute,',
     '     re-sum, or add commentary beyond copying it in):\n' + MERGE_RESOLVE_AGG.markdown,
@@ -5498,6 +5749,7 @@ const runRecord = buildRunRecord({
   runTag: RUN_TAG, state: state, baseBranch: BASE, batchBranch: TARGET, batchPr: batchPr,
   stop: STOP, counts: counts, verificationGaps: VERIFY_SKIPS, tokensSpent: spentTokens(),
   tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, frictionChurnAgg: FRICTION_CHURN_AGG,
+  reworkTaxAgg: REWORK_TAX_AGG, gateYieldAgg: GATE_YIELD_AGG,
   consolidationGroups: finalGroups, results: results,
 })
 const resultsJson = JSON.stringify(runRecord, null, 2)
@@ -5526,6 +5778,14 @@ const report = await agent([
     ? '   Include this "## Friction & Churn" section VERBATIM (already computed in JS — do not recompute,\n' +
       '   re-sum, or add commentary beyond copying it in):\n' + FRICTION_CHURN_AGG.markdown
     : '   (no friction or churn signal this run — omit the "## Friction & Churn" section entirely)',
+  REWORK_TAX_AGG.has_signal
+    ? '   Include this "## Rework Tax" section VERBATIM (already computed in JS — do not recompute, re-sum,\n' +
+      '   or add commentary beyond copying it in):\n' + REWORK_TAX_AGG.markdown
+    : '   (no rework-tax signal this run — omit the "## Rework Tax" section entirely)',
+  GATE_YIELD_AGG.has_signal
+    ? '   Include this "## Gate Yield" section VERBATIM (already computed in JS — do not recompute, re-sum,\n' +
+      '   or add commentary beyond copying it in):\n' + GATE_YIELD_AGG.markdown
+    : '   (no gate-yield signal this run — omit the "## Gate Yield" section entirely)',
   '3. Include the current timestamp from: date -Iseconds',
   RUN_TAG === 'run' ? '4. The tag "run" is a collision-prone default: substitute the current date (date +%F) for "run" in the .md filename so successive runs do not overwrite each other, and return the actual path.' : '',
   '',
