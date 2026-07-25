@@ -331,3 +331,105 @@ test('OUTCOME_GRADING module default is min_age_days:7, sample_cap:20 (mirrors C
   assert.strictEqual(og.min_age_days, 7)
   assert.strictEqual(og.sample_cap, 20)
 })
+
+// ---- computeRevisitRisk (issue #93): the deterministic revisit-risk flag core ----
+//
+// computeRevisitRisk(preflights, observations, cfg) takes each preflight's
+// predicted_files (PREFLIGHT_SCHEMA) and an { events, refix_chains, now } raw
+// observation bundle (already JS-derived/authoritative per deriveNegativeOutcomeEvents
+// + attachRevisitFiles — see the module comment above computeRevisitRisk in
+// workflows/ticketmill.js), and attaches a revisit_risk = { flagged, reasons } field
+// to every preflight. These tests cover the settled plan's four acceptance cases:
+// (a) a predicted_file intersecting an in-window hotfix/revert locus flags with
+// reasons, (b) no history / no overlap is a clean no-op (acceptance criterion 2),
+// (c) an out-of-window negative event never flags, and (d) refix_chains alone
+// (no events[] overlap) never flags — annotation-only corroboration.
+
+test('computeRevisitRisk: a predicted_file intersecting an in-window hotfix locus flags true with a reason', function () {
+  const context = harness.boot()
+  const preflights = [{ issue: 99, predicted_files: ['src/foo.js', 'src/bar.js'] }]
+  const events = [{
+    issue: 50, batch_pr: 10, grade: 'hotfix',
+    decided_at: daysAgoIso(5), merged_at: daysAgoIso(20),
+    files: ['src/foo.js'],
+  }]
+  const out = plain(context.computeRevisitRisk(preflights, { events: events, refix_chains: [], now: NOW }))
+  assert.strictEqual(out[0].revisit_risk.flagged, true)
+  assert.strictEqual(out[0].revisit_risk.reasons.length, 1)
+  assert.match(out[0].revisit_risk.reasons[0], /src\/foo\.js/)
+  assert.match(out[0].revisit_risk.reasons[0], /hotfix/)
+  assert.match(out[0].revisit_risk.reasons[0], /issue #50/)
+})
+
+test('computeRevisitRisk: a predicted_file intersecting an in-window revert locus flags true with a reason', function () {
+  const context = harness.boot()
+  const preflights = [{ issue: 98, predicted_files: ['src/reverted.js'] }]
+  const events = [{
+    issue: 51, batch_pr: 11, grade: 'reverted',
+    decided_at: daysAgoIso(2), merged_at: daysAgoIso(2),
+    files: ['src/reverted.js'],
+  }]
+  const out = plain(context.computeRevisitRisk(preflights, { events: events, refix_chains: [], now: NOW }))
+  assert.strictEqual(out[0].revisit_risk.flagged, true)
+  assert.strictEqual(out[0].revisit_risk.reasons.length, 1)
+  assert.match(out[0].revisit_risk.reasons[0], /src\/reverted\.js/)
+  assert.match(out[0].revisit_risk.reasons[0], /reverted/)
+})
+
+test('computeRevisitRisk: no history at all is a clean no-op (acceptance criterion 2) — flagged:false, reasons:[]', function () {
+  const context = harness.boot()
+  const preflights = [{ issue: 1, predicted_files: ['src/anything.js'] }]
+  const out = plain(context.computeRevisitRisk(preflights, { events: [], refix_chains: [], now: NOW }))
+  assert.strictEqual(out[0].revisit_risk.flagged, false)
+  assert.deepStrictEqual(out[0].revisit_risk.reasons, [])
+})
+
+test('computeRevisitRisk: history exists but does not overlap predicted_files is a clean no-op', function () {
+  const context = harness.boot()
+  const preflights = [{ issue: 2, predicted_files: ['src/unrelated.js'] }]
+  const events = [{
+    issue: 60, batch_pr: 20, grade: 'hotfix',
+    decided_at: daysAgoIso(1), merged_at: daysAgoIso(1),
+    files: ['src/other-area.js'],
+  }]
+  const out = plain(context.computeRevisitRisk(preflights, { events: events, refix_chains: [], now: NOW }))
+  assert.strictEqual(out[0].revisit_risk.flagged, false)
+  assert.deepStrictEqual(out[0].revisit_risk.reasons, [])
+})
+
+test('computeRevisitRisk: an out-of-window negative event never flags, even with a matching file', function () {
+  const context = harness.boot()
+  const preflights = [{ issue: 3, predicted_files: ['src/stale.js'] }]
+  const events = [{
+    issue: 61, batch_pr: 21, grade: 'reverted',
+    decided_at: daysAgoIso(45), merged_at: daysAgoIso(45),
+    files: ['src/stale.js'],
+  }]
+  const out = plain(context.computeRevisitRisk(preflights, { events: events, refix_chains: [], now: NOW }, { window_days: 30 }))
+  assert.strictEqual(out[0].revisit_risk.flagged, false)
+  assert.deepStrictEqual(out[0].revisit_risk.reasons, [])
+})
+
+test('computeRevisitRisk: refix_chains alone (no events[] overlap) never flags — annotation-only, not an independent driver', function () {
+  const context = harness.boot()
+  const preflights = [{ issue: 4, predicted_files: ['src/churned.js'] }]
+  const refixChains = [{ file: 'src/churned.js', issue: 40, count: 3 }]
+  const out = plain(context.computeRevisitRisk(preflights, { events: [], refix_chains: refixChains, now: NOW }))
+  assert.strictEqual(out[0].revisit_risk.flagged, false)
+  assert.deepStrictEqual(out[0].revisit_risk.reasons, [])
+})
+
+test('computeRevisitRisk: refix_chains corroborates (appends a reason) only for a file already flagged by a real events[] overlap', function () {
+  const context = harness.boot()
+  const preflights = [{ issue: 5, predicted_files: ['src/hot.js'] }]
+  const events = [{
+    issue: 70, batch_pr: 30, grade: 'hotfix',
+    decided_at: daysAgoIso(3), merged_at: daysAgoIso(3),
+    files: ['src/hot.js'],
+  }]
+  const refixChains = [{ file: 'src/hot.js', issue: 70, count: 3 }]
+  const out = plain(context.computeRevisitRisk(preflights, { events: events, refix_chains: refixChains, now: NOW }))
+  assert.strictEqual(out[0].revisit_risk.flagged, true)
+  assert.strictEqual(out[0].revisit_risk.reasons.length, 2)
+  assert.match(out[0].revisit_risk.reasons[1], /re-fixed/)
+})
