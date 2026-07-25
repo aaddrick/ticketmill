@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.34 (2026-07-25)
+
+Tier 4 of the observability upgrade, one milled issue (#94): the
+mill-review skill and a cross-run trend dashboard. Patch bump
+(0.1.33 -> 0.1.34). This is the human-facing analyze step of the
+flywheel, a read-only report over everything the earlier tiers
+accumulate.
+
+- New `skills/mill-review/SKILL.md` (#94) mapping to
+  `/ticketmill:mill-review`, a read-only skill that makes no repo
+  changes. It takes an optional window arg (last N runs or a date
+  range) and reads `logs/ticketmill/runs.jsonl`, `outcomes.jsonl`,
+  the per-run `runs/<tag>.json` records, and
+  `process-retrospective.md`.
+- Reuses the Tier 2 reducers (#94): `computeFriction` and
+  `computeChurn` run over the ledger rather than reimplementing the
+  math. The skill is a thin read-analyze-present wrapper, so there's
+  one source of truth for the numbers.
+- Highlights report (#94): an outcome scorecard (the fraction of
+  each run's PRs that held up versus hotfixed, reverted, or
+  reopened, from the #92 outcome ledger); per-stage friction,
+  rework-tax, gate-yield, lane precision, and token cost/issue
+  trends, each point tagged with its completeness score; chronic
+  bumpy stages, churn hotspots and re-fix chains, an
+  agent-attribution summary, stale or contradicted learnings, and a
+  ranked "what I'd change next."
+- Output surfaces (#94): prints the highlights inline and renders a
+  trend dashboard as a self-contained HTML Artifact (charts via the
+  dataviz skill). A committed `logs/ticketmill/dashboard.md`
+  fallback covers sessions without Artifacts.
+- Trend guardrails (#94): every trend chart gates on a minimum run
+  count and carries an issue-class heterogeneity caveat. A doc-heavy
+  batch and an architecture-heavy batch aren't comparable on raw
+  friction. Below the threshold the skill shows per-run summaries
+  only, not trend lines. Validated via the writing-skills skill;
+  prose ran through the aaddrick-voice + removing-ai-tells process.
+
 ## 0.1.33 (2026-07-25)
 
 Tier 3 of the observability upgrade, one milled issue (#93): a
