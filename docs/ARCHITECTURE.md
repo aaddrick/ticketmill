@@ -307,6 +307,63 @@ result, including a `needs_human` result the thrash guard escalated, since
 `fail()` carries `ctx.metrics` through. The two counts never overlap: a
 thrashed issue escalates before it can also count as resolved.
 
+### Friction & churn: a weighted per-run score, not a raw iteration count
+
+A run's difficulty used to live only inside each issue's raw metrics:
+iteration counts per stage, scattered across a JSON blob nobody scanned
+across a whole batch. `computeFriction(results)` turns those counts into one
+score per issue, so a human can see which issues actually fought back
+without reading every per-issue block.
+
+Seven capped pipeline stages (approach, plan, task-review, quality, test,
+browser, pr-review) each contribute `min(1, iters/cap)` to that score.
+Clearing a gate under its cap costs nothing: an issue whose stages all pass
+first try scores 0 across every one of them, no matter how many stages it
+has. On top of the seven ratios, weighted signal terms add friction a
+capped ratio can't see. `needs_human` carries the heaviest weight (2), since
+it's the one outcome a run can produce that never resolved on its own.
+`merge_thrash` (1.5) follows, since it forces a mandatory re-test and
+re-rebase cycle. `contrarian_capped` (1) is a flat penalty for hitting a
+contrarian cap with findings still open, and `unresolved_count` (0.25 per
+finding) adds granularity on top of it, so a capped-out issue carrying five
+open findings scores higher than one carrying only one. `quality_degrades`
+(0.5) and `test_quality_fix_rounds` (0.3) round out the list. The order and
+size of these weights tracks how much extra rework each signal actually
+costs, independent of how often it fires.
+
+Each nonzero stage or signal becomes one entry in that issue's `drivers`
+list, sorted by contribution. That's what lets the rendered table explain
+why an issue ranked where it did, instead of showing a bare number.
+
+`computeChurn(results, opts)` runs alongside it, reading the
+`changed_files`/`touch_counts` fields #87 added to `ctx`, and finds two
+different shapes of rework:
+
+- **Cross-issue hotspots**: a file touched by `HOTSPOT_ISSUE_THRESHOLD` (2)
+  or more distinct issues in the same run. Two issues landing on the same
+  file already counts as a collision worth flagging. One issue touching many
+  files across a run is ordinary and never trips this.
+- **Re-fix chains**: a file one issue's own `touch_counts` revisited
+  `REFIX_THRESHOLD` (3) or more times. The bar mirrors the "3+ fix rounds is
+  a smell" heuristic the quality and test loops already apply informally.
+
+Both get bucketed through the same `matchesGlobs` helper the lane scheduler
+uses for `serialize_globs`/engine-owned globs. A file matching
+`serialize_globs` buckets there first, since the profile already expects it
+to run hot. Anything left matching `ENGINE_OWNED` buckets next, and
+everything else lands in `surprising`. A `surprising` hotspot is the one
+worth a human's attention: neither the profile nor the engine's own file
+list predicted it would collide.
+
+`composeFrictionChurn(results, opts)` combines both rollups into one "##
+Friction & Churn" section, following the same JS-computed, verbatim-injected
+pattern as `aggregateTokens` and `aggregateMergeAutoResolve` above. The whole
+section is gated on `has_signal`, so a clean run, every stage under its cap
+and no hotspots or re-fix chains, renders nothing rather than an empty
+heading. `buildRunRecord` carries the same rollup under a `friction_churn`
+key: machine-readable fields only, no markdown, additive alongside the
+existing `tokens` and `merge_auto_resolve` blocks.
+
 ### Engine-owned path guardrail: three regimes
 
 A worktree only sees committed state. A freshly forged agent file, or a
