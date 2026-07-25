@@ -5118,6 +5118,191 @@ function buildLedgerLine(record) {
 }
 
 // ============================================================================
+// estimateCost (issue #97 task 2): a pure, sandbox-safe token-cost estimator
+// over the runs.jsonl ledger — the substrate #86/task 1 built. The engine has
+// no fs, so the `mill` skill reads runs.jsonl and hands the parsed lines in as
+// `history` (this is the same skill-does-IO / engine-does-pure-logic split as
+// buildLedgerLine's write path). Deliberately conservative: an estimate is
+// only ever a band median off TRUSTED history, and the function would rather
+// say "insufficient" than print a number nobody should act on.
+// ============================================================================
+
+// ESTIMATOR_PF_BAND_EDGES / pfBandKey: the cheap issue-shape bucket the
+// estimator medians over — predicted_files count, the only signal that is (a)
+// pure, (b) available for a brand-new issue at dry_run (preflight already
+// computes it), and (c) recoverable from history (by_issue_shape.pf, task 1).
+// Bands widen geometrically because pf itself is noisy at the low end (a
+// 1-file fix and a 2-file fix are practically the same shape) and predicted_files
+// is capped at 20 (MAX_LANE_PREDICTED_FILES-adjacent cap in preflight), so a
+// single open-ended top band covers everything past 15.
+const ESTIMATOR_PF_BANDS = [
+  { max: 0, key: '0' },
+  { max: 1, key: '1' },
+  { max: 3, key: '2-3' },
+  { max: 7, key: '4-7' },
+  { max: 15, key: '8-15' },
+  { max: Infinity, key: '16+' },
+]
+function pfBandKey(pf) {
+  const n = isFiniteNumber(pf) ? pf : 0
+  for (const b of ESTIMATOR_PF_BANDS) {
+    if (n <= b.max) return b.key
+  }
+  return ESTIMATOR_PF_BANDS[ESTIMATOR_PF_BANDS.length - 1].key
+}
+
+// ESTIMATOR_MAX_RECONCILE_ERROR: a coarse PATHOLOGY guard on the estimator's
+// history input — deliberately NOT the strict MAX_RECONCILE_ERROR_FOR_TRUST
+// (0.05, run-record.js line ~305) used to gate the run-level `trustworthy`
+// flag and rework-tax. Per aggregateTokens' own module comment, an
+// effective_concurrency===1 run STILL, by design, leaves ~26% of spend
+// (PR-review/merge/report overhead) unattributed to any single issue — that
+// ~0.26 reconcile_error is the EXPECTED shape of good history here, not a
+// defect, so re-applying the 0.05 bar would starve the estimator down to
+// near-zero trusted rows. 0.5 instead rejects only genuinely pathological
+// runs (a real accounting failure, a stale/corrupt ledger line) while keeping
+// the normal ~0.26 case in the trusted pool.
+const ESTIMATOR_MAX_RECONCILE_ERROR = 0.5
+
+// ESTIMATOR_MIN_BAND_SAMPLES: the smallest trusted-row count a pf-band needs
+// before its median is reported as a real number. A median of 1-2 points
+// isn't a central tendency, it's just "whatever those 1-2 issues happened to
+// cost" — 3 is the smallest sample where the median stops being a single
+// data point in disguise. Below this, the band degrades honestly to
+// {estimate: null, confidence: 'insufficient'} rather than print a number
+// that looks precise but is actually noise.
+const ESTIMATOR_MIN_BAND_SAMPLES = 3
+
+// medianOf: plain numeric median of an already-non-empty array. Pure/no
+// mutation of the caller's array (sorts a copy). Returns null on empty input
+// so callers never have to special-case it themselves.
+function medianOf(values) {
+  const v = (values || []).slice().sort(function (a, b) { return a - b })
+  const n = v.length
+  if (n === 0) return null
+  const mid = Math.floor(n / 2)
+  return n % 2 === 1 ? v[mid] : (v[mid - 1] + v[mid]) / 2
+}
+
+// buildTrustedPfBands: flattens `history` (an array of parsed runs.jsonl
+// ledger lines, i.e. buildLedgerLine's own output shape) into per-pf-band
+// token samples, keeping ONLY rows that clear every trust gate:
+//   - the row's PARENT RUN has effective_concurrency === 1 (issue #97's
+//     Revised Evaluation i1: recovers the default serialize_globs single-lane
+//     case with exact per-issue attribution — concurrency>1 runs are excluded
+//     wholesale, not row-by-row, since attribution is ambiguous for every row
+//     in that run, not just some).
+//   - the row's PARENT RUN's reconcile_error is finite and <=
+//     ESTIMATOR_MAX_RECONCILE_ERROR (the coarse pathology bar above, not
+//     MAX_RECONCILE_ERROR_FOR_TRUST).
+//   - the row itself has member_count === 1 (issue #97's Revised Plan i2: a
+//     group-unit row carries the union pf + WHOLE-GROUP token total under
+//     task 1's contract — filing that into a singleton pf-band would
+//     over-estimate every future singleton issue in that band).
+//   - the row itself is tracked with a finite token total (buildIssueShapeRows
+//     already sets tokens:null/tracked:false together when untracked, but
+//     both are checked here so the gate reads as self-contained, not
+//     dependent on that invariant holding forever).
+// Returns { [bandKey]: { median, count } } for every band with >=1 trusted
+// sample — NOT necessarily >= ESTIMATOR_MIN_BAND_SAMPLES; estimateIssue()
+// applies that threshold per-lookup so a caller inspecting `bands` directly
+// (e.g. a future oversized-multiple-of-median check) can still see the raw
+// sample count behind a band that estimateIssue() itself would call
+// insufficient.
+function buildTrustedPfBands(history) {
+  const runs = Array.isArray(history) ? history : []
+  const buckets = {}
+  for (const run of runs) {
+    if (!run) continue
+    if (run.effective_concurrency !== 1) continue
+    const re = run.reconcile_error
+    if (!(isFiniteNumber(re) && re <= ESTIMATOR_MAX_RECONCILE_ERROR)) continue
+    const rows = Array.isArray(run.by_issue_shape) ? run.by_issue_shape : []
+    for (const row of rows) {
+      if (!row) continue
+      if (row.member_count !== 1) continue
+      if (!row.tracked) continue
+      if (!isFiniteNumber(row.tokens)) continue
+      const band = pfBandKey(row.pf)
+      if (!buckets[band]) buckets[band] = []
+      buckets[band].push(row.tokens)
+    }
+  }
+  const stats = {}
+  for (const band in buckets) {
+    if (!Object.prototype.hasOwnProperty.call(buckets, band)) continue
+    stats[band] = { median: medianOf(buckets[band]), count: buckets[band].length }
+  }
+  return stats
+}
+
+// estimateIssue: one queried issue/unit's estimate off `bandStats` (band ->
+// {median, count} from buildTrustedPfBands). Band-median-else-null, NEVER a
+// global fallback (an issue with zero same-band history gets null, not some
+// other band's number pretending to be shape-matched). A group unit (members
+// array with >1 entries — each entry itself an {issue, predicted_files}-
+// shaped descriptor, mirroring the units deriveUnits() builds) estimates as
+// the SUM of its own members' individual estimates, each banded on that
+// MEMBER's own predicted_files count — not the group's unioned pf — so a
+// bundle's estimate reflects what its parts actually cost separately. Any
+// null member poisons the sum to null (honest: a partial sum would understate
+// the group and silently defeat a budget guard reading it).
+function estimateIssue(it, bandStats) {
+  const issueNum = it && it.issue
+  const members = Array.isArray(it && it.members) ? it.members : null
+  if (members && members.length > 1) {
+    let sum = 0
+    let anyNull = false
+    for (const m of members) {
+      const est = estimateIssue(m, bandStats)
+      if (est.estimate == null) anyNull = true
+      else sum += est.estimate
+    }
+    return {
+      issue: issueNum,
+      pf_band: null,
+      member_count: members.length,
+      estimate: anyNull ? null : sum,
+      confidence: anyNull ? 'insufficient' : 'estimated',
+    }
+  }
+  const pf = isFiniteNumber(it && it.pf) ? it.pf
+    : (Array.isArray(it && it.predicted_files) ? it.predicted_files.length : 0)
+  const band = pfBandKey(pf)
+  const stats = bandStats[band]
+  const trusted = !!stats && stats.count >= ESTIMATOR_MIN_BAND_SAMPLES
+  return {
+    issue: issueNum,
+    pf_band: band,
+    member_count: 1,
+    estimate: trusted ? stats.median : null,
+    confidence: trusted ? 'estimated' : 'insufficient',
+  }
+}
+
+// estimateCost (issue #97 task 2): the public pure reducer.
+//   history - array of parsed runs.jsonl lines (buildLedgerLine's shape).
+//             Missing/malformed entries degrade cleanly (see
+//             buildTrustedPfBands) rather than throwing.
+//   issues  - array of {issue, predicted_files} descriptors to estimate (a
+//             brand-new issue at dry_run has no history of its own, only its
+//             own preflight-predicted shape), optionally carrying `members`
+//             for a consolidated group (see estimateIssue above).
+// Returns { by_issue: [...], bands: {...} } — `bands` is exposed (not just
+// consumed internally) so a later consumer (task 3's oversized-multiple-of-
+// median check) can read the same trusted-band medians without re-deriving
+// them from `history` a second time.
+function estimateCost(history, issues) {
+  const bandStats = buildTrustedPfBands(history)
+  const list = Array.isArray(issues) ? issues : []
+  const byIssue = list.map(function (it) { return estimateIssue(it, bandStats) })
+  return {
+    by_issue: byIssue,
+    bands: bandStats,
+  }
+}
+
+// ============================================================================
 // Outcome grading (issue #92): the read-only back-annotation pass that grades
 // a prior run's merged batch PRs against what actually happened afterward
 // (reverted / issue reopened / needed a hotfix / held up cleanly), so later
