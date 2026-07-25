@@ -4931,6 +4931,54 @@ function computeCompleteness(results, tokenAgg) {
   }
 }
 
+// buildIssueShapeRows (issue #97 task 1): per-unit "shape" summary joined from
+// `results` (this run's per-issue/per-group outcome records) and `units` (the
+// lane-scheduling units that produced them — index-aligned with `results`, see
+// runPool()'s own module comment, but looked up by issue number here rather than
+// position so a future reordering can never silently mismatch). Feeds the
+// history estimateCost() reduces over (issue #97 task 2): one row per unit —
+//   issue        - the unit's primary issue number (r.issue).
+//   pf           - predicted_files count. For a group unit (member_count > 1)
+//                  this is ALREADY the union over every member — deriveUnits()
+//                  computes it via unionField(memberRefs, 'predicted_files')
+//                  before the unit ever reaches the pool (see its module
+//                  comment) — never a per-member sum computed here.
+//   tokens       - this row's token total, joined off tokenAgg.by_issue (itself
+//                  one entry per result — for a group unit that IS the whole
+//                  group's total, not the primary's share of it alone).
+//   tracked      - whether `tokens` is a real, budget-derived number.
+//   member_count - result.members.length (memberIssues(ctx) at the result-build
+//                  site, line ~4378 — results never carry a raw groupId, only
+//                  the resolved member-issue list). >1 flags a group unit so
+//                  estimateCost() never files its union pf + whole-group total
+//                  into a singleton's pf-band.
+function buildIssueShapeRows(results, units, byIssue) {
+  const list = Array.isArray(results) ? results : []
+  const unitByIssue = {}
+  for (const u of (Array.isArray(units) ? units : [])) {
+    if (u && u.issue != null) unitByIssue[u.issue] = u
+  }
+  const tokenByIssue = {}
+  for (const row of (Array.isArray(byIssue) ? byIssue : [])) {
+    if (row && row.issue != null) tokenByIssue[row.issue] = row
+  }
+  const out = []
+  for (const r of list) {
+    if (!r || r.issue == null) continue
+    const u = unitByIssue[r.issue]
+    const pf = (u && Array.isArray(u.predicted_files)) ? u.predicted_files.length : 0
+    const tok = tokenByIssue[r.issue]
+    out.push({
+      issue: r.issue,
+      pf: pf,
+      tokens: (tok && isFiniteNumber(tok.total)) ? tok.total : null,
+      tracked: !!(tok && tok.tracked),
+      member_count: Array.isArray(r.members) ? r.members.length : 1,
+    })
+  }
+  return out
+}
+
 // buildRunRecord (issue #86): assemble the FULL, untruncated machine-readable record
 // for a run. Pure and above the split marker so tests can prove — at 18-issue+ scale —
 // that no per-issue metrics/timeline block is dropped. This object is what the outer
@@ -4941,7 +4989,14 @@ function computeCompleteness(results, tokenAgg) {
 // never reached disk). The Report agent now renders only the human-readable .md; the
 // bytes of the machine record never pass through a model. Shape is byte-for-byte the
 // prior `resultsJson` payload plus a `schema_version` and `run_tag` header, plus (issue
-// #87 task 5) a `completeness` trust flag — see computeCompleteness() just above.
+// #87 task 5) a `completeness` trust flag — see computeCompleteness() just above — plus
+// (issue #97 task 1) `by_issue_shape`/`effective_concurrency`, the estimator's raw
+// history input. `f.units` is optional (defaults to [], pf falls open to 0) so every
+// existing caller/fixture that predates issue #97 keeps working unchanged.
+// `f.effectiveConcurrency` mirrors the dry_run lane preview's own
+// `Math.min(CONCURRENCY, lanes.length)` (see the routing-plan preview above) — the
+// caller passes it through rather than this pure function re-deriving it, since
+// CONCURRENCY/lanes are real-run-only bindings outside buildRunRecord's inputs.
 function buildRunRecord(f) {
   const t = f.tokenAgg || {}
   const m = f.mergeAgg || {}
@@ -4952,12 +5007,13 @@ function buildRunRecord(f) {
   const gy = f.gateYieldAgg || {}
   return {
     completeness: computeCompleteness(f.results, t),
-    schema_version: 1,
+    schema_version: 2,
     run_tag: f.runTag,
     state: f.state,
     base_branch: f.baseBranch,
     batch_branch: f.batchBranch,
     batch_pr: f.batchPr,
+    effective_concurrency: isFiniteNumber(f.effectiveConcurrency) ? f.effectiveConcurrency : null,
     stop: f.stop,
     counts: f.counts,
     verification_gaps: f.verificationGaps,
@@ -5022,6 +5078,7 @@ function buildRunRecord(f) {
       escaped_defects: gy.escaped_defects,
     },
     consolidation_groups: f.consolidationGroups,
+    by_issue_shape: buildIssueShapeRows(f.results, f.units, t.by_issue),
     results: f.results,
   }
 }
@@ -5032,7 +5089,11 @@ function buildRunRecord(f) {
 // runs/<run_tag>.json); this is the index. Pure/above the split marker. Carries
 // `trustworthy` (issue #87 task 5, mirroring record.completeness.trustworthy) so a
 // cross-run trend line can be filtered to only the runs whose telemetry is complete,
-// without re-opening every run's full record to re-derive it.
+// without re-opening every run's full record to re-derive it. Also carries
+// `by_issue_shape` and `effective_concurrency` verbatim off the record (issue #97
+// task 1) — estimateCost() (task 2) reduces over exactly this ledger, not the full
+// per-run record, so the shape rows and their trust signal (effective_concurrency)
+// must live here, not only in runs/<run_tag>.json.
 function buildLedgerLine(record) {
   const r = record || {}
   const t = r.tokens || {}
@@ -5042,6 +5103,7 @@ function buildLedgerLine(record) {
     base_branch: r.base_branch,
     batch_branch: r.batch_branch,
     batch_pr: r.batch_pr,
+    effective_concurrency: isFiniteNumber(r.effective_concurrency) ? r.effective_concurrency : null,
     counts: r.counts,
     issues: Array.isArray(r.results) ? r.results.length : 0,
     tokens_total: t.run_total,
@@ -5051,6 +5113,7 @@ function buildLedgerLine(record) {
     verification_gaps: Array.isArray(r.verification_gaps) ? r.verification_gaps.length : 0,
     stop_tripped: !!(r.stop && r.stop.tripped),
     trustworthy: !!(r.completeness && r.completeness.trustworthy),
+    by_issue_shape: Array.isArray(r.by_issue_shape) ? r.by_issue_shape : [],
   }
 }
 
@@ -6131,10 +6194,11 @@ if (shippedIssues.length) {
 // agent only renders the human .md, so the record bytes never pass through a model.
 const runRecord = buildRunRecord({
   runTag: RUN_TAG, state: state, baseBranch: BASE, batchBranch: TARGET, batchPr: batchPr,
+  effectiveConcurrency: Math.min(CONCURRENCY, lanes.length),
   stop: STOP, counts: counts, verificationGaps: VERIFY_SKIPS, tokensSpent: spentTokens(),
   tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, frictionChurnAgg: FRICTION_CHURN_AGG,
   reworkTaxAgg: REWORK_TAX_AGG, gateYieldAgg: GATE_YIELD_AGG,
-  consolidationGroups: finalGroups, results: results,
+  consolidationGroups: finalGroups, results: results, units: units,
 })
 const resultsJson = JSON.stringify(runRecord, null, 2)
 const report = await agent([
