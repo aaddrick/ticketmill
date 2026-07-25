@@ -232,13 +232,16 @@ That surfaces as an ordinary git conflict at the human merge gate. Manual
 version bumps carried the same exposure already; this stage doesn't add a
 new failure mode.
 
-**Adopting this repo's own profile is a follow-up, not part of this
-change.** `.claude/ticketmill.json` is engine-owned and out of this issue's
-scope, so `profile.release` here stays unset for now. Two agent charters
-still describe per-issue release discipline (`.claude/agents/
-ticketmill-implementer.md` and `ticketmill-code-reviewer.md`, both
-engine-owned) and will need realignment once this repo's own profile turns
-the stage on: an implementer should stop bumping per-issue, and the code
+**This repo's own profile now opts in.** Issue #83 named
+`.claude/ticketmill.json` as explicitly in scope, and the change landed the
+`release` object: `version_files: [".claude-plugin/plugin.json"]`,
+`changelog: "CHANGELOG.md"`, `bump: null`. `profile.release` is read once
+at engine startup, so the batch that adds the field still runs on the old,
+unset profile. The stage takes effect starting with the next self-mill
+run, not the run that turned it on. Two agent charters still describe
+per-issue release discipline (`.claude/agents/ticketmill-implementer.md`
+and `ticketmill-code-reviewer.md`, both engine-owned) and still need
+realignment: an implementer should stop bumping per-issue, and the code
 reviewer should stop flagging a per-issue PR for a missing bump.
 
 ### Merge auto-resolve: one mechanical recovery attempt before needs_human
