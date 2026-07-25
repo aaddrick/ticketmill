@@ -720,6 +720,47 @@ const LEARNINGS_SCHEMA = {
     performance: { type: 'string' }, error_patterns: { type: 'string' }, workflow: { type: 'string' },
   },
 }
+// OUTCOMES_SCHEMA (issue #92): the read-only Select-phase outcome-grading probe
+// (outcomeGradePromise, fired alongside learnPromise below). PIN
+// single-agent-returns-raw: the fs/git/gh-free engine sandbox cannot walk
+// runs.jsonl/runs/<tag>.json itself, so this ONE agent stage does both target
+// discovery (in-prompt) and the live gh reads, and returns raw per-target
+// observations only — it NEVER computes a grade. The engine's deterministic
+// post-hoc pass (gradeFromObservation etc., see the module comment above them)
+// turns these into ledger lines just after learnR is awaited below.
+const OUTCOMES_SCHEMA = {
+  type: 'object', required: ['observations', 'prior_ledger_lines', 'sample_cap_hit', 'now'],
+  properties: {
+    observations: {
+      type: 'array',
+      items: {
+        type: 'object', required: ['run_tag', 'batch_pr', 'issue'],
+        properties: {
+          run_tag: { type: 'string' },
+          batch_pr: { type: ['integer', 'null'] },
+          issue: { type: 'integer' },
+          // live_merge_state: THIS PASS's live `gh pr view` read of batch_pr's
+          // state — never the prior run record's own (possibly stale) state.
+          live_merge_state: { enum: ['open', 'merged', 'closed', 'none', 'unknown'] },
+          revert_found: { type: 'boolean' },
+          reopen_found: { type: 'boolean' },
+          hotfix_ref: { type: ['integer', 'null'] },
+          merged_at: { type: ['string', 'null'] },
+        },
+      },
+    },
+    // prior_ledger_lines: the RAW text lines of outcomes.jsonl, verbatim and
+    // UNPARSED — the engine JSON.parses each line itself post-hoc (see
+    // diffOutcomeGrades' call site below), so the agent never has to
+    // reproduce diffOutcomeGrades' last-line-wins/skip-terminal logic itself.
+    prior_ledger_lines: { type: 'array', items: { type: 'string' } },
+    sample_cap_hit: { type: 'boolean' },
+    // now: the probe's own `date -u` read, passed straight through to
+    // gradeFromObservation's `now` param (the sandbox has no Date.now()/`new
+    // Date()` — see that function's module comment).
+    now: { type: 'string' },
+  },
+}
 // CONSOLIDATION_SCHEMA: the opus-tier Select-phase gate that proposes grouping
 // selected issues into ONE worktree/branch/research/plan/PR unit. Conservative bar —
 // grouping is the exception, so groups[] is expected to be empty on most runs. Each
@@ -5387,10 +5428,11 @@ log('Selected ' + issueList.length + ' issue(s): ' + issueList.map(function (i) 
 // stage prompts: plan gets agent_selection+workflow, contrarians get
 // quality_loop+performance, test stages get test_loop.
 // STAGE_TOKENS.preflight R1: brackets the whole region from just before
-// learnPromise fires to just after it is awaited below — this deliberately
-// spans (never sub-brackets) the fire-and-forget learnPromise itself, plus
-// targetFetch and the preflight Promise.all in between, all of which run
-// strictly sequentially before runPool() (see addStage()'s module comment).
+// learnPromise fires to just after it (and outcomeGradePromise, fired right below
+// it) are awaited below — this deliberately spans (never sub-brackets) the two
+// fire-and-forget promises themselves, plus targetFetch and the preflight
+// Promise.all in between, all of which run strictly sequentially before runPool()
+// (see addStage()'s module comment).
 const preflightR1Before = spentTokens()
 const learnPromise = agent([
   'Read ' + LOGS + '/process-retrospective.md (READ-ONLY).',
@@ -5402,6 +5444,73 @@ const learnPromise = agent([
   'Return found=true and the six category strings.',
 ].join('\n'), { label: 'learnings-digest', phase: 'Select', schema: LEARNINGS_SCHEMA, model: M.learnings.model, effort: M.learnings.effort })
   .catch(function (e) { log('learnings digest failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
+
+// ---- Select: outcome-grading pass (issue #92), fired alongside learnPromise so
+// its latency hides behind the preflight probes too — see the STAGE_TOKENS.preflight
+// R1 bracket comment above. STRICTLY READ-ONLY: cat runs.jsonl/runs/<tag>.json/
+// outcomes.jsonl under LOGS, `gh pr view`/`gh issue view`/server-side `gh search` —
+// no git fetch, no local writes, no repo mutations of any kind. Does its own target
+// discovery in-prompt (the sandbox cannot read LOGS itself to build the target list
+// for it) and returns raw observations only; the deterministic grade decision
+// (gradeFromObservation) runs post-hoc, just after learnR below, using the pure
+// core above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+const outcomeGradePromise = agent([
+  'READ-ONLY outcome-grading pass over ' + REPO + '\'s ticketmill run history under ' + LOGS + '.',
+  'NO repo mutations of any kind: no git fetch, no local file writes, no gh command that changes state —',
+  'only cat and gh READ commands (gh pr view, gh issue view, gh search, gh pr list) below.',
+  '',
+  '0. now: run `date -u +%Y-%m-%dT%H:%M:%SZ` and return it verbatim as `now`.',
+  '',
+  '1. Target discovery — build the gradable-target list from run history:',
+  '   a. cat ' + LOGS + '/runs.jsonl (if missing/empty: return observations=[], prior_ledger_lines=[],',
+  '      sample_cap_hit=false, and now from step 0 — stop here, nothing else to do).',
+  '      Each line is one compact JSON object with (at least) run_tag and batch_pr; `issues` on that line is a',
+  '      COUNT, not a list of issue numbers — do not treat it as one.',
+  '   b. For each DISTINCT run_tag on those lines, cat ' + LOGS + '/runs/<run_tag>.json (the full record). If a',
+  '      run_tag has no such file, skip it (its runs.jsonl line predates the full-record format). Read its own',
+  '      batch_pr field (NOT the runs.jsonl line\'s) and its results[] array (one entry per unit this run',
+  '      processed: {issue, status, members, ...}).',
+  '   c. If a run\'s batch_pr is null, skip all of its issues — nothing ever reached a human-reviewed PR to grade.',
+  '      Otherwise, for each results[] entry with status === "completed", the gradable issue numbers are its',
+  '      members array (fall back to [entry.issue] if members is empty/absent — that is the no-group case).',
+  '      Build one candidate target {run_tag, batch_pr: <the full record\'s batch_pr>, issue: <member>} per member.',
+  '      Skip entries whose status is anything other than "completed" (skipped/error never shipped code).',
+  '   d. cat ' + LOGS + '/outcomes.jsonl (if missing/empty: no prior grades — every candidate survives). Return its',
+  '      raw lines VERBATIM, one array entry per line, as prior_ledger_lines — do not parse, reshape, or',
+  '      interpret them for the RETURNED array; the caller does that. For target SELECTION only (not for what',
+  '      you return), parse each line yourself: per {run_tag, batch_pr, issue} key, using the LAST line that',
+  '      key appears on (later lines override earlier ones), if its grade is one of reverted / reopened / hotfix /',
+  '      closed_unmerged / abandoned, that target is TERMINAL — drop it from the candidate list, it can never be',
+  '      re-graded.',
+  '   e. From the surviving candidates, sort oldest run_tag first (grade the longest-unobserved history first) and',
+  '      keep at most ' + OUTCOME_GRADING.sample_cap + '. Set sample_cap_hit = true if more candidates existed than',
+  '      that cap, else false.',
+  '',
+  '2. For each surviving target, resolve ONE observation. Batch efficiently: reuse a single `gh pr view <batch_pr>`',
+  '   read across every member issue of that same batch_pr instead of re-querying it per issue.',
+  '   a. gh pr view <batch_pr> --repo ' + REPO + ' --json state,mergedAt — a LIVE read; never trust the run',
+  '      record\'s own recorded status, which can be stale (a PR still open when the run finished may have merged',
+  '      since). live_merge_state = "merged" | "open" | "closed" (closed without merging) | "none" (PR not found).',
+  '      merged_at = the ISO mergedAt timestamp when merged, else null.',
+  '   b. revert_found (only meaningful once merged): server-side search for a commit or PR that reverts this PR —',
+  '      gh search commits --repo ' + REPO + ' "Revert" "#<batch_pr>", and gh pr list --repo ' + REPO + ' --state',
+  '      merged --search "Revert #<batch_pr>" as a second angle. true only when a commit/PR is clearly a revert of',
+  '      this specific PR (not merely mentioning its number in passing).',
+  '   c. reopen_found: gh issue view <issue> --repo ' + REPO + ' --json state,timelineItems — scan timelineItems',
+  '      for a ReopenedEvent that occurs AFTER the ClosedEvent this run produced (issue reopened following the',
+  '      batch PR merge, not reopened-then-reclosed earlier in its history). true only on a clear match.',
+  '   d. hotfix_ref: from that SAME timelineItems read, look for a CrossReferencedEvent whose source is a',
+  '      DIFFERENT, later-merged PR that references this issue AND whose title/body language indicates it fixes a',
+  '      problem from the original change (e.g. "fix"/"hotfix"/"regression" — not a routine follow-up feature).',
+  '      hotfix_ref = that PR\'s number, else null.',
+  '   e. On any gh command failure for a target, still return an entry for it with whatever fields you resolved',
+  '      and the rest null/false/"unknown" — never drop a target silently; the caller must see every target it',
+  '      asked about, even a partially-resolved one.',
+  '',
+  'Return observations (array, one entry per target — even partially-resolved ones), prior_ledger_lines (the raw',
+  'outcomes.jsonl lines, verbatim, unparsed), sample_cap_hit, and now (from step 0).',
+].join('\n'), { label: 'outcome-grade', phase: 'Select', schema: OUTCOMES_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+  .catch(function (e) { log('outcome-grading pass failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
 
 // ---- Select: preflight probe (the GitHub-state healing layer) ----
 // enginePathspec (issue #3): the literalized engine-owned pathspec, computed
@@ -5506,6 +5615,7 @@ preflights = engineSkip.preflights
 if (engineSkip.flagged.length) log('engine-owned guardrail: root working tree dirty under an engine-owned path targeted by issue(s) ' + engineSkip.flagged.join(', ') + ' — routed to select-skip (regime a)')
 
 const learnR = await learnPromise
+const outcomeGradeR = await outcomeGradePromise
 addStage('preflight', preflightR1Before) // STAGE_TOKENS.preflight R1 close — see the bracket comment above learnPromise
 if (learnR && learnR.found) {
   LEARN = learnR
@@ -5513,6 +5623,40 @@ if (learnR && learnR.found) {
     .filter(function (c) { return learnR[c] }).join(', '))
 } else {
   log('no prior-run learnings digest — plan stage falls back to reading the retro file itself')
+}
+
+// ---- Select: outcome-grading post-hoc (issue #92) — turn outcomeGradeR's raw,
+// judgment-free observations into ledger lines using the deterministic pure core
+// above the TICKETMILL-TEST-HARNESS-SPLIT marker (gradeFromObservation,
+// buildOutcomeLine, diffOutcomeGrades, summarizeOutcomeCoverage). The agent never
+// decides a grade itself — only this JS does, so the decision logic lives in one
+// place and stays unit-testable (tests/outcomes.test.js) without ever shelling out.
+let OUTCOMES_TO_APPEND = []
+let OUTCOMES_COVERAGE = summarizeOutcomeCoverage([], [], false)
+if (outcomeGradeR) {
+  // prior_ledger_lines arrives as raw, unparsed text (the agent never interprets
+  // it — see OUTCOMES_SCHEMA's module comment); parse it here, dropping any line
+  // that fails to parse rather than letting one bad line abort the whole pass.
+  const priorLedgerObjects = (Array.isArray(outcomeGradeR.prior_ledger_lines) ? outcomeGradeR.prior_ledger_lines : [])
+    .map(function (line) { try { return JSON.parse(line) } catch (e) { return null } })
+    .filter(Boolean)
+  const observations = Array.isArray(outcomeGradeR.observations) ? outcomeGradeR.observations : []
+  const gradedLines = observations.map(function (o) {
+    const g = gradeFromObservation({
+      pr_state: o.live_merge_state,
+      merged_at: o.merged_at,
+      reverted: !!o.revert_found,
+      reopened: !!o.reopen_found,
+      hotfix_pr: o.hotfix_ref,
+    }, outcomeGradeR.now)
+    return buildOutcomeLine({ run_tag: o.run_tag, batch_pr: o.batch_pr, issue: o.issue, grade: g.grade, signals: g.signals, decided_at: outcomeGradeR.now })
+  })
+  OUTCOMES_TO_APPEND = diffOutcomeGrades(gradedLines, priorLedgerObjects)
+  OUTCOMES_COVERAGE = summarizeOutcomeCoverage(observations, gradedLines, outcomeGradeR.sample_cap_hit)
+  log('outcome grading: ' + gradedLines.length + ' target(s) graded, ' + OUTCOMES_TO_APPEND.length + ' new/changed ledger line(s)' +
+    (OUTCOMES_COVERAGE.sample_cap_hit ? ' (sample cap hit — history not fully caught up yet)' : ''))
+} else {
+  log('outcome-grading pass failed or returned nothing (non-fatal) — no outcome ledger lines this run')
 }
 
 // ---- Select: consolidation gate (judgment call — see the PROPOSECONSOLIDATION
@@ -6106,6 +6250,16 @@ return {
   logs_dir: LOGS,
   record: runRecord,
   ledger: buildLedgerLine(runRecord),
+  // issue #92: outcome grading, same deterministic-persistence contract as
+  // record/ledger above — the outer mill skill appends each `outcomes` line
+  // (already new/changed-only, per diffOutcomeGrades) to `outcomes_path`
+  // (<logs_dir>/outcomes.jsonl) with a real fs Write, never via an agent.
+  // `outcomes_coverage` is the small machine-readable rollup a later
+  // observability tier (or this run's own report) reads instead of re-walking
+  // the ledger — see summarizeOutcomeCoverage's module comment.
+  outcomes: OUTCOMES_TO_APPEND,
+  outcomes_path: LOGS + '/outcomes.jsonl',
+  outcomes_coverage: OUTCOMES_COVERAGE,
   report: report ? report.report_path : null,
   summary_table: report ? report.markdown_summary : null,
   lane_prediction_accuracy: retro ? (retro.lane_prediction_accuracy || null) : null,
