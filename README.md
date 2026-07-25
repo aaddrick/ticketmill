@@ -313,7 +313,8 @@ load-bearing fields:
 ```
 .claude-plugin/    plugin.json + marketplace.json (this repo is its own marketplace)
 workflows/         ticketmill.js, the engine (invoked via Workflow scriptPath)
-skills/            mill (launch), mill-init (onboarding), forge-agent (agent generation)
+skills/            mill (launch), mill-init (onboarding), forge-agent (agent generation),
+                   mill-review (read-only cross-run trend dashboard over the run ledger)
 templates/         agents/contrarian.md, copied into repos that lack one
 scripts/           setup-worktree.sh (worktree creation), lint-engine.js (sandbox/lockstep gate)
 tests/             the test suite gating every run
