@@ -4649,6 +4649,9 @@ function computeCompleteness(results, tokenAgg) {
 function buildRunRecord(f) {
   const t = f.tokenAgg || {}
   const m = f.mergeAgg || {}
+  const fc = f.frictionChurnAgg || {}
+  const fcFriction = fc.friction || {}
+  const fcChurn = fc.churn || {}
   return {
     completeness: computeCompleteness(f.results, t),
     schema_version: 1,
@@ -4676,6 +4679,27 @@ function buildRunRecord(f) {
       resolved_issues: m.resolved_issues,
       thrash_count: m.thrash_count,
       thrash_issues: m.thrash_issues,
+    },
+    // friction_churn (issue #89): machine-readable fields only (no markdown) —
+    // mirrors the tokens/merge_auto_resolve shape above. Additive top-level key;
+    // never removes or renames an existing field, so it stays safe against #86's
+    // zero-field-loss tests (they assert no per-issue block is dropped, not
+    // top-level key exclusivity).
+    friction_churn: {
+      has_signal: !!fc.has_signal,
+      friction: {
+        has_signal: !!fcFriction.has_signal,
+        by_issue: fcFriction.by_issue,
+        by_stage: fcFriction.by_stage,
+        top_issues: fcFriction.top_issues,
+        top_stages: fcFriction.top_stages,
+      },
+      churn: {
+        has_signal: !!fcChurn.has_signal,
+        hotspots: fcChurn.hotspots,
+        refix_chains: fcChurn.refix_chains,
+        buckets: fcChurn.buckets,
+      },
     },
     consolidation_groups: f.consolidationGroups,
     results: f.results,
@@ -5270,6 +5294,12 @@ const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY, STAGE_TOK
 // ---- Merge auto-resolution: JS-computed run-level rollup, injected verbatim below ----
 const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
 
+// ---- Friction & churn (issue #89): JS-computed run-level rollup, injected verbatim
+// below. serializeGlobs is the same profile-driven array computeLanes/the engine-owned
+// guardrail already use (declared above at the lane-scheduling call site); ENGINE_OWNED
+// is the module-level array populated at Select. ----
+const FRICTION_CHURN_AGG = composeFrictionChurn(results, { serializeGlobs: serializeGlobs, engineOwned: ENGINE_OWNED })
+
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
 // shippedIssues (issue #30): the union, across THIS pass's completions and any
@@ -5410,6 +5440,10 @@ if (shippedIssues.length) {
     VERIFY_SKIPS.length
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
+    FRICTION_CHURN_AGG.has_signal
+      ? '   - this "## Friction & Churn" section, injected VERBATIM (already computed in JS — do not recompute,\n' +
+        '     re-sum, or add commentary beyond copying it in):\n' + FRICTION_CHURN_AGG.markdown
+      : '   - (no friction or churn signal this run)',
     '   - a note that per-issue PRs were squash-merged into ' + TARGET + ' with full review trails on each issue.',
     '   - this "## Merge Auto-Resolution" section, injected VERBATIM (already computed in JS — do not recompute,',
     '     re-sum, or add commentary beyond copying it in):\n' + MERGE_RESOLVE_AGG.markdown,
@@ -5433,7 +5467,8 @@ if (shippedIssues.length) {
 const runRecord = buildRunRecord({
   runTag: RUN_TAG, state: state, baseBranch: BASE, batchBranch: TARGET, batchPr: batchPr,
   stop: STOP, counts: counts, verificationGaps: VERIFY_SKIPS, tokensSpent: spentTokens(),
-  tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, consolidationGroups: finalGroups, results: results,
+  tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, frictionChurnAgg: FRICTION_CHURN_AGG,
+  consolidationGroups: finalGroups, results: results,
 })
 const resultsJson = JSON.stringify(runRecord, null, 2)
 const report = await agent([
@@ -5457,6 +5492,10 @@ const report = await agent([
   '   Include this "## Token Usage" section VERBATIM (already',
   '   computed in JS — do not recompute, re-sum, or add commentary beyond copying it in):',
   TOKEN_AGG.markdown,
+  FRICTION_CHURN_AGG.has_signal
+    ? '   Include this "## Friction & Churn" section VERBATIM (already computed in JS — do not recompute,\n' +
+      '   re-sum, or add commentary beyond copying it in):\n' + FRICTION_CHURN_AGG.markdown
+    : '   (no friction or churn signal this run — omit the "## Friction & Churn" section entirely)',
   '3. Include the current timestamp from: date -Iseconds',
   RUN_TAG === 'run' ? '4. The tag "run" is a collision-prone default: substitute the current date (date +%F) for "run" in the .md filename so successive runs do not overwrite each other, and return the actual path.' : '',
   '',
