@@ -303,6 +303,16 @@ const MAX_TOUCH_FILES = 100
 // comment already sets for gating efficiency metrics; not a correctness input,
 // only a display/trust-flag threshold.
 const MAX_RECONCILE_ERROR_FOR_TRUST = 0.05
+// churn analytics (issue #89): a file appearing in >= this many DISTINCT
+// issues' ctx.changed_files within one run is a cross-issue hotspot (computeChurn) —
+// 2 is the smallest number that actually means "more than one issue collided on
+// this file"; 1 would flag every file every issue ever touches.
+const HOTSPOT_ISSUE_THRESHOLD = 2
+// churn analytics (issue #89): a file whose ctx.touch_counts[file] (see
+// tallyTouches()) reaches this many re-touches WITHIN one issue is a re-fix
+// chain (computeChurn) — mirrors the "3+ fix rounds is a smell" bar the quality/
+// test loops already use informally; 1-2 touches is ordinary iterate-and-fix.
+const REFIX_THRESHOLD = 3
 
 // ----- model policy (profile.models may override any stage key) -----
 const M = {
@@ -1928,6 +1938,315 @@ function aggregateMergeAutoResolve(results) {
     thrash_count: thrashIssues.length,
     thrash_issues: thrashIssues,
     markdown: lines.join('\n'),
+  }
+}
+
+// FRICTION_WEIGHTS (issue #89): named per-signal weights for computeFriction's
+// non-stage "signal terms" — friction sources a capped iteration ratio can't
+// see. Multiplied by the signal's raw count (1 for a boolean signal) and
+// summed alongside the seven capped stage ratios. Ordered/weighted by how much
+// extra rework each signal actually costs:
+//   needs_human             - the unit never resolved on its own; the single
+//                             worst outcome a run can produce, so it dominates.
+//   merge_thrash             - the batch branch moved again mid-rebase, forcing
+//                             a mandatory re-test + re-rebase cycle.
+//   contrarian_capped        - a flat penalty for hitting a contrarian cap WITH
+//                             findings still unresolved (frictionFields).
+//   unresolved_count         - per-finding granularity ON TOP OF contrarian_capped,
+//                             so a capped-out issue carrying five open findings
+//                             scores higher than one carrying only one.
+//   quality_degrades         - each time the quality loop accepted a "degraded"
+//                             exit instead of a clean approval.
+//   test_quality_fix_rounds  - each extra fix round the test-quality gate forced.
+const FRICTION_WEIGHTS = {
+  needs_human: 2,
+  merge_thrash: 1.5,
+  contrarian_capped: 1,
+  unresolved_count: 0.25,
+  quality_degrades: 0.5,
+  test_quality_fix_rounds: 0.3,
+}
+
+// FRICTION_TOP_N (issue #89): bounds how many bumpiest issues/stages
+// computeFriction ranks into top_issues/top_stages — a human-readability cap
+// on the rendered markdown table, like MAX_LANE_ACCURACY_SAMPLES bounds the
+// retrospective sample. by_issue/by_stage (the full, unranked breakdown) are
+// never truncated by this cap.
+const FRICTION_TOP_N = 5
+
+// computeFriction (issue #89): pure per-issue/per-stage friction rollup — no
+// LLM math, same "load via harness.boot(), call directly" pattern as
+// aggregateTokens/aggregateMergeAutoResolve above, meant to be injected
+// verbatim (via composeFrictionChurn) into the batch-PR body / report agent.
+//
+// Each of the seven capped pipeline stages (approach/plan/task-review/quality/
+// test/browser/pr-review) contributes a normalized min(1, iters/cap) ratio —
+// running below a cap is normal, not friction, so a unit that cleared every
+// gate on its first pass scores 0 there regardless of how many stages it has.
+// Caps are read LIVE off module scope inside the function body (MAX_CONTRARIAN_
+// ITERATIONS et al — the same idiom aggregateTokens uses reading STAGE_LABELS),
+// never captured once at module load, so a __seed()-overridden cap in tests
+// changes the ratio it computes, not a stale snapshot.
+//
+// On top of the seven ratios, FRICTION_WEIGHTS-weighted signal terms add
+// friction a pure iteration count can't see: frictionFields' contrarian_capped/
+// unresolved_count/needs_human (spread onto every result — see frictionFields'
+// own doc comment) plus ctx.metrics' quality_degrades/test_quality_fix_rounds/
+// merge_thrash. Each nonzero stage/signal becomes one entry in that issue's
+// `drivers` breakdown, sorted by contribution descending, so the markdown/JSON
+// both explain WHY an issue ranked where it did, not just its final score.
+//
+// Defensive the same way aggregateMergeAutoResolve is about a null/empty
+// results array or a result missing .metrics — degrades to a clean, empty,
+// has_signal:false rollup, never throws.
+function computeFriction(results) {
+  const list = results || []
+  const caps = {
+    approach: MAX_CONTRARIAN_ITERATIONS,
+    plan: MAX_CONTRARIAN_ITERATIONS,
+    'task-review': MAX_TASK_REVIEW_ATTEMPTS,
+    quality: MAX_QUALITY_ITERATIONS,
+    test: MAX_TEST_ITERATIONS,
+    browser: MAX_BROWSER_ITERATIONS,
+    'pr-review': MAX_PR_REVIEW_ITERATIONS,
+  }
+  const stageField = {
+    approach: 'approach_iters',
+    plan: 'plan_iters',
+    'task-review': 'task_review_attempts',
+    quality: 'quality_iters',
+    test: 'test_iters',
+    browser: 'browser_iters',
+    'pr-review': 'pr_review_iters',
+  }
+  const stageKeys = Object.keys(caps)
+
+  const byIssue = []
+  const stageTotals = {}
+  for (const k of stageKeys) stageTotals[k] = { total: 0, count: 0 }
+
+  for (const r of list) {
+    const m = (r && r.metrics) || {}
+    const drivers = []
+    let score = 0
+
+    for (const k of stageKeys) {
+      const cap = caps[k] > 0 ? caps[k] : 1 // guard a misconfigured 0/negative cap from dividing by zero
+      const iters = Number(m[stageField[k]]) || 0
+      const ratio = Math.min(1, iters / cap)
+      if (ratio > 0) {
+        drivers.push({ name: k, value: iters, weight: null, contribution: ratio })
+        stageTotals[k].total += ratio
+        stageTotals[k].count += 1
+      }
+      score += ratio
+    }
+
+    // Signal terms: contrarian_capped/unresolved_count/needs_human come off the
+    // result's top-level frictionFields spread; quality_degrades/merge_thrash
+    // stay nested under .metrics (frictionFields never mirrors them there).
+    const signals = {
+      needs_human: r && r.needs_human ? 1 : 0,
+      merge_thrash: Number(m.merge_thrash) || 0,
+      contrarian_capped: r && r.contrarian_capped ? 1 : 0,
+      unresolved_count: Number(r && r.unresolved_count) || 0,
+      quality_degrades: Number(m.quality_degrades) || 0,
+      test_quality_fix_rounds: Number(r && r.test_quality_fix_rounds) || 0,
+    }
+    for (const name in signals) {
+      if (!Object.prototype.hasOwnProperty.call(signals, name)) continue
+      const raw = signals[name]
+      if (!raw) continue
+      const weight = FRICTION_WEIGHTS[name]
+      const contribution = raw * weight
+      drivers.push({ name: name, value: raw, weight: weight, contribution: contribution })
+      score += contribution
+    }
+
+    drivers.sort(function (a, b) { return b.contribution - a.contribution })
+    byIssue.push({ issue: r && r.issue, score: score, drivers: drivers })
+  }
+
+  const byStage = {}
+  for (const k of stageKeys) {
+    byStage[k] = { total: stageTotals[k].total, avg: list.length ? stageTotals[k].total / list.length : 0, count: stageTotals[k].count }
+  }
+
+  const topIssues = byIssue
+    .filter(function (i) { return i.score > 0 })
+    .slice()
+    .sort(function (a, b) { return b.score - a.score })
+    .slice(0, FRICTION_TOP_N)
+  const topStages = stageKeys
+    .map(function (k) { return Object.assign({ stage: k }, byStage[k]) })
+    .filter(function (s) { return s.total > 0 })
+    .sort(function (a, b) { return b.total - a.total })
+    .slice(0, FRICTION_TOP_N)
+
+  const hasSignal = topIssues.length > 0
+
+  const lines = []
+  lines.push('### Friction')
+  lines.push('')
+  if (!hasSignal) {
+    lines.push('No friction signal this run — every stage resolved within its normal range.')
+  } else {
+    lines.push('Bumpiest issues this run (ranked by weighted friction score):')
+    lines.push('')
+    lines.push('| Issue | Score | Top drivers |')
+    lines.push('| --- | --- | --- |')
+    for (const row of topIssues) {
+      const topDrivers = row.drivers.slice(0, 3).map(function (d) { return d.name + ' (' + d.contribution.toFixed(2) + ')' }).join(', ')
+      lines.push('| #' + row.issue + ' | ' + row.score.toFixed(2) + ' | ' + (topDrivers || '—') + ' |')
+    }
+    if (topStages.length) {
+      lines.push('')
+      lines.push('Bumpiest stages this run (summed capped ratio across issues):')
+      lines.push('')
+      lines.push('| Stage | Total | Issues hit |')
+      lines.push('| --- | --- | --- |')
+      for (const s of topStages) {
+        lines.push('| ' + s.stage + ' | ' + s.total.toFixed(2) + ' | ' + s.count + ' |')
+      }
+    }
+  }
+
+  return {
+    by_issue: byIssue,
+    by_stage: byStage,
+    top_issues: topIssues,
+    top_stages: topStages,
+    has_signal: hasSignal,
+    markdown: lines.join('\n'),
+  }
+}
+
+// computeChurn (issue #89): pure within-run churn rollup — from every result's
+// retained ctx.changed_files/ctx.touch_counts (issue #87), finds:
+//   - cross-issue hotspots: a file that shows up in >= HOTSPOT_ISSUE_THRESHOLD
+//     DISTINCT issues' changed_files this run (two+ issues collided on it).
+//   - re-fix chains: a file an issue's OWN touch_counts revisited
+//     >= REFIX_THRESHOLD times (that issue kept coming back to it).
+// Both are then bucketed serialize_globs / engine_owned / surprising via
+// matchesGlobs(file, globs) — `serializeGlobs`/`engineOwned` are passed as
+// PARAMS (mirroring matchesGlobs' own call sites), not read off module scope,
+// so a test (or a future profile-driven caller) can vary the bucketing without
+// seeding module state. A file matching both is bucketed serialize_globs first
+// (an expected-hot file the profile already flagged takes priority over the
+// engine's own default set).
+// Defensive the same way aggregateMergeAutoResolve is about a null/empty
+// results array or a result missing .changed_files/.touch_counts — degrades
+// to a clean, empty, has_signal:false rollup, never throws.
+function computeChurn(results, opts) {
+  const o = opts || {}
+  const serializeGlobs = Array.isArray(o.serializeGlobs) ? o.serializeGlobs : []
+  const engineOwned = Array.isArray(o.engineOwned) ? o.engineOwned : []
+  const list = results || []
+
+  function bucketFor(file) {
+    if (matchesGlobs(file, serializeGlobs)) return 'serialize_globs'
+    if (matchesGlobs(file, engineOwned)) return 'engine_owned'
+    return 'surprising'
+  }
+
+  // ---- cross-issue hotspots: file -> distinct issues whose changed_files hit it ----
+  const fileIssues = {}
+  for (const r of list) {
+    const issue = r && r.issue
+    for (const f of ((r && r.changed_files) || [])) {
+      const key = String(f || '').trim()
+      if (!key) continue
+      if (!fileIssues[key]) fileIssues[key] = []
+      if (fileIssues[key].indexOf(issue) === -1) fileIssues[key].push(issue)
+    }
+  }
+  const hotspots = Object.keys(fileIssues)
+    .filter(function (f) { return fileIssues[f].length >= HOTSPOT_ISSUE_THRESHOLD })
+    .map(function (f) { return { file: f, issues: fileIssues[f].slice(), count: fileIssues[f].length, bucket: bucketFor(f) } })
+    .sort(function (a, b) { return b.count - a.count })
+
+  // ---- within-issue re-fix chains: an issue's own touch_counts[file] hit the cap ----
+  const refixChains = []
+  for (const r of list) {
+    const issue = r && r.issue
+    const tc = (r && r.touch_counts) || {}
+    for (const f in tc) {
+      if (!Object.prototype.hasOwnProperty.call(tc, f)) continue
+      const count = tc[f]
+      if (count >= REFIX_THRESHOLD) refixChains.push({ issue: issue, file: f, count: count, bucket: bucketFor(f) })
+    }
+  }
+  refixChains.sort(function (a, b) { return b.count - a.count })
+
+  const buckets = {
+    serialize_globs: { hotspots: [], refix_chains: [] },
+    engine_owned: { hotspots: [], refix_chains: [] },
+    surprising: { hotspots: [], refix_chains: [] },
+  }
+  for (const h of hotspots) buckets[h.bucket].hotspots.push(h)
+  for (const c of refixChains) buckets[c.bucket].refix_chains.push(c)
+
+  const hasSignal = hotspots.length > 0 || refixChains.length > 0
+
+  const lines = []
+  lines.push('### Churn')
+  lines.push('')
+  if (!hasSignal) {
+    lines.push('No cross-issue hotspots or re-fix chains this run.')
+  } else {
+    if (hotspots.length) {
+      lines.push('Cross-issue hotspots (touched by ' + HOTSPOT_ISSUE_THRESHOLD + '+ issues this run):')
+      lines.push('')
+      lines.push('| File | Issues | Bucket |')
+      lines.push('| --- | --- | --- |')
+      for (const h of hotspots) lines.push('| ' + h.file + ' | ' + fmtIssues(h.issues) + ' | ' + h.bucket + ' |')
+    }
+    if (refixChains.length) {
+      if (hotspots.length) lines.push('')
+      lines.push('Re-fix chains (touched ' + REFIX_THRESHOLD + '+ times within one issue):')
+      lines.push('')
+      lines.push('| Issue | File | Touches | Bucket |')
+      lines.push('| --- | --- | --- | --- |')
+      for (const c of refixChains) lines.push('| #' + c.issue + ' | ' + c.file + ' | ' + c.count + ' | ' + c.bucket + ' |')
+    }
+  }
+
+  return {
+    hotspots: hotspots,
+    refix_chains: refixChains,
+    buckets: buckets,
+    has_signal: hasSignal,
+    markdown: lines.join('\n'),
+  }
+}
+
+// composeFrictionChurn (issue #89): the composer that emits ONE '## Friction &
+// Churn' section combining computeFriction's and computeChurn's own '###'
+// sub-blocks — same role aggregateTokens/aggregateMergeAutoResolve play
+// standalone, except this section is gated on has_signal for clean omission
+// (like the VERIFY_SKIPS.length ternary at the batch-PR body call site): a run
+// with neither friction nor churn signal renders nothing at all, rather than an
+// empty heading. Returns the two sub-rollups too so a caller (buildRunRecord,
+// the report agent) can read the machine-readable fields without recomputing.
+function composeFrictionChurn(results, opts) {
+  const friction = computeFriction(results)
+  const churn = computeChurn(results, opts)
+  const hasSignal = friction.has_signal || churn.has_signal
+
+  const lines = []
+  if (hasSignal) {
+    lines.push('## Friction & Churn')
+    lines.push('')
+    if (friction.has_signal) lines.push(friction.markdown)
+    if (friction.has_signal && churn.has_signal) lines.push('')
+    if (churn.has_signal) lines.push(churn.markdown)
+  }
+
+  return {
+    friction: friction,
+    churn: churn,
+    has_signal: hasSignal,
+    markdown: hasSignal ? lines.join('\n') : '',
   }
 }
 
@@ -4330,6 +4649,9 @@ function computeCompleteness(results, tokenAgg) {
 function buildRunRecord(f) {
   const t = f.tokenAgg || {}
   const m = f.mergeAgg || {}
+  const fc = f.frictionChurnAgg || {}
+  const fcFriction = fc.friction || {}
+  const fcChurn = fc.churn || {}
   return {
     completeness: computeCompleteness(f.results, t),
     schema_version: 1,
@@ -4357,6 +4679,27 @@ function buildRunRecord(f) {
       resolved_issues: m.resolved_issues,
       thrash_count: m.thrash_count,
       thrash_issues: m.thrash_issues,
+    },
+    // friction_churn (issue #89): machine-readable fields only (no markdown) —
+    // mirrors the tokens/merge_auto_resolve shape above. Additive top-level key;
+    // never removes or renames an existing field, so it stays safe against #86's
+    // zero-field-loss tests (they assert no per-issue block is dropped, not
+    // top-level key exclusivity).
+    friction_churn: {
+      has_signal: !!fc.has_signal,
+      friction: {
+        has_signal: !!fcFriction.has_signal,
+        by_issue: fcFriction.by_issue,
+        by_stage: fcFriction.by_stage,
+        top_issues: fcFriction.top_issues,
+        top_stages: fcFriction.top_stages,
+      },
+      churn: {
+        has_signal: !!fcChurn.has_signal,
+        hotspots: fcChurn.hotspots,
+        refix_chains: fcChurn.refix_chains,
+        buckets: fcChurn.buckets,
+      },
     },
     consolidation_groups: f.consolidationGroups,
     results: f.results,
@@ -4951,6 +5294,12 @@ const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY, STAGE_TOK
 // ---- Merge auto-resolution: JS-computed run-level rollup, injected verbatim below ----
 const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
 
+// ---- Friction & churn (issue #89): JS-computed run-level rollup, injected verbatim
+// below. serializeGlobs is the same profile-driven array computeLanes/the engine-owned
+// guardrail already use (declared above at the lane-scheduling call site); ENGINE_OWNED
+// is the module-level array populated at Select. ----
+const FRICTION_CHURN_AGG = composeFrictionChurn(results, { serializeGlobs: serializeGlobs, engineOwned: ENGINE_OWNED })
+
 // ---- Batch PR: TARGET -> BASE, created for HUMAN review — never merged by the run ----
 let batchPr = null
 // shippedIssues (issue #30): the union, across THIS pass's completions and any
@@ -5091,6 +5440,10 @@ if (shippedIssues.length) {
     VERIFY_SKIPS.length
       ? '   - a "## Verification Gaps" section the reviewer MUST see, listing EXACTLY these lines:\n' + VERIFY_SKIPS.map(function (s) { return '     - ' + s }).join('\n')
       : '   - (all verification gates ran; no gaps section needed)',
+    FRICTION_CHURN_AGG.has_signal
+      ? '   - this "## Friction & Churn" section, injected VERBATIM (already computed in JS — do not recompute,\n' +
+        '     re-sum, or add commentary beyond copying it in):\n' + FRICTION_CHURN_AGG.markdown
+      : '   - (no friction or churn signal this run)',
     '   - a note that per-issue PRs were squash-merged into ' + TARGET + ' with full review trails on each issue.',
     '   - this "## Merge Auto-Resolution" section, injected VERBATIM (already computed in JS — do not recompute,',
     '     re-sum, or add commentary beyond copying it in):\n' + MERGE_RESOLVE_AGG.markdown,
@@ -5114,7 +5467,8 @@ if (shippedIssues.length) {
 const runRecord = buildRunRecord({
   runTag: RUN_TAG, state: state, baseBranch: BASE, batchBranch: TARGET, batchPr: batchPr,
   stop: STOP, counts: counts, verificationGaps: VERIFY_SKIPS, tokensSpent: spentTokens(),
-  tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, consolidationGroups: finalGroups, results: results,
+  tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, frictionChurnAgg: FRICTION_CHURN_AGG,
+  consolidationGroups: finalGroups, results: results,
 })
 const resultsJson = JSON.stringify(runRecord, null, 2)
 const report = await agent([
@@ -5138,6 +5492,10 @@ const report = await agent([
   '   Include this "## Token Usage" section VERBATIM (already',
   '   computed in JS — do not recompute, re-sum, or add commentary beyond copying it in):',
   TOKEN_AGG.markdown,
+  FRICTION_CHURN_AGG.has_signal
+    ? '   Include this "## Friction & Churn" section VERBATIM (already computed in JS — do not recompute,\n' +
+      '   re-sum, or add commentary beyond copying it in):\n' + FRICTION_CHURN_AGG.markdown
+    : '   (no friction or churn signal this run — omit the "## Friction & Churn" section entirely)',
   '3. Include the current timestamp from: date -Iseconds',
   RUN_TAG === 'run' ? '4. The tag "run" is a collision-prone default: substitute the current date (date +%F) for "run" in the .md filename so successive runs do not overwrite each other, and return the actual path.' : '',
   '',

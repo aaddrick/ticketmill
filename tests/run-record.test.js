@@ -143,3 +143,55 @@ test('buildLedgerLine reports stop_tripped and gap counts from a circuit-broken 
   assert.strictEqual(line.state, 'circuit_breaker')
   assert.strictEqual(line.verification_gaps, 2)
 })
+
+// ---- friction_churn pass-through (issue #89) ----
+//
+// Every fixture above omits frictionChurnAgg entirely, so buildRunRecord's
+// `friction_churn` field was only ever exercised via its {} default — a
+// gap flagged in the Test Validation (iteration 1) verdict on issue #89.
+// These tests feed buildRunRecord a REAL composeFrictionChurn(...) output
+// (built from a results fixture that actually has friction/churn signal, the
+// same shape workflows/ticketmill.js:5301/5470 constructs in production) and
+// assert the machine-readable sub-fields survive verbatim.
+
+test('buildRunRecord threads a real frictionChurnAgg through to friction_churn verbatim', function () {
+  const context = harness.boot()
+  const results = fixtureResults(2)
+  // Give the fixture real friction/churn signal: issue 100 saturates quality
+  // iters, both issues touch the same file (cross-issue hotspot).
+  results[0].metrics.quality_iters = 999
+  results[0].changed_files = ['shared/util.js']
+  results[0].touch_counts = {}
+  results[1].changed_files = ['shared/util.js']
+  results[1].touch_counts = {}
+
+  const frictionChurnAgg = context.composeFrictionChurn(results, { serializeGlobs: [], engineOwned: [] })
+  assert.ok(frictionChurnAgg.has_signal, 'fixture must actually carry friction/churn signal to exercise the pass-through')
+
+  const record = makeRecord(context, results, { frictionChurnAgg: frictionChurnAgg })
+
+  assert.strictEqual(record.friction_churn.has_signal, true)
+  assert.strictEqual(record.friction_churn.friction.has_signal, true)
+  assert.strictEqual(record.friction_churn.friction.by_issue.length, frictionChurnAgg.friction.by_issue.length)
+  assert.strictEqual(record.friction_churn.friction.top_issues.length, frictionChurnAgg.friction.top_issues.length)
+  assert.strictEqual(record.friction_churn.friction.top_issues[0].issue, frictionChurnAgg.friction.top_issues[0].issue)
+  assert.strictEqual(record.friction_churn.churn.has_signal, true)
+  assert.strictEqual(record.friction_churn.churn.hotspots.length, 1)
+  assert.strictEqual(record.friction_churn.churn.hotspots[0].file, 'shared/util.js')
+  assert.strictEqual(record.friction_churn.churn.hotspots[0].count, 2)
+  assert.ok(record.friction_churn.churn.buckets, 'buckets object must pass through, not be dropped')
+  assert.strictEqual(record.friction_churn.churn.buckets.surprising.hotspots.length, 1)
+  // No markdown leaks into the machine record — it's a separate field on the composer.
+  assert.strictEqual(record.friction_churn.markdown, undefined)
+})
+
+test('buildRunRecord defaults friction_churn to a clean, signal-free shape when frictionChurnAgg is omitted', function () {
+  const context = harness.boot()
+  const record = makeRecord(context, fixtureResults(1))
+
+  assert.strictEqual(record.friction_churn.has_signal, false)
+  assert.strictEqual(record.friction_churn.friction.has_signal, false)
+  assert.strictEqual(record.friction_churn.churn.has_signal, false)
+  assert.strictEqual(record.friction_churn.friction.by_issue, undefined)
+  assert.strictEqual(record.friction_churn.churn.hotspots, undefined)
+})
