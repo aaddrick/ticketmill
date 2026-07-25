@@ -1435,7 +1435,14 @@ function applyRealRunCollapseGuard(units, lanes, concurrency, serializeGlobs) {
 }
 
 // ----- batch state -----
-const STOP = { tripped: false, reason: '' }
+// STOP.kind (issue #97 task 4): null for the pre-existing reactive breakers
+// (BATCH.failures circuit breaker, recordAgentDeath's consecutive-death
+// breaker, isBudgetExhaustedError's real-exhaustion-message breaker — all
+// still surface as state:'circuit_breaker'), 'budget' ONLY for the new
+// proactive runPool()/drainUnit() token_budget guard below — distinct so the
+// final state/resume_hint can tell "an agent call actually failed/died" apart
+// from "we stopped BEFORE spending more, on purpose, before anything failed".
+const STOP = { tripped: false, reason: '', kind: null }
 const BATCH = { failures: 0, consecutiveDeaths: 0 }
 // STAGE_TOKENS: region-boundary token buckets for Select-phase orchestration
 // spend that has no per-issue ctx to attribute to (see aggregateTokens' byStage
@@ -1446,8 +1453,17 @@ const BATCH = { failures: 0, consecutiveDeaths: 0 }
 const STAGE_TOKENS = { preflight: 0, select: 0 }
 let LEARN = null // category digests distilled from process-retrospective.md (Select phase)
 
-function tripStop(reason) {
-  if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; log('STOP: ' + reason) }
+function tripStop(reason, kind) {
+  if (!STOP.tripped) { STOP.tripped = true; STOP.reason = reason; STOP.kind = kind || null; log('STOP: ' + reason) }
+}
+
+// tripBudgetStop (issue #97 task 4): the proactive token_budget guard's own
+// trip path, always tagged kind:'budget' — see the STOP.kind module comment
+// above for why this must stay distinct from the plain tripStop(reason) the
+// reactive breakers (circuit breaker, consecutive deaths, real budget-
+// exhaustion error message) already use.
+function tripBudgetStop(reason) {
+  tripStop(reason, 'budget')
 }
 
 // isBudgetExhaustedError: only a real budget/token-exhaustion signature is
@@ -4500,7 +4516,27 @@ async function processIssue(pre) {
 // unit-level work — a throw partway through one lane can never tear down another
 // lane's in-flight or already-written results, and results.length always stays
 // items.length no matter what any single fn() call does.
-async function runPool(items, limit, fn, lanes) {
+//
+// budgetCtx (issue #97 task 4, OPTIONAL — undefined/omitted is a no-op, matching
+// every existing caller/test that doesn't pass a 5th arg): { budget, estimateByIssue }
+// where `budget` is the already-resolved OUTPUT-token ceiling (resolveTokenBudget's
+// output — null/non-finite means "guard off", checked once per call so a caller
+// never has to special-case "no budget set") and `estimateByIssue` is
+// buildBudgetEstimateMap()'s {issue -> estimate|null} lookup. Checked in drainUnit
+// immediately before STOP.tripped is consulted, so a fresh trip here funnels
+// through the exact same not_started result-shape as every other STOP reason —
+// no separate code path to drift from. Two layered checks, hard floor first:
+//   1. HARD FLOOR (PRIMARY, history-free, honest at ANY concurrency): spentTokens()
+//      is the real guarded monotonic run-wide counter (see its own module comment)
+//      — a plain >= budget compare needs no per-unit estimate at all, so it is the
+//      backstop even when history is empty or every estimate is null.
+//   2. ESTIMATE-AWARE PRE-CHECK (layered ON TOP, only reached if the hard floor
+//      didn't already trip): spentTokens() + estimateByIssue[unit.issue] > budget.
+//      Only fires when that unit's estimate is a finite number — a null estimate
+//      (insufficient history, or any group member unestimable) is left to the hard
+//      floor rather than guessed at, per estimateIssue()'s own "null poisons the
+//      sum" contract.
+async function runPool(items, limit, fn, lanes, budgetCtx) {
   const results = new Array(items.length)
   const laneList = (Array.isArray(lanes) && lanes.length)
     ? lanes
@@ -4559,6 +4595,24 @@ async function runPool(items, limit, fn, lanes) {
   }
 
   async function drainUnit(i) {
+    // token_budget guard (issue #97 task 4) — checked BEFORE STOP.tripped so a
+    // fresh trip here is caught by the very next check, immediately below,
+    // through the SAME not_started result shape every other STOP reason uses.
+    if (!STOP.tripped && budgetCtx && isFiniteNumber(budgetCtx.budget)) {
+      const spent = spentTokens()
+      if (isFiniteNumber(spent)) {
+        if (spent >= budgetCtx.budget) {
+          tripBudgetStop('token_budget hard floor reached: ' + spent + ' OUTPUT tokens spent >= budget ' +
+            budgetCtx.budget + ' — halting before issue #' + items[i].issue)
+        } else {
+          const est = budgetCtx.estimateByIssue ? budgetCtx.estimateByIssue[items[i].issue] : null
+          if (isFiniteNumber(est) && (spent + est) > budgetCtx.budget) {
+            tripBudgetStop('token_budget estimate-aware pre-check: ' + spent + ' OUTPUT tokens spent + ' + est +
+              ' estimated for issue #' + items[i].issue + ' would exceed budget ' + budgetCtx.budget)
+          }
+        }
+      }
+    }
     if (STOP.tripped) {
       // items[i] is a unit (deriveUnits() shape) — .members is always present
       // (a self-reference singleton, or real group members), never ctx-shaped.
@@ -5448,6 +5502,113 @@ function buildCostEstimate(history, issues) {
     bands: result.bands,
     batch_projection: buildBatchProjection(byIssue),
   }
+}
+
+// ----------------------------------------------------------------------------
+// token_budget resolution + per-unit estimate map (issue #97 task 4) — feeds
+// runPool()'s always-on hard-floor/estimate-aware guard (see that function's
+// own budgetCtx module comment). Pure/above the split marker, like the rest of
+// the estimator, so every arm is directly unit-testable; the Select-phase call
+// site (real PROFILE/units/HISTORY) is a thin, untestable-but-trivial wiring
+// point, same posture as buildCostEstimate's own dry_run call site.
+// ----------------------------------------------------------------------------
+
+// parseTokenBudgetSpec: normalizes ONE raw token_budget value (a run arg OR a
+// profile field — both accept the exact same shapes) into {kind, amount} /
+// {kind, multiple}, or null when the value is absent/unusable so callers can
+// fall through to the next source cleanly. Two accepted forms:
+//   - ABSOLUTE OUTPUT-token count: a positive finite number, or a numeric
+//     string ("500000") — budget.spent() (spentTokens()) is OUTPUT tokens only
+//     (see its own module comment), so this ceiling is in the same unit.
+//   - RELATIVE multiple-of-historical-median: a string shaped "<N>x"
+//     (case-insensitive, e.g. "5x") or an object {multiple_of_median: N} — the
+//     unit-INVARIANT form (works regardless of what a "normal" issue costs in
+//     this repo), resolved against globalHistoricalMedian() by the caller
+//     (resolveTokenBudget, below) since that requires `bands`, which this
+//     function deliberately does not take (keeps the parse step trivially
+//     testable without any history fixture).
+function parseTokenBudgetSpec(raw) {
+  if (raw == null) return null
+  if (isFiniteNumber(raw) && raw > 0) return { kind: 'absolute', amount: raw }
+  if (typeof raw === 'string') {
+    const mx = /^\s*(\d+(?:\.\d+)?)\s*x\s*$/i.exec(raw)
+    if (mx) {
+      const mult = Number(mx[1])
+      return isFiniteNumber(mult) && mult > 0 ? { kind: 'multiple', multiple: mult } : null
+    }
+    const n = Number(raw)
+    return isFiniteNumber(n) && n > 0 ? { kind: 'absolute', amount: n } : null
+  }
+  if (typeof raw === 'object' && isFiniteNumber(raw.multiple_of_median) && raw.multiple_of_median > 0) {
+    return { kind: 'multiple', multiple: raw.multiple_of_median }
+  }
+  return null
+}
+
+// resolveTokenBudget (issue #97 task 4): run arg wins over the profile field —
+// same "run arg -> profile field" precedence CONCURRENCY/BROWSER/etc already
+// use — and a relative ("Nx") spec is multiplied by globalHistoricalMedian(bands),
+// the SAME trusted-band medians buildCostEstimate's own multiple_of_median
+// oversized arm reads (see that function's module comment: "so a later
+// consumer ... can read the same trusted-band medians without re-deriving them
+// from history a second time"), so "5x" means "5x THIS batch's own trusted
+// historical per-issue median", not some other reference cost. Degrades to
+// {budget: null, ...} — guard OFF, never a false floor — when: neither source
+// sets a usable value, OR a relative spec is given but no trusted history
+// exists yet to multiply (globalHistoricalMedian returns null on zero trusted
+// bands, matching the estimator's own honest-degrade posture). `degraded`
+// (present only on that second case) is a human-readable line the Select-phase
+// call site logs — never thrown, a mis-set token_budget must not halt the run
+// itself.
+function resolveTokenBudget(runArgValue, profileValue, bands) {
+  const fromArg = parseTokenBudgetSpec(runArgValue)
+  const spec = fromArg || parseTokenBudgetSpec(profileValue)
+  if (!spec) return { budget: null, source: null, spec: null }
+  const source = fromArg ? 'arg' : 'profile'
+  if (spec.kind === 'absolute') return { budget: spec.amount, source: source, spec: spec }
+  const median = globalHistoricalMedian(bands)
+  if (!isFiniteNumber(median) || median <= 0) {
+    return {
+      budget: null, source: source, spec: spec,
+      degraded: 'relative token_budget (' + spec.multiple + 'x) needs trusted historical data; none available yet — guard is off this run',
+    }
+  }
+  return { budget: spec.multiple * median, source: source, spec: spec }
+}
+
+// buildBudgetEstimateMap (issue #97 task 4): the estimate-aware pre-check's
+// history-derived input. Built ONCE at Select from the SAME `history` run arg
+// the skill passes on EVERY invocation — live runs and dry_run alike (see the
+// HISTORY module comment above) — NOT scoped inside the DRY_RUN branch,
+// otherwise the pre-check would be completely dead on a real run (Revised Plan
+// iteration 2, Minor finding). Mirrors the dry_run cost_estimate preview's own
+// unit -> issues[] shaping (task 3's costEstimateUnits/costEstimateIssues call
+// site) but keyed by issue number for O(1) per-unit lookup in drainUnit,
+// instead of an index-aligned array.
+//
+// A unit whose resume_point isn't 'implement' (skip/process_pr) is charged 0,
+// not left unestimated and not charged a full band-median guess — a
+// 'process_pr' unit pays only rework-tax and a 'skip' unit does no real work
+// at all (processIssue's own resume_point==='skip' early return), so a fresh
+// implement-shaped historical estimate would misrepresent what either actually
+// costs, exactly the reasoning the dry_run preview's own resume_point-filter
+// already documents.
+function buildBudgetEstimateMap(history, units) {
+  const list = Array.isArray(units) ? units : []
+  const implementUnits = list.filter(function (u) { return u && u.resume_point === 'implement' })
+  const issues = implementUnits.map(function (u) {
+    const memberCount = Array.isArray(u.members) ? u.members.length : 1
+    const item = { issue: u.issue, pf: (Array.isArray(u.predicted_files) ? u.predicted_files.length : 0), member_count: memberCount }
+    if (memberCount > 1) {
+      item.members = u.members.map(function (m) { return { issue: m.issue, pf: (Array.isArray(m.predicted_files) ? m.predicted_files.length : 0) } })
+    }
+    return item
+  })
+  const estimate = buildCostEstimate(history, issues)
+  const map = {}
+  list.forEach(function (u) { if (u) map[u.issue] = 0 }) // default: non-'implement' units cost ~0 — see module comment
+  estimate.by_issue.forEach(function (est, i) { map[implementUnits[i].issue] = est.estimate })
+  return { estimateByIssue: map, bands: estimate.bands }
 }
 
 // ============================================================================
@@ -6340,12 +6501,33 @@ if (guard.dissolvedCount) {
 }
 if (lanes.length < units.length) log('lane scheduling: ' + lanes.length + ' lane(s) for ' + units.length + ' unit(s) — effective concurrency ' + Math.min(CONCURRENCY, lanes.length) + '/' + CONCURRENCY)
 
+// ---- Process: token_budget guard (issue #97 task 4) — resolve once, before
+// runPool() drains, off the HISTORY run arg (threaded on EVERY invocation, live
+// runs and dry_run alike — see the HISTORY module comment) and this run's real
+// `units`, so the estimate-aware pre-check has a live map even on a real run
+// (Revised Plan iteration 2, Minor finding: it would otherwise only ever fire
+// inside the dry_run preview). run arg -> profile field precedence, matching
+// every other run-arg/profile-fallback field above.
+const budgetEstimate = buildBudgetEstimateMap(HISTORY, units)
+const tokenBudgetResolved = resolveTokenBudget(A.token_budget, PROFILE && PROFILE.token_budget, budgetEstimate.bands)
+if (tokenBudgetResolved.degraded) log('token_budget: ' + tokenBudgetResolved.degraded)
+if (isFiniteNumber(tokenBudgetResolved.budget)) {
+  log('token_budget: guard armed at ' + tokenBudgetResolved.budget + ' OUTPUT tokens (source: ' + tokenBudgetResolved.source +
+    (tokenBudgetResolved.spec && tokenBudgetResolved.spec.kind === 'multiple' ? ', ' + tokenBudgetResolved.spec.multiple + 'x historical median' : '') + ')')
+}
+const TOKEN_BUDGET_CTX = { budget: tokenBudgetResolved.budget, estimateByIssue: budgetEstimate.estimateByIssue }
+
 // ---- Process: per-issue pipeline with issue-level concurrency + breakers ----
-const results = await runPool(units, CONCURRENCY, processIssue, lanes)
+const results = await runPool(units, CONCURRENCY, processIssue, lanes, TOKEN_BUDGET_CTX)
 
 const counts = {}
 for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1
-const state = STOP.tripped ? 'circuit_breaker'
+// state (issue #97 task 4): 'budget_halt' is distinct from 'circuit_breaker' —
+// STOP.kind === 'budget' ONLY when the proactive token_budget guard tripped
+// (see the STOP.kind module comment); every other STOP reason (BATCH.failures,
+// consecutive agent deaths, a real budget-exhaustion error message) still
+// reports 'circuit_breaker', unchanged.
+const state = STOP.tripped ? (STOP.kind === 'budget' ? 'budget_halt' : 'circuit_breaker')
   : (results.some(function (r) { return r.status !== 'completed' && r.status !== 'skipped' }) ? 'completed_with_errors' : 'completed')
 log('Batch done: ' + JSON.stringify(counts) + ' state=' + state + (STOP.tripped ? ' (' + STOP.reason + ')' : ''))
 
@@ -6710,6 +6892,15 @@ return {
   summary_table: report ? report.markdown_summary : null,
   lane_prediction_accuracy: retro ? (retro.lane_prediction_accuracy || null) : null,
   stopped: STOP.tripped ? STOP.reason : null,
+  // resume_hint (issue #97 task 4): a budget_halt gets its OWN hint, distinct
+  // from the reactive death-signature breaker's hint below — a proactive
+  // pre-spend stop is not "an agent kept dying", it needs a token_budget-
+  // specific nudge (raise the budget, or resume with the same/a smaller batch)
+  // rather than the generic "usage limit or API outage, try again later" framing.
   resume_hint: state === 'completed' ? null :
-    'Re-run ticketmill with the same args PLUS batch_branch: "' + TARGET + '" (so healing lands on the same integration branch) — the Select-phase preflight skips merged/closed issues, routes open PRs straight to review/merge, and continues partial branches. For exact journal replay use Workflow({scriptPath, resumeFromRunId}).',
+    (state === 'budget_halt'
+      ? 'token_budget reached before the batch finished (' + STOP.reason + '). Re-run ticketmill with the same args PLUS ' +
+        'batch_branch: "' + TARGET + '" to continue — the Select-phase preflight skips merged/closed issues and continues ' +
+        'partial branches — after raising token_budget or splitting the remaining issues into a smaller batch.'
+      : 'Re-run ticketmill with the same args PLUS batch_branch: "' + TARGET + '" (so healing lands on the same integration branch) — the Select-phase preflight skips merged/closed issues, routes open PRs straight to review/merge, and continues partial branches. For exact journal replay use Workflow({scriptPath, resumeFromRunId}).'),
 }
