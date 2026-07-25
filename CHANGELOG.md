@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.33 (2026-07-25)
+
+Tier 3 of the observability upgrade, one milled issue (#93): a
+preflight revisit risk-flag. Patch bump (0.1.32 -> 0.1.33). This
+closes the forward-looking side of the production-feedback gap. A
+run can now react when an area it's about to touch has a bad recent
+track record. Depends on the outcome ledger (#92) and Tier 1 churn
+data.
+
+- Read-only Select-phase agent (#93): a dedicated `agent()` probe
+  fires concurrently beside `learnPromise` and `outcomeGradePromise`
+  so its latency hides behind the existing preflight probes. For
+  each issue's predicted files, it checks whether recent ticketmill
+  PRs touched the same area and were later reverted, hot-fixed, or
+  reopened. It reads `outcomes.jsonl` (#92), the `runs.jsonl` churn
+  history, and live `gh pr view --json files`, and returns raw
+  observations only. The engine decides the flag post-hoc in
+  deterministic JS, per the same sandbox split as #92.
+- New module const `REVISIT_RISK = { window_days: 30 }` (#93), a
+  30-day lookback beside `OUTCOME_GRADING`, plus a
+  `REVISIT_RISK_SCHEMA`. The pure reducers `deriveNegativeOutcomeEvents`/
+  `attachRevisitFiles`/`computeRevisitRisk` derive the flag, and
+  `unionRevisitRisk` combines risk across a consolidated group's
+  member issues.
+- Risk-flag rendering (#93): the resulting `revisit_risk` threads
+  through the unit rails (`deriveUnits`) and renders as a risk-flag
+  block into the approach and plan prompts. Example: "this area was
+  re-fixed twice in the last 30 days and the earlier fix regressed:
+  prefer a conservative approach and add regression coverage." When
+  no predicted file matches a recently-reverted or hot-fixed area,
+  the probe is a clean no-op and no flag appears.
+- Tests (#93): `computeRevisitRisk` cases added to
+  `tests/outcomes.test.js` — a matching-history case that raises the
+  flag and a no-history case that stays silent. Full suite 504
+  `node --test` cases green; engine copies byte-identical
+  (lockstep-linted).
+
 ## 0.1.32 (2026-07-25)
 
 Tier 2b of the observability upgrade, milled as one batch of four
