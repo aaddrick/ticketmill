@@ -1,12 +1,18 @@
 'use strict'
 
 // Unit tests for issue #35's tightened isBudgetExhaustedError(): a
-// budget/token/ceiling NOUN must now co-occur with an exhaustion/exceedance
+// budget/ceiling/tokens NOUN must now co-occur with an exhaustion/exceedance
 // VERB (exhaust/exceed/deplete/ran out/over/limit-reached) in a caught stage
 // error's message before the whole-run STOP trips. Either alone is not
 // enough — a target repo's own domain error that merely names a budget noun,
 // or merely exceeds something unrelated, must fall through to the ordinary
 // per-attempt retry + recordAgentDeath() path instead of halting the run.
+//
+// Issue #62 further narrowed the noun side: bare singular "token" no longer
+// counts, since it co-occurs with exhaustion-shaped verbs in ordinary auth/
+// rate-limit domain errors that have nothing to do with agent budget (see the
+// false-positive cases below). "token" only counts pluralized ("tokens") or
+// directly qualified by "budget"/"limit" ("token budget", "token limit").
 //
 // Drives both the predicate directly (context.isBudgetExhaustedError(msg))
 // and end-to-end through context.stage() with a scripted throwing agent(),
@@ -63,6 +69,76 @@ test('isBudgetExhaustedError: domain error with a budget noun and "over" only as
   assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
 })
 
+// Regression cases for issue #62: these three auth/rate-limit domain errors
+// each pair a bare singular "token" with an exhaustion-shaped verb and were
+// confirmed (during PR #61 / issue #35's review) to false-positive-trip the
+// whole-run STOP under the pre-fix noun regex. None of these name an agent
+// budget/ceiling and none use the plural "tokens" or a "token budget"/"token
+// limit" phrase, so the narrowed noun regex must leave STOP untripped.
+test('isBudgetExhaustedError: "authentication token expired; retry limit reached" (auth domain error) returns false and leaves STOP untripped', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('authentication token expired; retry limit reached')
+  assert.strictEqual(result, false)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+})
+
+test('isBudgetExhaustedError: "API token rate limit reached" (rate-limit domain error) returns false and leaves STOP untripped', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('API token rate limit reached')
+  assert.strictEqual(result, false)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+})
+
+test('isBudgetExhaustedError: "csrf token validation exceeded retries" (csrf domain error) returns false and leaves STOP untripped', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('csrf token validation exceeded retries')
+  assert.strictEqual(result, false)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), false)
+})
+
+// Regression case for issue #62's plural-noun recall gap: bare \btoken\b
+// never matched the plural "tokens", so "ran out of tokens" fell through to
+// the recordAgentDeath() backstop instead of tripping the fast/accurate
+// path. The narrowed regex's explicit "tokens" alternative fixes this.
+test('isBudgetExhaustedError: "ran out of tokens" (plural noun + exhaustion verb) returns true and trips STOP', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('ran out of tokens')
+  assert.strictEqual(result, true)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+})
+
+// Regression case for the narrowed regex's phrase-qualified branch: bare
+// singular "token" only counts when directly qualified by "limit" or
+// "budget" (token[\s-]+(?:budget|limit)). This is the one alternative in
+// hasBudgetNoun that admits singular "token" back in, and it was the sole
+// gap flagged by test validation's mutation check — deleting this
+// alternative outright left every prior case green, since none of them
+// exercised a bare-token message that relies on it. "token limit reached"
+// supplies both the noun (via "token limit") and the verb (via "limit
+// reached") through this branch alone.
+test('isBudgetExhaustedError: "token limit reached" (token directly qualified by "limit" + exhaustion verb) returns true and trips STOP', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('token limit reached')
+  assert.strictEqual(result, true)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+})
+
+test('isBudgetExhaustedError: "token budget exceeded" (token directly qualified by "budget" + exhaustion verb) returns true and trips STOP', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('token budget exceeded')
+  assert.strictEqual(result, true)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+})
+
+// Pins the [\s-]+ separator class itself (hyphenated qualifier), distinct
+// from the space-separated cases above.
+test('isBudgetExhaustedError: "token-limit exceeded" (hyphenated token-limit qualifier + exhaustion verb) returns true and trips STOP', function () {
+  const context = harness.boot()
+  const result = context.isBudgetExhaustedError('token-limit exceeded')
+  assert.strictEqual(result, true)
+  assert.strictEqual(harness.readGlobal(context, 'STOP.tripped'), true)
+})
+
 // Every alternative in hasExhaustionVerb's regex gets its own true-positive
 // case here, each paired with a budget noun. A typo in any one alternative
 // (e.g. "ran\s+out" losing its \s+) would silently disable detection for
@@ -73,11 +149,11 @@ const exhaustionVerbTruePositives = [
   ['deplete', 'the budget has been depleted'],
   ['ran out', 'we ran out of budget'],
   ['overrun', 'budget overrun detected'],
-  ['overage', 'token overage this cycle'],
+  ['overage', 'tokens overage this cycle'],
   ['went over', 'we went over budget this month'],
   ['ran over', 'the run ran over the token ceiling'],
   ['over budget', 'the run is over budget'],
-  ['over the limit', 'token usage is over the limit'],
+  ['over the limit', 'usage of tokens is over the limit'],
   ['limit reached', 'budget limit reached'],
 ]
 

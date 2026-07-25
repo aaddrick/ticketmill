@@ -1568,17 +1568,24 @@ function tripBudgetStop(reason) {
 // isBudgetExhaustedError: only a real budget/token-exhaustion signature is
 // fatal for the whole run (tripStop), not a per-attempt death — shared by
 // stage() and consolidationAgent() so the two call sites can't drift on what
-// counts as one. Requires a budget/token/ceiling NOUN to co-occur with an
+// counts as one. Requires a budget/ceiling/tokens NOUN to co-occur with an
 // exhaust/exceed/deplete/ran-out/overrun-shaped/limit-reached VERB; either
 // alone is not enough, so a target repo's own domain error that merely names
 // "budget" (no exhaustion verb) or merely exceeds something unrelated (no
 // budget noun) is left to the ordinary per-attempt retry + recordAgentDeath()
-// path instead of halting the whole run. The "over" family is deliberately
-// anchored to overrun-shaped phrasing (overrun/overage/went over/ran over/
-// over budget/over the limit) rather than the bare word "over", which shows
-// up in ordinary prose ("budget review is over") without meaning exhaustion.
+// path instead of halting the whole run. The noun side deliberately excludes
+// bare singular "token": that word alone is common in non-budget domain
+// errors (auth tokens, CSRF tokens, API rate-limit tokens) and, paired with
+// an exhaustion-shaped verb like "limit reached", produced false positives
+// (e.g. "authentication token expired; retry limit reached"). "token" only
+// counts when pluralized ("tokens", as in "ran out of tokens") or directly
+// qualified by "budget"/"limit" ("token budget", "token limit"). The "over"
+// family is deliberately anchored to overrun-shaped phrasing (overrun/
+// overage/went over/ran over/over budget/over the limit) rather than the
+// bare word "over", which shows up in ordinary prose ("budget review is
+// over") without meaning exhaustion.
 function isBudgetExhaustedError(msg) {
-  const hasBudgetNoun = /\b(?:budget|token|ceiling)\b/i.test(msg)
+  const hasBudgetNoun = /\b(?:budget|ceiling|tokens|token[\s-]+(?:budget|limit))\b/i.test(msg)
   const hasExhaustionVerb = /\b(?:exhaust(?:ed|ion|s)?|exceed(?:ed|s|ing)?|deplete(?:d|s)?|ran\s+out|over[\s-]?(?:run|age)\b|went\s+over|ran\s+over|over\s+budget|over\s+the\s+limit|limit[\s-]?reached)\b/i.test(msg)
   if (!hasBudgetNoun || !hasExhaustionVerb) return false
   tripStop('token budget exhausted (' + msg + ')')

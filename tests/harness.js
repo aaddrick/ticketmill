@@ -248,10 +248,11 @@ function makeCtx(overrides) {
  *     have the responder return a "failed" shape forever and assert the loop stops
  *     at its MAX_* cap rather than looping forever).
  *   - throwing -> stage() catches it and logs, same retry behavior as null (unless
- *     the message co-occurs a budget/token/ceiling noun with an exhaustion verb
- *     — exhaust/exceed/deplete/ran out/over/limit-reached — which trips the
- *     circuit breaker instead; see isBudgetExhaustedError()/tripStop() in the
- *     engine).
+ *     the message co-occurs a budget/ceiling/tokens noun (bare singular "token"
+ *     alone does not count; only plural "tokens" or "token budget"/"token limit")
+ *     with an exhaustion verb — exhaust/exceed/deplete/ran out/over/
+ *     limit-reached — which trips the circuit breaker instead; see
+ *     isBudgetExhaustedError()/tripStop() in the engine).
  *
  * opts.label is "<issue>:<stageKey>" (e.g. "1:test-run-i3") — the most reliable
  * way to branch behavior per call site; opts also carries opts.schema if a
