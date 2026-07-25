@@ -140,9 +140,10 @@ The run narrates itself in the places you already look:
   batch PR carries the Verification Gaps section: every check that did not run,
   in front of the human who is about to merge.
 - **The logs dir** (`logs_dir`, default `logs/ticketmill`). Each run writes
-  `summary-<run_label>.json` (machine-readable, per-issue outcomes and stage
-  timelines)
-  and `summary-<run_label>.md` (the human version), and appends to the running
+  `runs/<run_label>.json` (the machine-readable record — per-issue metrics, tokens,
+  and timelines, written deterministically by the mill skill so nothing is truncated)
+  and appends one line to `runs.jsonl` (the cross-run ledger). It also writes
+  `summary-<run_label>.md` (the human version) and appends to the running
   `process-retrospective.md`.
 - **Live.** While a run is going, `/workflows` in Claude Code shows the progress
   tree: which issues are in flight and which stage each one is in.

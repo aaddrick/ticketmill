@@ -340,21 +340,26 @@ test('addStage: preflight and select buckets accumulate independently', function
 // isolates the `resultsJson` object literal so the assertion can't be satisfied by
 // an unrelated spentTokens() call elsewhere in the file (e.g. the TOKEN_AGG line).
 
-/** Extract the `const resultsJson = JSON.stringify({ ... }, null, 2)` block verbatim. */
-function extractResultsJsonBlock(source) {
-  const start = source.indexOf('const resultsJson = JSON.stringify({')
-  assert.notStrictEqual(start, -1, 'resultsJson block not found in engine source')
-  const end = source.indexOf('}, null, 2)', start)
-  assert.notStrictEqual(end, -1, 'resultsJson block close (`}, null, 2)`) not found in engine source')
+// issue #86: the run record is now assembled by the pure buildRunRecord({...}) call
+// (from which `resultsJson` is JSON.stringify'd, and which the mill skill also persists
+// verbatim). The guard still isolates the object that carries tokens_spent so the
+// assertion can't be satisfied by an unrelated spentTokens() call (e.g. the TOKEN_AGG
+// line) — it just targets the buildRunRecord call arguments instead of the old literal.
+/** Extract the `const runRecord = buildRunRecord({ ... })` call block verbatim. */
+function extractRunRecordBlock(source) {
+  const start = source.indexOf('const runRecord = buildRunRecord({')
+  assert.notStrictEqual(start, -1, 'runRecord/buildRunRecord block not found in engine source')
+  const end = source.indexOf('})', start)
+  assert.notStrictEqual(end, -1, 'runRecord block close (`})`) not found in engine source')
   return source.slice(start, end)
 }
 
 for (const [label, enginePath] of [['workflows/ticketmill.js', ENGINE_PATH], ['.claude/workflows/ticketmill.js', CLAUDE_ENGINE_PATH]]) {
-  test('Report phase (' + label + '): resultsJson.tokens_spent uses the guarded spentTokens(), not raw budget.spent()', function () {
+  test('Report phase (' + label + '): the run record\'s tokens_spent uses the guarded spentTokens(), not raw budget.spent()', function () {
     const source = fs.readFileSync(enginePath, 'utf8')
-    const block = extractResultsJsonBlock(source)
+    const block = extractRunRecordBlock(source)
 
-    assert.match(block, /tokens_spent:\s*spentTokens\(\)/, 'resultsJson.tokens_spent must call spentTokens(), the guarded wrapper that never throws')
-    assert.doesNotMatch(block, /budget\.spent\(\)/, 'resultsJson block must not call the unguarded budget.spent() directly — a misbehaving hook would abort the whole Report phase')
+    assert.match(block, /tokensSpent:\s*spentTokens\(\)/, 'the run record must sample spend via spentTokens(), the guarded wrapper that never throws')
+    assert.doesNotMatch(block, /budget\.spent\(\)/, 'the run-record assembly must not call the unguarded budget.spent() directly — a misbehaving hook would abort the whole Report phase')
   })
 }

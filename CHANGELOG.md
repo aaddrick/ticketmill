@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.1.30 (2026-07-25)
+
+Tier 1 of the observability and self-improvement upgrade: the foundation the
+later tiers build on. Three issues. The bump stays a patch by choice
+(0.1.29 -> 0.1.30) even though this tier is load-bearing. The rest of the
+upgrade lands across later batches.
+
+- Telemetry truncation (#86): the Report phase used to hand the run's JSON to
+  the report agent as `resultsJson.slice(0, 30000)`, so the engine truncated
+  the payload in plain JS before any agent ever saw it. An 8-issue run already
+  serialized past 24,000 chars. 18-issue runs overflowed, and every per-issue
+  `metrics` block after the cut never reached disk. The committed
+  `summary-2026-07-19-f.json` proves it: 18 results, zero metrics blocks. The
+  fix is a pure `buildRunRecord()`/`buildLedgerLine()` pair above the harness
+  split, unit-tested for zero field loss at 100-issue scale. The report agent
+  now writes only the human `summary-<tag>.md`. The workflow return carries
+  `record`, `ledger`, `run_tag`, and `logs_dir`, so the `mill` skill persists
+  the full machine record to `<logs_dir>/runs/<run_tag>.json` with a
+  deterministic `Write` outside the sandbox, plus a one-line append to
+  `<logs_dir>/runs.jsonl`, the cross-run ledger. The record bytes never pass
+  through a model. The old `summary-<tag>.json` is no longer written: nothing
+  consumed it.
+
+- Learning injection (#88): `learn()`, the retrospective digest injector, now
+  reaches the implement, spec-review, and code-review stages too. Before this,
+  only planning, the two contrarian gates, and the test stages saw prior-run
+  learnings. Implement now sees the `error_patterns` and `workflow` digests.
+  Spec review picks up `workflow`, and the merge-gate reviewer gets
+  `error_patterns` plus `quality_loop`. Lessons now land where code is written
+  and reviewed, close to where the mistakes they describe actually happen.
+
+- Token reconciliation (#90): `aggregateTokens` now returns `attributed` (the
+  summed per-issue and per-stage deltas) and `reconcile_error`, defined as
+  `|spent - attributed| / spent`. That fraction is the concurrency-independent
+  honesty signal. The pre-existing `reconciles` boolean reads true whenever
+  concurrency is 1 and anything was tracked, without ever comparing the sums,
+  so it reports true even when a large slice of spend went unattributed. About
+  26% does at concurrency 1: the PR-review, merge, and report spend goes
+  unbracketed. `reconcile_error` exposes that gap, and downstream efficiency
+  metrics must gate on it rather than on the boolean. `LEARN` was also added to
+  the `__seed` test hook.
+
 ## 0.1.29 (2026-07-20)
 
 - Release stage (#57): the pipeline used to defer the CHANGELOG entry and

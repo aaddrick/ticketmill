@@ -1733,6 +1733,21 @@ function aggregateTokens(results, spent, concurrency, byStage) {
   const tracked = trackedAny || hasSpent
   const reconciles = concurrency === 1 && hasSpent && trackedAny
   const remainder = hasSpent ? Math.max(0, spent - sumDeltas) : null
+  // reconcile_error (issue #90): the HONEST, concurrency-independent reconciliation
+  // signal, unlike `reconciles` (which is defined true whenever concurrency===1 and
+  // some spend is tracked, WITHOUT ever comparing the attributed sum to the real
+  // total — so a concurrency:1 run reports reconciles:true even with a large
+  // unattributed gap). reconcile_error = |spent - attributed| / spent captures both
+  // failure modes: the concurrency>1 over-count (attributed > spent, error grows past
+  // 0) AND the concurrency:1 under-attribution (the ~26% of PR-review/merge/report
+  // spend left unbracketed — attributed < spent). Downstream efficiency metrics
+  // (rework-tax, issue #91) MUST gate on this fraction being small, never on the
+  // `reconciles` boolean. null when budget.spent() is unavailable, or when spent is 0
+  // and nothing was attributed (trivially exact, error 0) — see below.
+  const attributed = sumDeltas
+  const reconcileError = !hasSpent
+    ? null
+    : (spent > 0 ? Math.abs(spent - sumDeltas) / spent : (sumDeltas === 0 ? 0 : null))
   const models = Object.keys(byModel).sort()
 
   const lines = []
@@ -1797,6 +1812,8 @@ function aggregateTokens(results, spent, concurrency, byStage) {
     by_model: byModel,
     by_stage: byStageOut,
     remainder: remainder,
+    attributed: attributed,
+    reconcile_error: reconcileError,
     tracked: tracked,
     reconciles: reconciles,
     markdown: lines.join('\n'),
@@ -3487,6 +3504,11 @@ async function implementIssue(ctx) {
       '## Decision chain (context from prior stages)', decisionChain(ctx),
       unresolvedBlock,
       notesBlock(ctx), '',
+      // issue #88: prior-run learnings now reach the implement stage (previously only
+      // planning/contrarian/test stages saw them) — error patterns to avoid and known
+      // workflow friction, so lessons land where code is actually written.
+      learn('error_patterns'),
+      learn('workflow'),
       'FIRST check git -C ' + ctx.worktree + ' log --oneline origin/' + TARGET + '..HEAD — if a prior run already',
       'implemented part or all of this task, verify it works and build on it instead of redoing it.',
       'Commit with a descriptive conventional-commit message referencing issue #' + ctx.issue + '.',
@@ -3657,6 +3679,7 @@ async function reviewAndMerge(ctx) {
           '',
           '## Decision chain', decisionChain(ctx),
           settledBlock(ctx), '',
+          learn('workflow'), // issue #88: spec review sees prior-run workflow/scope learnings
           'Check goal achievement, not code quality. Flag scope creep.',
           'IMPORTANT: before flagging any acceptance criterion as missing, check base branch ' + TARGET + ' — if the',
           'criterion is already satisfied by pre-existing code the PR preserves, mark it met, NOT missing.',
@@ -3676,6 +3699,10 @@ async function reviewAndMerge(ctx) {
           '',
           '## Decision chain', decisionChain(ctx),
           settledBlock(ctx), '',
+          // issue #88: the merge-gate reviewer sees prior-run error patterns and
+          // quality-loop learnings — the bug classes earlier runs caught late.
+          learn('error_patterns'),
+          learn('quality_loop'),
           'Check patterns, standards, security. This is the merge gate — be thorough.',
           'Read issue and PR comments for context. On iteration 2+, do not re-flag issues already addressed or accepted.',
           IMPLEMENTERS.length ? 'If changes are requested, set recommended_fix_agent to one of: ' + IMPLEMENTERS.join(', ') + '.' : '',
@@ -4031,6 +4058,7 @@ function __seed(o) {
   if ('IMPLEMENTERS' in o) IMPLEMENTERS = o.IMPLEMENTERS
   if ('DEFAULT_IMPLEMENTER' in o) DEFAULT_IMPLEMENTER = o.DEFAULT_IMPLEMENTER
   if ('ROLES' in o) ROLES = o.ROLES
+  if ('LEARN' in o) LEARN = o.LEARN
   if ('TARGET' in o) TARGET = o.TARGET
   if ('REPO' in o) REPO = o.REPO
   if ('ROOT' in o) ROOT = o.ROOT
@@ -4093,6 +4121,75 @@ function deriveReleaseVersion(baseVersion, commitTypes, profile) {
 // Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
 function releaseChangelogAnchor(version, runTag) {
   return '## [' + String(version) + '] - ' + String(runTag)
+}
+
+// buildRunRecord (issue #86): assemble the FULL, untruncated machine-readable record
+// for a run. Pure and above the split marker so tests can prove — at 18-issue+ scale —
+// that no per-issue metrics/timeline block is dropped. This object is what the outer
+// `mill` skill writes verbatim to <logs_dir>/runs/<run_tag>.json with a real fs Write
+// (deterministic, outside the sandbox). It is NOT handed to an agent to serialize: the
+// old path fed JSON.stringify(...).slice(0, 30000) to the report agent, which silently
+// cut the tail (an 18-issue run overflowed 30 000 chars, so the last issues' metrics
+// never reached disk). The Report agent now renders only the human-readable .md; the
+// bytes of the machine record never pass through a model. Shape is byte-for-byte the
+// prior `resultsJson` payload plus a `schema_version` and `run_tag` header.
+function buildRunRecord(f) {
+  const t = f.tokenAgg || {}
+  const m = f.mergeAgg || {}
+  return {
+    schema_version: 1,
+    run_tag: f.runTag,
+    state: f.state,
+    base_branch: f.baseBranch,
+    batch_branch: f.batchBranch,
+    batch_pr: f.batchPr,
+    stop: f.stop,
+    counts: f.counts,
+    verification_gaps: f.verificationGaps,
+    tokens_spent: f.tokensSpent,
+    tokens: {
+      run_total: t.run_total,
+      by_issue: t.by_issue,
+      by_model: t.by_model,
+      by_stage: t.by_stage,
+      attributed: t.attributed,
+      reconcile_error: t.reconcile_error,
+      tracked: t.tracked,
+      reconciles: t.reconciles,
+    },
+    merge_auto_resolve: {
+      resolved_count: m.resolved_count,
+      resolved_issues: m.resolved_issues,
+      thrash_count: m.thrash_count,
+      thrash_issues: m.thrash_issues,
+    },
+    consolidation_groups: f.consolidationGroups,
+    results: f.results,
+  }
+}
+
+// buildLedgerLine (issue #86): the compact one-object-per-run summary the mill skill
+// appends to <logs_dir>/runs.jsonl — the cross-run ledger every later observability
+// tier trends over. Deliberately flat and small (the full per-issue detail lives in
+// runs/<run_tag>.json); this is the index. Pure/above the split marker.
+function buildLedgerLine(record) {
+  const r = record || {}
+  const t = r.tokens || {}
+  return {
+    run_tag: r.run_tag,
+    state: r.state,
+    base_branch: r.base_branch,
+    batch_branch: r.batch_branch,
+    batch_pr: r.batch_pr,
+    counts: r.counts,
+    issues: Array.isArray(r.results) ? r.results.length : 0,
+    tokens_total: t.run_total,
+    tokens_by_model: t.by_model,
+    reconciles: t.reconciles,
+    reconcile_error: t.reconcile_error,
+    verification_gaps: Array.isArray(r.verification_gaps) ? r.verification_gaps.length : 0,
+    stop_tripped: !!(r.stop && r.stop.tripped),
+  }
 }
 
 // ---- TICKETMILL-TEST-HARNESS-SPLIT: tests/harness.js truncates the source at this
@@ -4811,20 +4908,24 @@ if (shippedIssues.length) {
 }
 
 // ---- Report ----
-const resultsJson = JSON.stringify({
-  state: state, base_branch: BASE, batch_branch: TARGET, batch_pr: batchPr, stop: STOP, counts: counts,
-  verification_gaps: VERIFY_SKIPS, tokens_spent: spentTokens(),
-  tokens: { run_total: TOKEN_AGG.run_total, by_issue: TOKEN_AGG.by_issue, by_model: TOKEN_AGG.by_model, by_stage: TOKEN_AGG.by_stage, tracked: TOKEN_AGG.tracked, reconciles: TOKEN_AGG.reconciles },
-  merge_auto_resolve: { resolved_count: MERGE_RESOLVE_AGG.resolved_count, resolved_issues: MERGE_RESOLVE_AGG.resolved_issues, thrash_count: MERGE_RESOLVE_AGG.thrash_count, thrash_issues: MERGE_RESOLVE_AGG.thrash_issues },
-  consolidation_groups: finalGroups,
-  results: results,
-}, null, 2)
+// issue #86: assemble the full record via the pure builder (above the split marker,
+// unit-tested for zero field loss at scale). The machine-readable JSON is persisted
+// deterministically by the mill skill from the workflow return value below — the report
+// agent only renders the human .md, so the record bytes never pass through a model.
+const runRecord = buildRunRecord({
+  runTag: RUN_TAG, state: state, baseBranch: BASE, batchBranch: TARGET, batchPr: batchPr,
+  stop: STOP, counts: counts, verificationGaps: VERIFY_SKIPS, tokensSpent: spentTokens(),
+  tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, consolidationGroups: finalGroups, results: results,
+})
+const resultsJson = JSON.stringify(runRecord, null, 2)
 const report = await agent([
-  'Write the ticketmill run report.',
+  'Write the ticketmill run report — human-readable markdown ONLY.',
+  'Do NOT write any .json file: the machine-readable record is persisted separately and',
+  'deterministically by the mill skill from the workflow return value, so a model must',
+  'never re-serialize it (that path truncated and dropped per-issue data).',
   '',
   '1. mkdir -p ' + LOGS,
-  '2. Write the JSON below verbatim to ' + LOGS + '/summary-' + RUN_TAG + '.json',
-  '3. Write a human-readable markdown summary to ' + LOGS + '/summary-' + RUN_TAG + '.md with:',
+  '2. Write a human-readable markdown summary to ' + LOGS + '/summary-' + RUN_TAG + '.md with:',
   '   a results table (Issue | Title | Status | PR | Follow-ups | Error), a per-issue pipeline narrative built',
   '   from each result\'s "timeline" field (gates, verdicts, iterations), a "Consolidated Groups" section if',
   '   consolidation_groups is non-empty — one line per group naming its primary issue, every absorbed member,',
@@ -4838,12 +4939,12 @@ const report = await agent([
   '   Include this "## Token Usage" section VERBATIM (already',
   '   computed in JS — do not recompute, re-sum, or add commentary beyond copying it in):',
   TOKEN_AGG.markdown,
-  '4. Include the current timestamp from: date -Iseconds',
-  RUN_TAG === 'run' ? '5. The tag "run" is a collision-prone default: substitute the current date (date +%F) for "run" in BOTH filenames so successive runs do not overwrite each other, and return the actual path.' : '',
+  '3. Include the current timestamp from: date -Iseconds',
+  RUN_TAG === 'run' ? '4. The tag "run" is a collision-prone default: substitute the current date (date +%F) for "run" in the .md filename so successive runs do not overwrite each other, and return the actual path.' : '',
   '',
-  'Run data:', resultsJson.slice(0, 30000),
+  'Run data (complete, untruncated — build the .md narrative from all of it):', resultsJson,
   '',
-  'Return report_path and markdown_summary (the table portion, compact).',
+  'Return report_path (the summary .md path) and markdown_summary (the table portion, compact).',
 ].join('\n'), { label: 'report', phase: 'Report', schema: REPORT_SCHEMA, model: M.report.model, effort: M.report.effort })
 
 // ---- Retrospective (the pipeline improves itself) ----
@@ -4869,7 +4970,7 @@ const retro = await agent([
   'Memory file: ' + LOGS + '/process-retrospective.md (seed with "## Active Learnings",',
   '"## Deprecated Learnings", "## Run History", "## Lane Prediction Accuracy" sections if missing).',
   '',
-  'Run data:', resultsJson.slice(0, 20000),
+  'Run data (complete, untruncated):', resultsJson,
   '',
   lanePredictions.length
     ? ['Lane-scheduling predicted-vs-actual data (issue #1) — one entry per completed unit that had a',
@@ -4911,6 +5012,13 @@ return {
   merge_auto_resolved_count: MERGE_RESOLVE_AGG.resolved_count,
   merge_thrash_count: MERGE_RESOLVE_AGG.thrash_count,
   results: results,
+  // issue #86: the outer mill skill persists these deterministically (real fs Write,
+  // no agent transcription) — `record` -> <logs_dir>/runs/<run_tag>.json (full,
+  // untruncated), `ledger` -> one appended line in <logs_dir>/runs.jsonl.
+  run_tag: RUN_TAG,
+  logs_dir: LOGS,
+  record: runRecord,
+  ledger: buildLedgerLine(runRecord),
   report: report ? report.report_path : null,
   summary_table: report ? report.markdown_summary : null,
   lane_prediction_accuracy: retro ? (retro.lane_prediction_accuracy || null) : null,

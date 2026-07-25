@@ -84,6 +84,33 @@ per-issue outcomes, the batch PR number (stress that a HUMAN must review and mer
 it), any `verification_gaps` (these are important — they list checks that did not
 run), and the `resume_hint` if the run did not fully complete.
 
+## Persist the run record (do this the moment the workflow returns)
+
+The return value carries the authoritative machine-readable record. **Write it yourself
+with the `Write` tool — never ask an agent to serialize it** (the engine used to hand a
+`.slice(0, 30000)` of the JSON to the report agent, which silently dropped the tail;
+on an 18-issue run every per-issue `metrics` block after the cut was lost). The engine
+now returns the full object so the outer skill can persist it with deterministic file
+IO, outside the sandbox.
+
+When the return includes a `record` object (older engines omit it — then skip this):
+
+1. Write `record` as pretty-printed JSON to `<logs_dir>/runs/<run_tag>.json` (both
+   `logs_dir` and `run_tag` are fields on the return). Create the `runs/` directory
+   first. Write it **verbatim** — every per-issue `metrics`/`tokens`/`timeline` block
+   must land; this file is the source of truth for every observability tier built on top.
+   **Collision guard:** if `run_tag` is the literal `run` (no `run_label` was passed),
+   substitute today's date (`date +%F`) into the filename — `runs/<YYYY-MM-DD>.json` —
+   exactly as the engine does for the human `.md`, so successive default-tag runs don't
+   clobber the source-of-truth record. (Normally you pass `run_label`, so this never
+   fires; it's the same defense the `.md` already carries.)
+2. Append the return's `ledger` object as a **single compact JSON line** (no
+   pretty-printing, one line) to `<logs_dir>/runs.jsonl` — the cross-run ledger. Always
+   append; never overwrite.
+
+The agent-written `summary-<run_tag>.md` remains the human narrative; `runs/<run_tag>.json`
+is the machine record.
+
 ## Resuming
 
 - Same session: `Workflow({scriptPath, resumeFromRunId: "wf_..."})` replays completed
