@@ -94,6 +94,47 @@ test('settledBlock: only renders the most recent 6 settled decisions', function 
   assert.ok(block.includes('Topic6:'))
 })
 
+// ---- revisit risk block (issue #93) ----
+//
+// revisitRiskBlock(ctx) mirrors settledBlock/notesBlock's empty-string-when-
+// nothing-to-say shape: an unflagged ctx.revisit_risk (the default every ctx
+// gets — see processIssue's ctx init) renders '', so an unflagged run's
+// prompts stay byte-identical to before this feature existed.
+
+test('revisitRiskBlock: empty when ctx.revisit_risk is missing entirely', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({ issue: 10 })
+  assert.strictEqual(context.revisitRiskBlock(ctx), '')
+})
+
+test('revisitRiskBlock: empty when ctx.revisit_risk.flagged is false, even with a non-empty reasons array', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({ issue: 10, revisit_risk: { flagged: false, reasons: ['stale leftover reason'] } })
+  assert.strictEqual(context.revisitRiskBlock(ctx), '')
+})
+
+test('revisitRiskBlock: renders a heading, every reason as a bullet, and the conservative-approach guidance when flagged', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({
+    issue: 10,
+    revisit_risk: { flagged: true, reasons: ['src/foo.js was hotfixed on issue #50 5 days ago', 'src/foo.js was re-fixed 3 times on issue #50'] },
+  })
+  const block = context.revisitRiskBlock(ctx)
+  assert.ok(block.startsWith('## Revisit risk flag (recent outcome/churn history)'))
+  assert.ok(block.includes('- src/foo.js was hotfixed on issue #50 5 days ago'))
+  assert.ok(block.includes('- src/foo.js was re-fixed 3 times on issue #50'))
+  assert.ok(block.includes('CONSERVATIVE'))
+  assert.ok(block.includes('regression coverage'))
+})
+
+test('revisitRiskBlock: flagged with a missing/non-array reasons never throws, renders no bullets', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({ issue: 10, revisit_risk: { flagged: true } })
+  const block = context.revisitRiskBlock(ctx)
+  assert.ok(block.startsWith('## Revisit risk flag (recent outcome/churn history)'))
+  assert.ok(!block.includes('undefined'))
+})
+
 // ---- handoff notes ----
 
 test('notesBlock: empty with no notes collected', function () {
