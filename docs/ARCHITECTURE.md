@@ -425,6 +425,74 @@ findings rather than weighing severity, matching the issue's own definition.
 It answers one question directly: did the early gates ever get a look at
 this, or did it only surface because nothing upstream ever saw it.
 
+### Outcome grading: a quality anchor beside the friction signal
+
+Friction, churn, rework tax, and gate yield all measure how hard a run
+fought. None of them measure whether the result was any good. An issue
+can clear every gate on the first try, score zero friction, and still
+ship a defect that gets reverted the next day. Self-improvement built
+only on process signal is Goodhart-able for exactly that reason, so
+issue #92 adds a read-only pass that back-annotates a prior run's merged
+batch PRs with what actually happened to them, and records it in
+`<logs_dir>/outcomes.jsonl`.
+
+**Split across the sandbox boundary, like learnings.** The Select-phase
+sandbox has no fs/git/gh (see "Sandbox lint" above), so it can't walk
+`runs.jsonl` or shell out to `gh` itself. An `outcome-grade` agent stage
+does both jobs live: it reads the run-history ledger and each run's full
+record to build the list of gradable targets (a merged member issue of a
+prior run's batch PR), then resolves one raw observation per target with
+`gh pr view`, `gh issue view`, and `gh search` — live reads, never the
+run record's own possibly-stale status. It fires alongside `learnPromise`
+so its latency hides behind the same preflight probes, and it is
+strictly read-only: no git fetch, no local writes, no state-changing `gh`
+command.
+
+The agent never decides a grade. It returns `observations` (one raw
+object per target), `prior_ledger_lines` (the raw text of
+`outcomes.jsonl`, verbatim and unparsed), and `now` (its own `date -u`
+read, since the sandbox forbids `Date.now()`). Everything downstream of
+that is deterministic JS above the `TICKETMILL-TEST-HARNESS-SPLIT`
+marker, unit-tested directly in `tests/outcomes.test.js` without ever
+shelling out.
+
+**`gradeFromObservation`** applies a fixed precedence: `reverted` >
+`reopened` > `hotfix` > `closed_unmerged` > `abandoned` > `clean` >
+`pending`. The aging is deliberately asymmetric. A bad outcome is real
+the moment it's observed and grades immediately, at any age. A clean
+grade waits: `merged, no negative signal` only becomes `clean` once the
+PR has stood for `min_age_days` (default 7, profile-overridable via
+`outcome_grading.min_age_days`, mirroring the
+`profile.contrarian_max_iterations` guard). Before that it grades
+`pending`, because "no negative signal yet" is not the same claim as
+"held up cleanly". `closed_unmerged` and `abandoned` are a terminal
+escape hatch for targets that will never see a merge and so can never
+earn `clean` any other way.
+
+**`diffOutcomeGrades`** is the only thing allowed to decide what gets
+appended. It compares this pass's freshly graded lines against
+`prior_ledger_lines` (both sides read last-line-wins, since the ledger is
+append-only) and keeps only lines that are new or whose grade changed,
+skipping any key whose prior grade is already terminal
+(`reverted`/`reopened`/`hotfix`/`closed_unmerged`/`abandoned` —
+`OUTCOME_TERMINAL_GRADES`) so settled history never gets bloated or
+second-guessed by a possibly-flaky re-read. `summarizeOutcomeCoverage`
+rolls the pass into `graded_count`/`negative_count`/`pending_count`/
+`sample_cap_hit`, so a later tier can read one small object instead of
+re-walking the ledger.
+
+**Persistence follows the `record`/`ledger` contract exactly.** The
+engine returns `outcomes` (the diffed, new-or-changed lines only),
+`outcomes_path`, and `outcomes_coverage` alongside `record`/`ledger`.
+`skills/mill/SKILL.md` seeds `outcomes.jsonl` if it doesn't exist yet and
+appends each entry as its own compact JSON line, in order: a plain,
+dumb append, never a rewrite or a dedup, matching how the skill already
+writes `runs.jsonl`. `outcomes.jsonl` is a per-host, gitignored local
+artifact, and target selection is bounded by
+`outcome_grading.sample_cap` (default 20, oldest-unobserved-first) so one
+pass stays cheap and history catches up over many runs instead of trying
+to grade everything at once.
+
 ### Engine-owned path guardrail: three regimes
 
 A worktree only sees committed state. A freshly forged agent file, or a

@@ -111,6 +111,23 @@ When the return includes a `record` object (older engines omit it — then skip 
 The agent-written `summary-<run_tag>.md` remains the human narrative; `runs/<run_tag>.json`
 is the machine record.
 
+When the return also includes an `outcomes` array (older engines omit it — then skip this):
+
+3. If `<logs_dir>/outcomes.jsonl` does not exist yet, create it empty first (seed it) —
+   same as `runs/` gets created before the first write above.
+4. Append each entry in `outcomes` to `<logs_dir>/outcomes.jsonl` as its own **single
+   compact JSON line** (no pretty-printing, one line per entry), in the order given.
+   This is a **plain append — never rewrite the file, never de-dup, never drop a line**.
+   The engine's `diffOutcomeGrades` already decided which grades are new or changed
+   before returning `outcomes`; the skill's only job here is dumb, deterministic append,
+   identical in spirit to the `runs.jsonl` append above. "Last-line-wins per
+   `run_tag`+`batch_pr`+`issue` key" is a convention for whatever later *reads* this
+   file (e.g. a Tier 5 consumer) — it is not something the skill enforces on write.
+
+`outcomes.jsonl` is a per-host local artifact, same as `runs.jsonl` and `runs/*.json`
+(`logs/` is gitignored) — it is never committed, and grades accrue only from runs
+executed on this host.
+
 ## Resuming
 
 - Same session: `Workflow({scriptPath, resumeFromRunId: "wf_..."})` replays completed
