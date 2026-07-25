@@ -6237,6 +6237,61 @@ const outcomeGradePromise = agent([
 ].join('\n'), { label: 'outcome-grade', phase: 'Select', schema: OUTCOMES_SCHEMA, model: M.probe.model, effort: M.probe.effort })
   .catch(function (e) { log('outcome-grading pass failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
 
+// ---- Select: revisit-risk pass (issue #93), fired alongside learnPromise/
+// outcomeGradePromise above so its latency hides behind the preflight probes too
+// — same STAGE_TOKENS.preflight R1 bracket (see the comment above learnPromise).
+// STRICTLY READ-ONLY: cat outcomes.jsonl/runs.jsonl/runs/<tag>.json under LOGS,
+// `gh pr view`/`gh search commits`/`gh pr list`/`gh api` — no git fetch, no local
+// writes, no repo mutations of any kind. Same PIN as outcomeGradePromise: this
+// agent returns raw, issue-attributed negative-outcome events + refix_chains
+// only — it NEVER decides a flag itself. computeRevisitRisk (the deterministic
+// pure core above the TICKETMILL-TEST-HARNESS-SPLIT marker) is the only place
+// that turns these into a revisit_risk flag, post-hoc, just after outcomeGradeR
+// below.
+const revisitRiskPromise = agent([
+  'READ-ONLY revisit-risk pass over ' + REPO + '\'s ticketmill run history under ' + LOGS + '.',
+  'NO repo mutations of any kind: no git fetch, no local file writes, no gh command that changes state —',
+  'only cat and gh READ commands (gh pr view, gh search commits, gh pr list, gh api) below.',
+  '',
+  '0. now: run `date -u +%Y-%m-%dT%H:%M:%SZ` and return it verbatim as `now`.',
+  '',
+  '1. Negative-outcome events — issue-attributed regression loci:',
+  '   a. cat ' + LOGS + '/outcomes.jsonl (if missing/empty: events = [] — skip straight to step 2, there is no history',
+  '      yet). Each line is one compact JSON object {run_tag, batch_pr, issue, grade, signals, decided_at}',
+  '      (schema_version 1). Group lines by {run_tag, batch_pr, issue} and, per key, keep ONLY the LAST line (the',
+  '      ledger is append-only; later lines override earlier ones for the same key).',
+  '   b. Keep only keys whose current (last-line-wins) grade is one of reverted / reopened / hotfix. Drop every other',
+  '      grade (pending/clean/closed_unmerged/abandoned are not evidence of a regression).',
+  '   c. Drop any survivor whose age is already outside the ' + REVISIT_RISK.window_days + '-day window: age in whole',
+  '      days from its own decided_at field (fall back to signals.merged_at ONLY if decided_at is missing) to `now`',
+  '      from step 0. This is a target-selection optimization only, to keep this pass\'s gh-call budget cheap — if in',
+  '      doubt, keep the survivor; the engine deterministically re-checks the real window itself afterward.',
+  '   d. For each surviving key, resolve `files` (the regression locus) by grade — fail open to [] on ANY doubt, never',
+  '      fabricate a path:',
+  '      - hotfix: gh pr view <signals.hotfix_pr> --repo ' + REPO + ' --json files,mergedAt. files = the returned',
+  '        files[].path list. If signals.hotfix_pr is missing/null, files = [].',
+  '      - reverted: best-effort only. gh search commits --repo ' + REPO + ' "Revert" "#<batch_pr>" to find the revert',
+  '        commit (or gh pr list --repo ' + REPO + ' --state merged --search "Revert #<batch_pr>" as a second angle) —',
+  '        accept a result ONLY when it clearly reverts THIS batch_pr, not merely mentions its number in passing. If',
+  '        found, resolve its changed files via gh api repos/' + REPO + '/commits/<sha> --jq \'.files[].filename\' (or,',
+  '        if the revert itself was a PR, gh pr view <that PR> --json files). If no revert commit/PR is clearly',
+  '        identifiable, or any command fails, files = [].',
+  '      - reopened: files = [] always (no recoverable regression locus without a squashed diff to compare).',
+  '   e. Return one entry per surviving key: {issue, batch_pr, grade, decided_at, merged_at (from signals.merged_at,',
+  '      else null), files}.',
+  '',
+  '2. refix_chains (issue #89 within-issue re-fix chains — corroboration-only, never resolve files/gh calls for these):',
+  '   a. cat ' + LOGS + '/runs.jsonl (if missing/empty: refix_chains = []). For each DISTINCT run_tag on those lines,',
+  '      cat ' + LOGS + '/runs/<run_tag>.json (skip a run_tag with no such file — its runs.jsonl line predates the',
+  '      full-record format).',
+  '   b. From each record\'s friction_churn.churn.refix_chains array (if present), collect every {issue, file, count}',
+  '      entry verbatim (drop its bucket field — not needed here).',
+  '',
+  'Return events (array, from step 1e — even if empty), refix_chains (array, from step 2b — even if empty), and now',
+  '(from step 0).',
+].join('\n'), { label: 'revisit-risk', phase: 'Select', schema: REVISIT_RISK_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+  .catch(function (e) { log('revisit-risk pass failed (non-fatal): ' + String((e && e.message) || e).slice(0, 120)); return null })
+
 // ---- Select: preflight probe (the GitHub-state healing layer) ----
 // enginePathspec (issue #3): the literalized engine-owned pathspec, computed
 // ONCE here (ENGINE_OWNED is already populated — profile is loaded) using the
@@ -6341,6 +6396,7 @@ if (engineSkip.flagged.length) log('engine-owned guardrail: root working tree di
 
 const learnR = await learnPromise
 const outcomeGradeR = await outcomeGradePromise
+const revisitRiskR = await revisitRiskPromise
 addStage('preflight', preflightR1Before) // STAGE_TOKENS.preflight R1 close — see the bracket comment above learnPromise
 if (learnR && learnR.found) {
   LEARN = learnR
@@ -6382,6 +6438,25 @@ if (outcomeGradeR) {
     (OUTCOMES_COVERAGE.sample_cap_hit ? ' (sample cap hit — history not fully caught up yet)' : ''))
 } else {
   log('outcome-grading pass failed or returned nothing (non-fatal) — no outcome ledger lines this run')
+}
+
+// ---- Select: revisit-risk post-hoc (issue #93) — turn revisitRiskR's raw,
+// judgment-free events into a flag decision using the deterministic pure core
+// above the TICKETMILL-TEST-HARNESS-SPLIT marker (computeRevisitRisk). The agent
+// never decides a flag itself — only this JS does. Runs unconditionally (not
+// gated on `if (revisitRiskR)` like the outcome-grading block above) because
+// computeRevisitRisk's own observations-defaulting (`obs = observations || {}`,
+// `events`/`refix_chains` each defaulting to []) is what normalizes a dead/failed
+// probe to the clean, non-flagging { flagged: false, reasons: [] } shape
+// acceptance criterion 2 requires — every preflight gets a revisit_risk field
+// either way, never a missing one.
+preflights = computeRevisitRisk(preflights, revisitRiskR || {}, REVISIT_RISK)
+if (revisitRiskR) {
+  const revisitFlaggedCount = preflights.filter(function (p) { return p.revisit_risk && p.revisit_risk.flagged }).length
+  log('revisit risk: ' + (Array.isArray(revisitRiskR.events) ? revisitRiskR.events.length : 0) + ' negative-outcome event(s) observed, ' +
+    revisitFlaggedCount + ' preflight(s) flagged')
+} else {
+  log('revisit-risk pass failed or returned nothing (non-fatal) — no revisit_risk flags this run')
 }
 
 // ---- Select: consolidation gate (judgment call — see the PROPOSECONSOLIDATION
