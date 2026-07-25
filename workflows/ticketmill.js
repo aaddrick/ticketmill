@@ -4292,7 +4292,12 @@ function computeCompleteness(results, tokenAgg) {
   let changedFilesMissing = 0
   let completedCount = 0
   for (const r of list) {
-    if (!r || r.metrics == null) metricsMissing++
+    // 'skipped' results (already-merged/duplicate/consolidation-member) are built
+    // with no metrics key at all by design (see the 'skip' return site) — that is
+    // a legitimate shape, not a pool-catch stub or a ctx that died mid-run, so it
+    // must not force trustworthy:false. A pool-catch 'failed' result also has no
+    // metrics key but IS a genuine failure mode and still counts.
+    if (!r || (r.status !== 'skipped' && r.metrics == null)) metricsMissing++
     if (r && r.status === 'completed') {
       completedCount++
       if (r.changed_files == null) changedFilesMissing++

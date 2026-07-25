@@ -58,14 +58,28 @@ test('computeCompleteness: flags a completed issue whose changed_files was never
 test('computeCompleteness: a skipped/needs_human result never counts against changed_files_missing (only completed issues probe it)', function () {
   const context = harness.boot()
   const results = [
-    { issue: 1, status: 'skipped', metrics: {}, changed_files: null },
+    // real 'skip' return site shape (Object.assign with no metrics key at all,
+    // workflows/ticketmill.js's skip-return site) — must not count as metrics_missing.
+    { issue: 1, status: 'skipped', changed_files: null },
     { issue: 2, status: 'needs_human', metrics: {}, changed_files: null },
   ]
   const c = context.computeCompleteness(results, reconciled(0))
 
+  assert.strictEqual(c.metrics_missing, 0)
   assert.strictEqual(c.completed_count, 0)
   assert.strictEqual(c.changed_files_missing, 0)
   assert.strictEqual(c.trustworthy, true)
+})
+
+test('computeCompleteness: a pool-catch failed result (no metrics key, same shape as a skip) still counts as metrics_missing', function () {
+  const context = harness.boot()
+  const results = [
+    { issue: 1, status: 'failed', changed_files: null }, // runPool catch-site shape: no metrics key
+  ]
+  const c = context.computeCompleteness(results, reconciled(0))
+
+  assert.strictEqual(c.metrics_missing, 1)
+  assert.strictEqual(c.trustworthy, false)
 })
 
 test('computeCompleteness: a large reconcile_error (above MAX_RECONCILE_ERROR_FOR_TRUST) flips tokens_reconciled/trustworthy false even with clean per-issue data', function () {
