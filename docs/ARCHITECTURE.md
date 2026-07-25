@@ -792,12 +792,20 @@ nothing to do with tokens. An ordinary agent death got misreported as
 exhaustion, and the whole batch halted with every remaining issue left
 unstarted.
 
-The check now requires a budget/token/ceiling noun to co-occur with an
-exhaustion-shaped verb: exhaust, exceed, deplete, ran out, overrun/overage,
-went over, ran over, over budget, over the limit, or limit reached. Either
-alone isn't enough. The "over" family is anchored to those overrun-shaped
-phrases rather than the bare word "over", which turns up in ordinary prose
-("budget review is over") without meaning exhaustion.
+The check now requires a budget/ceiling noun — or `token` narrowed to its
+plural `tokens` or a qualified form like `token budget`/`token limit` — to
+co-occur with an exhaustion-shaped verb: exhaust, exceed, deplete, ran out,
+overrun/overage, went over, ran over, over budget, over the limit, or limit
+reached. Either alone isn't enough. The "over" family is anchored to those
+overrun-shaped phrases rather than the bare word "over", which turns up in
+ordinary prose ("budget review is over") without meaning exhaustion. Bare
+singular `token` was dropped from the noun set (issue #62): it was broad
+enough to co-occur with an exhaustion verb in unrelated auth/rate-limit
+errors (an expired auth token, an API rate limit, a CSRF token check), each
+misreported as budget exhaustion. Narrowing to the qualified/plural forms
+also closed a recall gap — the old bare-`token` pattern never matched the
+plural, so "ran out of tokens" fell through to the death-counter backstop
+instead of tripping the fast path.
 
 Anchoring to the runtime's exact exhaustion error string was rejected: that
 text isn't documented anywhere accessible, and the runtime's budget object
