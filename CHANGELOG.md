@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.1.31 (2026-07-25)
+
+Tier 2a of the observability upgrade: the data-enrichment foundation
+the per-run analytics tiers build on. One issue (#87). Patch bump by
+choice (0.1.30 -> 0.1.31). The per-issue `ctx` object gathered rich
+friction data during a run but dropped several signals and never kept
+the actual list of files an issue changed, so "which files got
+revisited" couldn't be computed. This enriches `ctx` in pure JS, with
+no new agent calls beyond reusing the engine-owned diff probe.
+
+- Changed files retained (#87): the engine-owned diff probe
+  (`probeChangedFiles`) now runs once post-implement for every issue
+  and stores `changed_files`/`added_files` on `ctx`. Before, the probe
+  was gated on engine-owned globs and its result was discarded, so the
+  file list an issue touched never survived past the implement stage.
+- Within-issue re-touch tally (#87): `tallyTouches` derives
+  `touch_counts` from the fix-stage `files_changed` fields, counting
+  how many times each file was revisited inside a single issue. A file
+  touched three times signals churn a merged diff alone hides.
+- Derived friction fields (#87): `frictionFields` adds
+  `contrarian_capped` (a contrarian gate hit its iteration cap with
+  unresolved caveats), `test_quality_fix_rounds`, `needs_human`, and
+  `unresolved_count`. These roll scattered per-stage state into flat
+  fields a trend query can read without walking the run tree.
+- Gate findings tally (#87): `recordGateOutcome` writes `gate_findings`
+  per contrarian gate: a count plus severity mix and disposition
+  (accepted / dismissed / carried-unresolved), reusing the
+  settled-decisions ledger. Scoped to the two per-issue contrarian
+  gates (approach, plan). The review/task gates don't carry a
+  severity-tagged findings array, so a severity mix can't be honestly
+  derived for them.
+- Per-run completeness block (#87): `computeCompleteness` records
+  whether every issue's `metrics` landed, whether tokens reconciled,
+  and whether `changed_files` was captured for each merged issue.
+  Downstream trends carry a trust flag off this. It distinguishes an
+  issue skipped by design from one that failed, since both lack a
+  `metrics` key.
+
+Every new field is threaded through all three result returns
+(completed / failure / skip). 31 new reducer tests run over fixture
+`ctx` objects. Engine copies stay byte-identical (lockstep-linted).
+
 ## 0.1.30 (2026-07-25)
 
 Tier 1 of the observability and self-improvement upgrade: the foundation the
