@@ -1660,26 +1660,42 @@ function verifyNotesBlock() {
   return '## Project verification notes (from the ticketmill profile)\n' + vn.map(function (n) { return '- ' + n }).join('\n')
 }
 
-// ----- gate findings tally (issue #87 task 3) -----
-// Per-gate (currently the two per-issue contrarian gates, 'approach' and
-// 'plan' — CHALLENGE_SCHEMA's findings carry a severity, unlike REVIEW_SCHEMA/
-// TASK_REVIEW_SCHEMA's untyped issues/pass-fail shape, so those are the gates
-// a "severity mix" can honestly describe) tally of finding counts, severity
-// mix, and how that gate ITERATION resolved:
-//   accepted            - verdict sound_with_caveats with zero critical/major
-//                          (the same condition that triggers settleDecision()).
-//   carried-unresolved  - the contrarian cap was reached with critical/major
-//                         findings still open (they ride into ctx.unresolved).
+// ----- gate findings tally (issue #87 task 3, issue #91 wired in pr-review) -----
+// Per-gate (the two per-issue contrarian gates 'approach'/'plan', plus the
+// per-task 'pr-review' merge gate) tally of finding counts, severity mix, and
+// how that gate ITERATION resolved:
+//   accepted            - the gate iteration passed clean: for approach/plan,
+//                          verdict sound_with_caveats with zero critical/major
+//                          (the same condition that triggers settleDecision());
+//                          for pr-review, both spec and code review returned
+//                          'approved' (the same condition that ends the loop).
+//   carried-unresolved  - the gate's iteration cap was reached without a clean
+//                         pass: for approach/plan, critical/major findings
+//                         still open (they ride into ctx.unresolved); for
+//                         pr-review, MAX_PR_REVIEW_ITERATIONS reached without
+//                         both reviewers approving (the PR is left for human
+//                         review).
 //   re-litigated        - neither of the above: the loop revises and
-//                         re-challenges, so these findings get contested again
-//                         next iteration.
+//                         re-contests, so these findings get judged again
+//                         next iteration (a fix stage for pr-review, a
+//                         re-evaluate stage for approach/plan).
 //   dismissed           - the gate produced no adjudicated verdict at all
 //                         (challenger agent died) — any findings were never
-//                         actually judged.
+//                         actually judged. pr-review has no equivalent call:
+//                         a dead reviewer there fails the run immediately
+//                         (see reviewAndMerge) rather than tallying an outcome.
 // One call per gate ITERATION (not per finding), so `disposition` tallies
 // outcomes while `severity` sums every finding's severity across every
-// iteration of that gate. Bounded implicitly: one entry per gate name, each
-// gate runs at most challengeCap (<= MAX_CONTRARIAN_ITERATIONS) times per issue.
+// iteration of that gate. Bounded implicitly: one entry per gate name;
+// approach/plan run at most challengeCap (<= MAX_CONTRARIAN_ITERATIONS) times,
+// pr-review at most MAX_PR_REVIEW_ITERATIONS times, per issue/task.
+// NOTE: unlike CHALLENGE_SCHEMA (approach/plan), REVIEW_SCHEMA's `issues`
+// (pr-review's finding source) is untyped with no `severity` field — neither
+// the spec- nor code-review prompts ask for one — so `gate_findings['pr-
+// review'].severity` will stay {critical:0, major:0, minor:0} regardless of
+// actual findings. That's expected, not a bug: recordGateOutcome degrades
+// gracefully when `f.severity` doesn't match critical/major/minor, and
+// `disposition`/`count` still carry real signal for pr-review.
 function recordGateOutcome(ctx, gate, findings, disposition) {
   if (!ctx || !ctx.gate_findings) return
   const key = String(gate || '').trim()
@@ -4169,13 +4185,17 @@ async function reviewAndMerge(ctx) {
     const code = reviews[1]
     if (!spec || !code) return fail(ctx, 'needs_human', 'pr-review', 'a PR reviewer died — PR #' + ctx.pr + ' left open for human review')
 
-    // gate_findings tally (issue #91): one call per PR-review iteration, mirroring
-    // the approach/plan gates recorded above — this is the only gate #87 left
-    // unwired, so an "escaped defect" (finding absent at approach/plan, present
-    // here) was previously undetectable. 'accepted' means at least one reviewer
-    // requested changes (the findings drove a fix); 'approved' means the gate
-    // passed clean this iteration.
-    const prReviewDisposition = (spec.result === 'changes_requested' || code.result === 'changes_requested') ? 'accepted' : 'approved'
+    // gate_findings tally (issue #91): one call per PR-review iteration, using the
+    // same disposition vocabulary as the approach/plan gates above (see the doc
+    // comment on recordGateOutcome) — this is the only gate #87 left unwired, so
+    // an "escaped defect" (finding absent at approach/plan, present here) was
+    // previously undetectable. 'accepted' means both reviewers approved (the
+    // gate passed clean, mirroring the approved=true break below); on the final
+    // iteration without a clean pass the cap was reached with issues still open,
+    // same shape as the contrarian gates' 'carried-unresolved'; otherwise the
+    // loop continues into a fix stage and gets re-reviewed, i.e. 're-litigated'.
+    const prReviewClean = spec.result === 'approved' && code.result === 'approved'
+    const prReviewDisposition = prReviewClean ? 'accepted' : (iter === MAX_PR_REVIEW_ITERATIONS ? 'carried-unresolved' : 're-litigated')
     recordGateOutcome(ctx, 'pr-review', (spec.issues || []).concat(code.issues || []), prReviewDisposition)
 
     if (spec.result === 'approved' && code.result === 'approved') { approved = true; break }
