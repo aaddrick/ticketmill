@@ -334,6 +334,14 @@ const REFIX_THRESHOLD = 3
 // probes cover, so the pass stays cheap and re-runs/deepens over many runs rather
 // than trying to grade full history in one shot.
 let OUTCOME_GRADING = { min_age_days: 7, sample_cap: 20 }
+// revisit risk (issue #93): default config for computeRevisitRisk()'s recency
+// window — overridable via profile.revisit_risk, same guard shape as
+// outcome_grading just above (see PROFILE.revisit_risk in Select). window_days
+// bounds how far back an issue-attributed negative outcome (reverted/reopened/
+// hotfix — OUTCOME_NEGATIVE_GRADES) can be and still count toward a preflight's
+// "recent track record" risk flag; older regressions age out and stop
+// contributing reasons.
+let REVISIT_RISK = { window_days: 30 }
 
 // ----- model policy (profile.models may override any stage key) -----
 const M = {
@@ -439,18 +447,20 @@ const PROFILE_SCHEMA = {
   type: 'object', required: ['found'],
   // found/raw describe the probe's own response shape (does the profile file
   // exist, and its raw text). engine_owned_globs/lockstep_installed_paths/
-  // outcome_grading document — for readers of this schema — optional fields
-  // added to the parsed .claude/ticketmill.json profile itself: issue #3's
-  // engine_owned_globs/lockstep_installed_paths (read at Select via
-  // mergeEngineOwnedGlobs), and issue #92's outcome_grading (read at Select via
-  // a guard mirroring profile.contrarian_max_iterations's, right after it).
-  // None of them are part of the probe response itself and additionalProperties
-  // is unset, so listing them here is documentation only, not enforcement.
+  // outcome_grading/revisit_risk document — for readers of this schema —
+  // optional fields added to the parsed .claude/ticketmill.json profile itself:
+  // issue #3's engine_owned_globs/lockstep_installed_paths (read at Select via
+  // mergeEngineOwnedGlobs), issue #92's outcome_grading, and issue #93's
+  // revisit_risk (both read at Select via a guard mirroring
+  // profile.contrarian_max_iterations's, right after it). None of them are part
+  // of the probe response itself and additionalProperties is unset, so listing
+  // them here is documentation only, not enforcement.
   properties: {
     found: { type: 'boolean' }, raw: { type: 'string' },
     engine_owned_globs: { type: 'array', items: { type: 'string' } },
     lockstep_installed_paths: { type: 'array', items: { type: 'string' } },
     outcome_grading: { type: 'object', properties: { min_age_days: { type: 'integer' }, sample_cap: { type: 'integer' } } },
+    revisit_risk: { type: 'object', properties: { window_days: { type: 'integer' } } },
   },
 }
 const AGENTS_SCHEMA = {
@@ -769,6 +779,65 @@ const OUTCOMES_SCHEMA = {
     // now: the probe's own `date -u` read, passed straight through to
     // gradeFromObservation's `now` param (the sandbox has no Date.now()/`new
     // Date()` — see that function's module comment).
+    now: { type: 'string' },
+  },
+}
+// REVISIT_RISK_SCHEMA (issue #93): the read-only Select-phase revisit-risk
+// probe's raw-observation payload. Same PIN as OUTCOMES_SCHEMA just above: the
+// agent returns raw, issue-attributed regression events ONLY — it never
+// decides a flag itself. That decision is computeRevisitRisk's job (the
+// deterministic pure core placed above the TICKETMILL-TEST-HARNESS-SPLIT
+// marker), which does the normalized-path intersection against each
+// preflight's predicted_files.
+const REVISIT_RISK_SCHEMA = {
+  type: 'object', required: ['events', 'refix_chains', 'now'],
+  properties: {
+    // events: a flat list of issue-attributed negative-outcome events (grade
+    // mirrors OUTCOME_NEGATIVE_GRADES: reverted/reopened/hotfix) the probe found
+    // by reading outcomes.jsonl (last-line-wins per {run_tag,batch_pr,issue}),
+    // one entry per graded target whose current grade is negative.
+    events: {
+      type: 'array',
+      items: {
+        type: 'object', required: ['issue', 'grade', 'files'],
+        properties: {
+          issue: { type: 'integer' },
+          batch_pr: { type: ['integer', 'null'] },
+          grade: { enum: ['reverted', 'reopened', 'hotfix'] },
+          // decided_at: the outcome ledger line's own decided_at (when THIS
+          // negative grade was decided/observed) — the PRIMARY recency anchor.
+          // merged_at (the batch PR's original merge time, from the ledger's
+          // signals.merged_at) is the FALLBACK, used only when decided_at is
+          // missing (e.g. an older ledger line predating this field). See
+          // computeRevisitRisk's module comment for why decided_at
+          // (observation time), not merged_at (event time), is the deliberate
+          // recency-anchor polarity (approach-challenge caveat 2).
+          decided_at: { type: ['string', 'null'] },
+          merged_at: { type: ['string', 'null'] },
+          // files: the issue-attributed regression locus. hotfix resolves this
+          // via `gh pr view <signals.hotfix_pr> --json files`; reverted via a
+          // best-effort live revert-commit diff (else []); reopened is always
+          // [] (no recoverable locus without a squashed diff — an
+          // approach-challenge-i2 minor left deliberately open). An empty
+          // array is non-flagging, never an error.
+          files: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+    // refix_chains: issue #89's within-issue re-fix chains (computeChurn),
+    // read straight off runs/<tag>.json's friction_churn.churn.refix_chains —
+    // corroboration-only. computeRevisitRisk never lets these independently
+    // flag a file; they only annotate a file that already flagged from a real
+    // events[] overlap.
+    refix_chains: {
+      type: 'array',
+      items: {
+        type: 'object', required: ['issue', 'file'],
+        properties: { issue: { type: 'integer' }, file: { type: 'string' }, count: { type: 'integer' } },
+      },
+    },
+    // now: the probe's own `date -u` read, same role as OUTCOMES_SCHEMA.now —
+    // the sandbox has no Date.now()/argless `new Date()`.
     now: { type: 'string' },
   },
 }
@@ -4682,6 +4751,7 @@ function __seed(o) {
   if ('LOCKSTEP_INSTALLED_PATHS' in o) LOCKSTEP_INSTALLED_PATHS = o.LOCKSTEP_INSTALLED_PATHS
   if ('MAX_CONTRARIAN_ITERATIONS' in o) MAX_CONTRARIAN_ITERATIONS = o.MAX_CONTRARIAN_ITERATIONS
   if ('OUTCOME_GRADING' in o) OUTCOME_GRADING = o.OUTCOME_GRADING
+  if ('REVISIT_RISK' in o) REVISIT_RISK = o.REVISIT_RISK
 }
 
 // contrarianCapFor: proportional adversarial depth (see the comment at its call
@@ -5820,6 +5890,90 @@ function summarizeOutcomeCoverage(observations, lines, sampleCapHit) {
   }
 }
 
+// computeRevisitRisk (issue #93): the deterministic flag decision — mirrors
+// gradeFromObservation's raw-observation-in/deterministic-decision-out shape
+// per #92's PIN (the Select-phase revisit probe returns raw events only; this
+// pure function is the only place that decides a flag). Takes `preflights`
+// (each carrying predicted_files, PREFLIGHT_SCHEMA), `observations`
+// (REVISIT_RISK_SCHEMA's raw payload: events[] + refix_chains[] + now), and
+// `cfg` (defaults to REVISIT_RISK; pass an explicit object to override
+// window_days in tests). Returns a NEW array (mirrors
+// attachEngineOwnedIntentional's non-mutating shape) — every preflight comes
+// back with a `revisit_risk = { flagged, reasons }` field attached;
+// `{ flagged: false, reasons: [] }` is the clean no-op shape acceptance
+// criterion 2 requires when there is no matching history.
+//
+// Recency anchor polarity (approach-challenge caveat 2): each event's window
+// membership is computed from its `decided_at` (when the outcome ledger
+// DECIDED the negative grade — i.e. when a revisit-risk probe could first have
+// seen it), falling back to `merged_at` only when decided_at is missing (an
+// older ledger line predating that field). This is deliberately
+// OBSERVATION-time, not EVENT-time: the signal this probe feeds a preflight is
+// "how recently did we LEARN this area is risky", not "how recently did the
+// regression itself land" — a regression that merged months ago but was only
+// just discovered (reverted/hotfixed/reopened, decided this week) is fresh
+// news to a run starting today, even though the underlying merge is old.
+// `merged_at` is the truer EVENT-time anchor and would be defensible too; this
+// function commits to `decided_at` and this comment is what makes that choice
+// legible rather than accidental.
+//
+// Matching: a normalized-path (case-sensitive, slash-normalized) intersection
+// of each preflight's predicted_files against every in-window event's files[]
+// — any overlap sets flagged:true and adds one reason per matching event.
+// `refix_chains` (issue #89's within-issue re-fix chains) never flags on its
+// own — it only appends a corroborating reason for a file that ALREADY
+// flagged from a real events[] overlap, per approach-challenge-i2's F1: churn/
+// edit-frequency alone has zero outcome coupling and would flag almost every
+// engine-touching issue in a monolith-shaped repo like this one.
+function computeRevisitRisk(preflights, observations, cfg) {
+  const c = cfg || REVISIT_RISK
+  const windowDays = Number.isFinite(c.window_days) ? c.window_days : REVISIT_RISK.window_days
+  const obs = observations || {}
+  const now = obs.now
+  const events = Array.isArray(obs.events) ? obs.events : []
+  const refixChains = Array.isArray(obs.refix_chains) ? obs.refix_chains : []
+
+  function normalizePath(f) { return String(f).trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/{2,}/g, '/') }
+
+  // in-window events only, each pre-normalized into a file lookup set
+  const inWindow = []
+  for (const e of events) {
+    if (!e) continue
+    const anchor = e.decided_at != null ? e.decided_at : e.merged_at
+    const age = ageInDays(anchor, now)
+    if (age == null || age > windowDays) continue // unparseable/unknown age never flags — fail safe
+    const fileSet = {}
+    for (const f of (Array.isArray(e.files) ? e.files : [])) fileSet[normalizePath(f)] = true
+    inWindow.push({ issue: e.issue, grade: e.grade, files: fileSet })
+  }
+
+  return (preflights || []).map(function (p) {
+    const predicted = Array.isArray(p && p.predicted_files) ? p.predicted_files : []
+    const reasons = []
+    const flaggedFiles = {}
+    for (const f of predicted) {
+      const nf = normalizePath(f)
+      for (const e of inWindow) {
+        if (e.files[nf]) {
+          flaggedFiles[nf] = true
+          reasons.push(nf + ' was ' + e.grade + ' on issue #' + e.issue + ' within the last ' + windowDays + ' days')
+        }
+      }
+    }
+    const flagged = reasons.length > 0
+    if (flagged) {
+      for (const rc of refixChains) {
+        if (!rc) continue
+        const nf = normalizePath(rc.file)
+        if (flaggedFiles[nf]) {
+          reasons.push(nf + ' also re-fixed ' + (Number.isFinite(rc.count) ? rc.count : '?') + '+ times within issue #' + rc.issue + ' (corroborating)')
+        }
+      }
+    }
+    return Object.assign({}, p, { revisit_risk: { flagged: flagged, reasons: reasons } })
+  })
+}
+
 // ---- TICKETMILL-TEST-HARNESS-SPLIT: tests/harness.js truncates the source at this
 // marker and evaluates only what precedes it; nothing from here down (including the
 // top-level await below) runs under the test harness's vm context. Do not remove or
@@ -5880,6 +6034,20 @@ if (Object.prototype.hasOwnProperty.call(PROFILE, 'outcome_grading')) {
     nextOG.sample_cap = og.sample_cap
   }
   OUTCOME_GRADING = nextOG
+}
+// revisit risk (issue #93): OPTIONAL profile.revisit_risk overrides
+// REVISIT_RISK's hardcoded default (window_days:30 — see its declaration) —
+// same shape of guard as outcome_grading just above. Absent profile key ->
+// default stands untouched.
+if (Object.prototype.hasOwnProperty.call(PROFILE, 'revisit_risk')) {
+  const rr = PROFILE.revisit_risk
+  if (!rr || typeof rr !== 'object' || Array.isArray(rr)) throw new Error('profile.revisit_risk must be an object, got: ' + JSON.stringify(rr))
+  const nextRR = Object.assign({}, REVISIT_RISK)
+  if (Object.prototype.hasOwnProperty.call(rr, 'window_days')) {
+    if (!Number.isInteger(rr.window_days) || rr.window_days < 1) throw new Error('profile.revisit_risk.window_days must be an integer >= 1, got: ' + JSON.stringify(rr.window_days))
+    nextRR.window_days = rr.window_days
+  }
+  REVISIT_RISK = nextRR
 }
 REPO = PROFILE.repo || REPO
 LOGS = ROOT + '/' + String(PROFILE.logs_dir || 'logs/ticketmill').replace(/^\/+|\/+$/g, '')
