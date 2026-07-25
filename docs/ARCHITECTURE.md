@@ -364,6 +364,67 @@ heading. `buildRunRecord` carries the same rollup under a `friction_churn`
 key: machine-readable fields only, no markdown, additive alongside the
 existing `tokens` and `merge_auto_resolve` blocks.
 
+### Rework tax and gate yield: did the fight pay for itself
+
+Friction & churn scores how hard a run fought. Rework tax and gate yield ask
+a narrower question: how much of that fight was wasted motion, and did the
+paranoid gates catch anything worth their cost. Both are pure JS reducers,
+built the same way as `composeFrictionChurn` above. Each computes once,
+injects its markdown verbatim into the batch PR and run report, and adds
+machine-readable fields to `buildRunRecord` alongside `friction_churn`.
+
+**Completing the gate findings tally.** `recordGateOutcome` (#87) tallied
+findings for the approach and plan contrarian gates only. `reviewAndMerge`
+now calls it for `pr-review` too, the third and last per-issue gate. The
+disposition vocabulary carries over unchanged: `accepted` when both the spec
+and code reviewer approve in the same iteration (the same condition that
+trips the `approved = true` break just below it), `carried-unresolved` when
+the iteration cap is reached without a clean pass, and `re-litigated`
+otherwise, since the loop revises and sends the PR back for another review.
+A dead reviewer never reaches this line: `reviewAndMerge` already fails the
+run with `needs_human` first. One gap carries through the tally.
+`REVIEW_SCHEMA`'s `issues` field has no `severity`, unlike the contrarian
+gates' `CHALLENGE_SCHEMA`. The review prompts never ask for one, so
+`gate_findings['pr-review'].severity` stays zero across the board while
+`disposition` and `count` still carry real signal for that gate.
+
+**Per-stage token tracking.** `stage()` already attributed each retry loop's
+token delta to `ctx.tokens.total` and `ctx.tokens.byModel`. It now attributes
+the same delta to `ctx.tokens.byStage[key]`, keyed by the literal stage name
+the caller passed in, things like `quality-fix-i1` or `pr-fix`. No new
+sampling runs and no new failure mode opens up. The accumulation rides the
+same try/finally block that already guards the total and per-model sums.
+
+**`computeReworkTax(results, tokenAgg)`** classifies each `byStage` key
+against a fixed prefix list: `quality-fix`, `test-fix`, `test-quality-fix`,
+`pr-fix`, `merge-conflict-resolve`. Anything matching one of those prefixes
+counts as rework. Everything else counts as first-pass work. The list checks
+the compound `test-quality-fix` prefix before the shorter `quality-fix` and
+`test-fix` prefixes it would otherwise match as a substring, then sums both
+buckets per issue and across the run.
+
+The result is only as trustworthy as the token accounting under it. Above
+concurrency 1, overlapping issues' stages attribute the same shared counter
+movement to each of their own `byStage` keys, the exact over-count
+`aggregateTokens` already documents for its per-issue rows. `computeReworkTax`
+gates on `tokenAgg.reconcile_error` staying at or under
+`MAX_RECONCILE_ERROR_FOR_TRUST` (#90's honest reconciliation signal). It
+never gates on the coarser `reconciles` boolean, because an untrusted
+`reconcile_error` taints the rework fraction the same way it taints the run
+total. A run that fails the check still returns its raw per-issue sums. Only
+the run-level fraction and the rendered signal go quiet, with a stated
+reason, so a machine consumer can see what was computed without the run
+treating it as trustworthy.
+
+**`computeGateYield(results)`** rolls the three gates' `gate_findings`
+tallies into one table: findings, severity mix, and an accepted-to-dismissed
+ratio, summed across every issue in the run. Alongside it sits the signal
+the reducer exists for, an escaped defect: an issue where `pr-review` raised
+findings but neither `approach` nor `plan` raised any. The check counts
+findings rather than weighing severity, matching the issue's own definition.
+It answers one question directly: did the early gates ever get a look at
+this, or did it only surface because nothing upstream ever saw it.
+
 ### Engine-owned path guardrail: three regimes
 
 A worktree only sees committed state. A freshly forged agent file, or a
