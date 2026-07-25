@@ -650,3 +650,95 @@ test('deriveUnits: a singleton unit carries its OWN engineOwnedIntentional flag 
   assert.strictEqual(units[0].groupId, null)
   assert.strictEqual(units[0].engineOwnedIntentional, true)
 })
+
+// ---- unionRevisitRisk (issue #93) / deriveUnits: revisit_risk OR-fold ----
+//
+// Same shape and same reason as the engineOwnedIntentional OR-fold just above:
+// a member whose OWN revisit_risk is flagged must not go invisible just
+// because pickPrimary chose a different (unflagged) member as primary. Unlike
+// the boolean OR-fold, reasons[] is concatenated (not deduped) — each reason
+// already names the specific file/issue/grade it came from.
+
+test('unionRevisitRisk: flagged is true if ANY memberRef is flagged, and reasons concatenate in member order (not deduped)', function () {
+  const context = bootConsolidation()
+  const memberRefs = [
+    { issue: 1, revisit_risk: { flagged: false, reasons: [] } },
+    { issue: 2, revisit_risk: { flagged: true, reasons: ['reason A'] } },
+    { issue: 3, revisit_risk: { flagged: true, reasons: ['reason B', 'reason A'] } },
+  ]
+  const out = context.unionRevisitRisk(memberRefs)
+  assert.strictEqual(out.flagged, true)
+  assert.deepStrictEqual(Array.from(out.reasons), ['reason A', 'reason B', 'reason A'])
+})
+
+test('unionRevisitRisk: no memberRef flagged, or an empty/missing list, yields the clean no-op shape {flagged:false, reasons:[]}', function () {
+  const context = bootConsolidation()
+  const clean = context.unionRevisitRisk([
+    { issue: 1, revisit_risk: { flagged: false, reasons: [] } },
+    { issue: 2, revisit_risk: { flagged: false, reasons: [] } },
+  ])
+  assert.strictEqual(clean.flagged, false)
+  assert.deepStrictEqual(Array.from(clean.reasons), [])
+
+  const empty = context.unionRevisitRisk([])
+  assert.strictEqual(empty.flagged, false)
+  assert.deepStrictEqual(Array.from(empty.reasons), [])
+})
+
+test('unionRevisitRisk: a memberRef with no revisit_risk field at all (or a null one) is skipped, not thrown', function () {
+  const context = bootConsolidation()
+  const out = context.unionRevisitRisk([
+    { issue: 1 },
+    { issue: 2, revisit_risk: null },
+    { issue: 3, revisit_risk: { flagged: true, reasons: ['hit'] } },
+  ])
+  assert.strictEqual(out.flagged, true)
+  assert.deepStrictEqual(Array.from(out.reasons), ['hit'])
+})
+
+test('deriveUnits: a group whose flagged member is NOT the primary still yields unit.revisit_risk.flagged === true, with its reasons folded in', function () {
+  const context = bootConsolidation()
+  const map = new Map()
+  map.set(60, { groupId: 60, primary: 60, members: [60, 61], subsystem: 's', rationale: 'r' })
+  const live = [
+    { issue: 60, resume_point: 'implement', revisit_risk: { flagged: false, reasons: [] } },
+    { issue: 61, resume_point: 'implement', revisit_risk: { flagged: true, reasons: ['src/hot.js was hotfixed on issue #40'] } },
+  ]
+
+  const reconciled = context.reconcileGroups(map, live)
+  assert.strictEqual(reconciled.get(60).primary, 60) // confirm #60 IS the primary, not #61
+
+  const units = context.deriveUnits(reconciled, live)
+
+  assert.strictEqual(units.length, 1)
+  assert.strictEqual(units[0].issue, 60)
+  assert.strictEqual(units[0].revisit_risk.flagged, true) // OR-folded from non-primary member #61
+  assert.deepStrictEqual(Array.from(units[0].revisit_risk.reasons), ['src/hot.js was hotfixed on issue #40'])
+})
+
+test('deriveUnits: a group where no member is flagged yields unit.revisit_risk === {flagged:false, reasons:[]}', function () {
+  const context = bootConsolidation()
+  const map = new Map()
+  map.set(70, { groupId: 70, primary: 70, members: [70, 71], subsystem: 's', rationale: 'r' })
+  const live = [
+    { issue: 70, resume_point: 'implement', revisit_risk: { flagged: false, reasons: [] } },
+    { issue: 71, resume_point: 'implement', revisit_risk: { flagged: false, reasons: [] } },
+  ]
+
+  const units = context.deriveUnits(context.reconcileGroups(map, live), live)
+
+  assert.strictEqual(units[0].revisit_risk.flagged, false)
+  assert.deepStrictEqual(Array.from(units[0].revisit_risk.reasons), [])
+})
+
+test('deriveUnits: a singleton unit carries its OWN revisit_risk straight through untouched (no group to fold)', function () {
+  const context = bootConsolidation()
+  const live = [{ issue: 80, resume_point: 'implement', revisit_risk: { flagged: true, reasons: ['solo reason'] } }]
+
+  const units = context.deriveUnits(new Map(), live)
+
+  assert.strictEqual(units.length, 1)
+  assert.strictEqual(units[0].groupId, null)
+  assert.strictEqual(units[0].revisit_risk.flagged, true)
+  assert.deepStrictEqual(Array.from(units[0].revisit_risk.reasons), ['solo reason'])
+})

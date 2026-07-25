@@ -332,6 +332,130 @@ test('OUTCOME_GRADING module default is min_age_days:7, sample_cap:20 (mirrors C
   assert.strictEqual(og.sample_cap, 20)
 })
 
+// ---- deriveNegativeOutcomeEvents (issue #93 quality-fix, iteration 1) ----
+//
+// The re-derivation this fix added to close the PIN violation: given
+// outcomes.jsonl's RAW, unparsed lines (REVISIT_RISK_SCHEMA.prior_ledger_lines,
+// exactly as the probe returns them — never agent-interpreted), re-run
+// last-line-wins keying (outcomeLineKey) and the OUTCOME_NEGATIVE_GRADES filter
+// in JS, the same way diffOutcomeGrades already does. These tests guard the
+// exact failure modes the code review flagged: a broken last-line-wins parse
+// or a broken negative-grade filter would otherwise pass silently.
+
+function rawLedgerLine(context, over) {
+  return JSON.stringify(context.buildOutcomeLine(Object.assign({ run_tag: 'r1', batch_pr: 1, issue: 5, decided_at: 'x' }, over)))
+}
+
+test('deriveNegativeOutcomeEvents: a line whose grade is in OUTCOME_NEGATIVE_GRADES is emitted', function () {
+  const context = harness.boot()
+  const lines = [rawLedgerLine(context, { grade: 'hotfix' })]
+  const out = context.deriveNegativeOutcomeEvents(lines)
+  assert.strictEqual(out.length, 1)
+  assert.strictEqual(out[0].issue, 5)
+  assert.strictEqual(out[0].batch_pr, 1)
+  assert.strictEqual(out[0].grade, 'hotfix')
+})
+
+test('deriveNegativeOutcomeEvents: a line whose grade is NOT in OUTCOME_NEGATIVE_GRADES (clean/pending) is dropped', function () {
+  const context = harness.boot()
+  const lines = [rawLedgerLine(context, { grade: 'clean' }), rawLedgerLine(context, { issue: 6, grade: 'pending' })]
+  const out = context.deriveNegativeOutcomeEvents(lines)
+  assert.deepStrictEqual(plain(out), [])
+})
+
+test('deriveNegativeOutcomeEvents: last-line-wins across a duplicate key — a superseding clean line drops an earlier hotfix', function () {
+  const context = harness.boot()
+  const lines = [
+    rawLedgerLine(context, { grade: 'hotfix', decided_at: 'x' }),
+    rawLedgerLine(context, { grade: 'clean', decided_at: 'y' }),
+  ]
+  const out = context.deriveNegativeOutcomeEvents(lines)
+  assert.deepStrictEqual(plain(out), [], 'the LAST line for this key is clean, so the earlier hotfix must not survive')
+})
+
+test('deriveNegativeOutcomeEvents: last-line-wins the other direction — a superseding hotfix line surfaces even though an earlier line was clean', function () {
+  const context = harness.boot()
+  const lines = [
+    rawLedgerLine(context, { grade: 'clean', decided_at: 'x' }),
+    rawLedgerLine(context, { grade: 'hotfix', decided_at: 'y' }),
+  ]
+  const out = context.deriveNegativeOutcomeEvents(lines)
+  assert.strictEqual(out.length, 1)
+  assert.strictEqual(out[0].grade, 'hotfix')
+})
+
+test('deriveNegativeOutcomeEvents: pulls merged_at out of signals, defaults decided_at/batch_pr/merged_at to null when absent', function () {
+  const context = harness.boot()
+  const line = JSON.stringify({ run_tag: 'r1', issue: 7, grade: 'reverted', signals: { merged_at: '2026-01-01T00:00:00Z' } })
+  const out = context.deriveNegativeOutcomeEvents([line])
+  assert.strictEqual(out.length, 1)
+  assert.strictEqual(out[0].batch_pr, null)
+  assert.strictEqual(out[0].decided_at, null)
+  assert.strictEqual(out[0].merged_at, '2026-01-01T00:00:00Z')
+})
+
+test('deriveNegativeOutcomeEvents: a malformed (non-JSON) line is skipped, not thrown', function () {
+  const context = harness.boot()
+  const lines = ['{not valid json', rawLedgerLine(context, { grade: 'reverted' })]
+  const out = context.deriveNegativeOutcomeEvents(lines)
+  assert.strictEqual(out.length, 1)
+  assert.strictEqual(out[0].grade, 'reverted')
+})
+
+test('deriveNegativeOutcomeEvents: non-array/null/undefined input degrades to [], never throws', function () {
+  const context = harness.boot()
+  assert.deepStrictEqual(plain(context.deriveNegativeOutcomeEvents(null)), [])
+  assert.deepStrictEqual(plain(context.deriveNegativeOutcomeEvents(undefined)), [])
+  assert.deepStrictEqual(plain(context.deriveNegativeOutcomeEvents('not-an-array')), [])
+})
+
+// ---- attachRevisitFiles (issue #93 quality-fix, iteration 1) ----
+//
+// Merges ONLY the agent's live-gh `files` resolution onto
+// deriveNegativeOutcomeEvents' JS-derived, authoritative negative-event set,
+// keyed by {issue, batch_pr} — grade/decided_at/merged_at are never taken from
+// the agent side. A negative key the agent never resolved files for must fail
+// open to files:[], not fabricate or drop the event.
+
+test('attachRevisitFiles: merges files onto a matching {issue, batch_pr} key', function () {
+  const context = harness.boot()
+  const negativeEvents = [{ issue: 5, batch_pr: 1, grade: 'hotfix' }]
+  const agentEvents = [{ issue: 5, batch_pr: 1, files: ['src/foo.js'] }]
+  const out = context.attachRevisitFiles(negativeEvents, agentEvents)
+  assert.deepStrictEqual(plain(out)[0].files, ['src/foo.js'])
+  assert.strictEqual(out[0].grade, 'hotfix', 'grade must stay whatever deriveNegativeOutcomeEvents decided, untouched by the merge')
+})
+
+test('attachRevisitFiles: a negative event with no matching agent resolution fails open to files:[]', function () {
+  const context = harness.boot()
+  const negativeEvents = [{ issue: 5, batch_pr: 1, grade: 'reverted' }]
+  const out = context.attachRevisitFiles(negativeEvents, [{ issue: 999, batch_pr: 1, files: ['unrelated.js'] }])
+  assert.deepStrictEqual(plain(out)[0].files, [])
+})
+
+test('attachRevisitFiles: an agent event whose files is not an array degrades that key to [] rather than throwing', function () {
+  const context = harness.boot()
+  const negativeEvents = [{ issue: 5, batch_pr: 1, grade: 'reopened' }]
+  const out = context.attachRevisitFiles(negativeEvents, [{ issue: 5, batch_pr: 1, files: null }])
+  assert.deepStrictEqual(plain(out)[0].files, [])
+})
+
+test('attachRevisitFiles: batch_pr:null on both sides still matches (does not require batch_pr to be present)', function () {
+  const context = harness.boot()
+  const negativeEvents = [{ issue: 8, batch_pr: null, grade: 'hotfix' }]
+  const agentEvents = [{ issue: 8, batch_pr: null, files: ['src/no-batch.js'] }]
+  const out = context.attachRevisitFiles(negativeEvents, agentEvents)
+  assert.deepStrictEqual(plain(out)[0].files, ['src/no-batch.js'])
+})
+
+test('attachRevisitFiles: null/undefined negativeEvents or agentEvents degrade gracefully, never throw', function () {
+  const context = harness.boot()
+  assert.deepStrictEqual(plain(context.attachRevisitFiles(null, null)), [])
+  assert.deepStrictEqual(plain(context.attachRevisitFiles(undefined, undefined)), [])
+  const out = context.attachRevisitFiles([{ issue: 5, batch_pr: 1, grade: 'hotfix' }], null)
+  assert.deepStrictEqual(plain(out)[0].files, [])
+})
+
 // ---- computeRevisitRisk (issue #93): the deterministic revisit-risk flag core ----
 //
 // computeRevisitRisk(preflights, observations, cfg) takes each preflight's
