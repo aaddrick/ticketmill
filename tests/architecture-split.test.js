@@ -17,9 +17,10 @@
 // both before and after the split runs, rather than only during task 1's
 // narrow pre-generation window.
 //
-// Deliberately NOT covered here (a later task, once sha256 is filled in): the
-// true-inverse round-trip diff and the sha256 digests (the fixture's
-// `sha256` field is intentionally `{}` until then).
+// Deliberately NOT covered here: the true-inverse round-trip reconstruction
+// and its sha256 digests. That GIT-FREE gate lives in
+// tests/architecture-provenance.test.js and reads fixture.sha256, which this
+// file only checks for shape (see the 'sha256 is filled in' test below).
 //
 // tests/fixtures/ is NOT auto-discovered by bare `node --test` (only
 // tests/*.test.js is) -- this file is the actual test; the JSON is inert data.
@@ -109,9 +110,18 @@ test('gate: every split output file now exists on disk (task 2 has run)', functi
     'docs/ARCHITECTURE.md still looks like the full monolith; task 2 must reduce it to a stub')
 })
 
-test('sha256 is intentionally empty until task 3', function () {
+test('sha256 is filled in: one digest per output file, plus the reconstructed-document digest', function () {
   const fixture = loadFixture()
-  assert.deepStrictEqual(fixture.sha256, {})
+  for (const file of Object.keys(fixture.outputs)) {
+    const digest = fixture.sha256[file]
+    assert.strictEqual(typeof digest, 'string', 'sha256.' + file + ' must be a string')
+    assert.match(digest, /^[0-9a-f]{64}$/, 'sha256.' + file + ' must be a lowercase hex sha256 digest')
+  }
+  assert.match(fixture.sha256.reconstructed, /^[0-9a-f]{64}$/,
+    'sha256.reconstructed must be a lowercase hex sha256 digest')
+  // tests/architecture-provenance.test.js is the GIT-FREE gate that recomputes
+  // and checks these digests against the committed docs/architecture/*.md
+  // files; this test only checks the fixture's own shape.
 })
 
 test('coverage: segments plus drops exactly partition base lines 1-1310 (no gap, no overlap)', function () {
@@ -226,7 +236,7 @@ test('doNotTouch entries record the exact base text and are not among the rewrit
 test('reachabilityExempt lists a root and an exhaustiveness note alongside its exempt entries', function () {
   const fixture = loadFixture()
   assert.ok(typeof fixture.reachabilityExempt.root === 'string' && fixture.reachabilityExempt.root.includes('docs/index.md'))
-  assert.ok(Array.isArray(fixture.reachabilityExempt.exempt) && fixture.reachabilityExempt.exempt.length === 2)
+  assert.ok(Array.isArray(fixture.reachabilityExempt.exempt) && fixture.reachabilityExempt.exempt.length === 3)
   for (const e of fixture.reachabilityExempt.exempt) {
     assert.ok(typeof e.path === 'string' && e.path.length > 0)
     assert.ok(typeof e.reason === 'string' && e.reason.length > 0)

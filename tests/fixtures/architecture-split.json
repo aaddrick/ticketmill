@@ -182,6 +182,10 @@
       {
         "path": "docs/diagrams/CLAUDE.md",
         "reason": "Byte-identical twin of docs/diagrams/AGENTS.md, kept only to satisfy the AGENTS.md/CLAUDE.md naming convention both agent runtimes look for. No page needs to link to both twins of the same content; linking one is sufficient."
+      },
+      {
+        "path": "docs/architecture/CLAUDE.md",
+        "reason": "Byte-identical twin of docs/architecture/AGENTS.md, same naming-convention pair as docs/diagrams/CLAUDE.md above. docs/architecture/index.md's file map links AGENTS.md only; linking one twin is sufficient."
       }
     ],
     "exhaustiveness": "This list must be exhaustive: any other .md file under docs/ that the two-hop check finds unreachable from docs/index.md is a real gap and must fail the check, not be silently added here."
@@ -208,5 +212,40 @@
     }
   ],
 
-  "sha256": {}
+  "sha256": {
+    "_schema": [
+      "One digest per generated output file (docs/architecture/*.md, the ten keys",
+      "under `outputs` above), plus one `reconstructed` digest for the full",
+      "document. Both are computed the same GIT-FREE way tests/architecture-provenance.test.js",
+      "recomputes them: read each committed output file, locate every segment by",
+      "an exact whole-line search for its `firstLineOutput`, take `lines` lines",
+      "from there (padding back any trailing blank line writeLines() stripped at",
+      "generation time, then pinning the final line to `lastLine`), re-promote",
+      "headings by `-shift` (or restore the literal fold `from` text on a fold's",
+      "own first line), then either (a) join that one file's own segments with a",
+      "single blank line between them, in the file's own declared order -- this",
+      "is the per-file digest below, catching a hand-edit to THAT file's moved",
+      "prose -- or (b) place every segment (plus the two dropped lines) at its",
+      "fixed position in the base document's own SOURCE order (a hardcoded fact",
+      "about the frozen base commit, not re-derived from git) and reverse the 13",
+      "rewrites/4 proseRefs, then hash the whole 1310-line result -- this is",
+      "`reconstructed`, and it was verified once, non-committed, against",
+      "`git show ac612eb07f68d57e8f43a312cc76275064930bde:docs/ARCHITECTURE.md`",
+      "with an EMPTY diff (no allow-list entries were needed; the transform is",
+      "exact) before being baked in here as the durable proof. Both computations",
+      "are pure functions of committed files plus this fixture: no git call is",
+      "needed to reproduce either value again."
+    ],
+    "docs/architecture/index.md": "68c6923bc8a9a4b5241bf9812bf677de92f5ae1dab2e240bbc160a25f3bc7b64",
+    "docs/architecture/pipeline.md": "66ad12fb44b6270ae5f73aa685037dcb8fc98a12b0a53884444050d3623b8eae",
+    "docs/architecture/agents-and-models.md": "2d498bbeeca242c894c3e3637eb94c309411a3075b713a35ef608d74372b4fd3",
+    "docs/architecture/profile-and-environment.md": "bcb720e960444429262faab9c91dae92906ca4408c403e4fd7d173b810463770",
+    "docs/architecture/invocation-and-guardrails.md": "596b000d5658ed618da96a8c5075e9f8cd3a2bdffd951011d54fa5dd8bd4e24a",
+    "docs/architecture/branching-and-merge.md": "5a86474d3e0ec0fb6ab852699b36045f4590846a9014e0c7924b33ecc749ae64",
+    "docs/architecture/metrics.md": "6aaccef75bb08328c5a10cf49851a9c9bff13b26f9c344d4028961b852c4e298",
+    "docs/architecture/failure-semantics.md": "b64257331f921f5c1be29e4b0887824ca91b8b37d9b0aba82e83b84c1463833b",
+    "docs/architecture/cost-and-tokens.md": "ff1f12ebd21bfa87ac6a23a5ef40280d1a83de298bdd4091917b779347b8487f",
+    "docs/architecture/scheduling.md": "23c3b157ea7c055d938287ea31b1ff1fdbf3981846f80b5192f525d356749128",
+    "reconstructed": "a931cc9b23c9858e956e0c180d37a2bf1d9e4ae3d09d31600a5bf82a34b45c3b"
+  }
 }

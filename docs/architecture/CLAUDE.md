@@ -1,0 +1,96 @@
+# Working on the architecture docs
+
+Read this before editing anything under `docs/architecture/`. These ten files
+used to be one file, `docs/ARCHITECTURE.md`, split into topic-sized pages by
+issue #154. The split is provable, not just described: a committed test
+reconstructs the original document from these files and checks it byte for
+byte against a digest recorded when the split happened. That provability is
+the one rule everything else here follows from.
+
+> **Parity note:** `CLAUDE.md` and `AGENTS.md` in this directory are byte-identical
+> on purpose, so an agent finds the same guidance under whichever name its harness
+> looks for. If you change one, copy it over the other in the same commit:
+> `cp docs/architecture/CLAUDE.md docs/architecture/AGENTS.md`.
+
+## THE INVARIANT
+
+Every one of these files is a mix of two kinds of text, and they are not
+interchangeable:
+
+- **Moved prose.** Paragraphs, headings, tables, and code blocks carried over
+  verbatim from the original `docs/ARCHITECTURE.md`, with only mechanical
+  changes applied (a heading demoted or promoted a fixed number of levels, a
+  handful of `docs/diagrams/...` links rewritten to `../diagrams/...`, four
+  cross-references reworded from "above"/"below" to name the file the
+  referenced section now lives in). `tests/architecture-provenance.test.js`
+  hashes this text, GIT-FREE, against `tests/fixtures/architecture-split.json`
+  and fails if a single character of it differs from what shipped in the
+  split.
+- **Authored text.** Each file's one-sentence lede under its title, the seven
+  synthetic `#` titles given to files whose first moved section didn't carry
+  a natural H1 of its own, and `index.md`'s file-map table. None of this
+  existed in the original document. All of it is ordinary prose you can edit
+  freely, the same as any other doc in this repo.
+
+If you can't tell which kind a given line is, check
+`tests/fixtures/architecture-split.json`: the `outputs` entry for your file
+lists exactly which line ranges came from the base document (by an exact
+`firstLine`/`lines` locator) and what heading shift applies to them.
+Everything in a file that isn't inside one of its listed segments is
+authored text.
+
+## What happens if you edit moved prose anyway
+
+`node --test` goes red on `tests/architecture-provenance.test.js`, in one of
+two ways:
+
+- **Per-file check fails**: the file whose moved prose you touched no longer
+  hashes to its recorded digest. The failure names the file.
+- **Whole-document check fails**: the full reconstruction across all ten
+  files no longer hashes to the recorded digest, even if no per-file check
+  caught it (this can happen for a rewrite or cross-reference edit, since
+  those live outside any single file's segment list).
+
+Either way, the fix is the same: **revert the edit to the moved prose, and
+open a follow-up issue for the wording change you wanted.** Do not edit the
+test's expected digest to make it pass. The test isn't wrong; it's telling
+you the provenance proof no longer holds, and that proof is the reason this
+split was safe to do in the first place.
+
+## What lives here
+
+| File | Contents |
+| --- | --- |
+| `index.md` | Base lines 1-6 (the opening paragraph) plus the file map below. |
+| `pipeline.md` | `## Pipeline` folded into its own H1: the overview picture, the provenance paragraph, the legend, and all five phase sections. |
+| `agents-and-models.md` | Persona-by-reference and model policy. |
+| `profile-and-environment.md` | The required profile and the mill-init doctor pass. |
+| `invocation-and-guardrails.md` | Invocation, the sandbox lint, and the engine-owned path guardrail. |
+| `branching-and-merge.md` | The batch-branch model, release stage, and merge auto-resolve. |
+| `metrics.md` | Friction and churn, rework tax, gate yield, and outcome grading. |
+| `failure-semantics.md` | How the run fails, halts, and resumes (two segments, emitted out of source order: the short bullet list first, the incident-derived-machinery table second). |
+| `cost-and-tokens.md` | Token tracking, cost estimation, and the token_budget guard. |
+| `scheduling.md` | Claims interop, the consolidation gate, and lane scheduling. |
+| `AGENTS.md`, `CLAUDE.md` | This freeze pair. Not moved prose; not tracked in the provenance fixture. |
+
+`docs/ARCHITECTURE.md` (one level up) is a permanent redirect stub left at the
+old path for old bookmarks and links; it is not meant to be edited beyond
+that, and nothing under `docs/` links back to it.
+
+## Adding or restructuring a section
+
+The provenance test only knows about the ten files and line ranges recorded
+when the split happened. It has no opinion on new material:
+
+1. New prose (a new section, a new page) is authored text from the moment
+   you write it. Add it wherever it reads best; there's nothing to keep in
+   sync.
+2. If you genuinely need to reshuffle moved prose across files (not just add
+   to it), that's a second split-style change, not a docs edit: it needs its
+   own fixture update and its own one-time provenance re-proof, the same way
+   issue #154 built this one. Don't hand-edit the fixture's `sha256` values
+   to match a reshuffle; regenerate them the way the fixture's own
+   `sha256._schema` note describes.
+3. Either way, keep `index.md`'s file map current. It's authored text, so
+   the provenance test won't catch a stale row, but a reader following it
+   will.
