@@ -55,6 +55,15 @@ function allSegments(fixture) {
   return out
 }
 
+// Maps each base line's text to its first (1-indexed) occurrence line number.
+function buildFirstLineIndex(baseLines) {
+  const map = new Map()
+  for (let i = 1; i < baseLines.length; i++) {
+    if (!map.has(baseLines[i])) map.set(baseLines[i], i)
+  }
+  return map
+}
+
 test('fixture is valid JSON with the required top-level shape', function () {
   const fixture = loadFixture()
   assert.strictEqual(fixture.baseFile, 'docs/ARCHITECTURE.md')
@@ -90,10 +99,7 @@ test('coverage: segments plus drops exactly partition base lines 1-1310 (no gap,
   // Build the [start, end] ranges for segments (from firstLine's line number,
   // resolved via the base file) and for drops (explicit start/end already).
   const baseLines = loadBaseLines()
-  const firstLineNumber = new Map() // firstLine text -> 1-indexed line number
-  for (let i = 1; i < baseLines.length; i++) {
-    if (!firstLineNumber.has(baseLines[i])) firstLineNumber.set(baseLines[i], i)
-  }
+  const firstLineNumber = buildFirstLineIndex(baseLines)
 
   const ranges = []
   for (const seg of segments) {
@@ -142,11 +148,7 @@ test('bounds: lastLine assertion holds (redundant check, never a locator) and ra
   const fixture = loadFixture()
   const segments = allSegments(fixture)
   const baseLines = loadBaseLines()
-
-  const firstLineNumber = new Map()
-  for (let i = 1; i < baseLines.length; i++) {
-    if (!firstLineNumber.has(baseLines[i])) firstLineNumber.set(baseLines[i], i)
-  }
+  const firstLineNumber = buildFirstLineIndex(baseLines)
 
   for (const seg of segments) {
     assert.ok(Number.isInteger(seg.lines) && seg.lines >= 1, seg.file + ': lines must be a positive integer')
