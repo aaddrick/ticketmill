@@ -113,16 +113,24 @@ function reverseSegment(outputPath, seg, foldFromByTo) {
 
   const startIdx = hits[0]
   const endIdx = startIdx + seg.lines - 1
+  const onDiskLength = fileLines.length
   // writeLines() (the generator, scratchpad-only) strips ALL trailing blank
   // lines from a file at write time, so a segment whose own last line is
   // blank and which happens to be the last thing written to its file loses
-  // that blank on disk. Pad back in blank lines and pin the final line to
-  // the fixture's recorded `lastLine` rather than treating this as an
-  // overrun -- `lastLine` is the redundant-but-authoritative record of what
-  // that line actually was.
+  // that blank on disk. Pad back in blank lines ONLY past what's actually on
+  // disk, and substitute the fixture's recorded `lastLine` ONLY on that
+  // padded-in line -- never on a line that genuinely exists on disk. A
+  // segment whose last line is NOT past EOF must match `lastLine` exactly;
+  // anything else is a real edit to guard against, not padding to paper over.
   while (fileLines.length <= endIdx) fileLines.push('')
   const segLines = fileLines.slice(startIdx, endIdx + 1)
-  if (segLines[segLines.length - 1] !== seg.lastLine) segLines[segLines.length - 1] = seg.lastLine
+  if (endIdx >= onDiskLength) {
+    segLines[segLines.length - 1] = seg.lastLine
+  } else {
+    assert.strictEqual(segLines[segLines.length - 1], seg.lastLine,
+      outputPath + ': last line of segment (base line recorded as lastLine) does not match what is on disk -- ' +
+      'the moved prose in this file was hand-edited after the split')
+  }
 
   const isFold = foldFromByTo.has(segLines[0]) && segLines[0] === seg.firstLineOutput
   for (let i = 0; i < segLines.length; i++) {

@@ -11,10 +11,15 @@
 // condensed happy path stays in README, the full section moves verbatim into
 // docs/getting-started.md).
 //
-// The canonical heading list is read from the base commit via `git show`, not
-// hardcoded, so this test would notice if the wrong base were ever assumed --
-// the same discipline tests/architecture-split.test.js uses for its own base
-// read.
+// The canonical heading list is read from
+// tests/fixtures/readme-base-headings.json, a committed, byte-checked copy
+// of README.md's 15 base H2 headings at that commit -- NOT re-derived from
+// git history at test time. A shallow CI checkout (actions/checkout@v4's
+// default fetch-depth: 1) does not have that commit's blob, and the
+// eventual squash-merge rewrites history anyway, so pinning to a committed
+// fixture is what keeps this gate meaningful and runnable everywhere,
+// forever, the same discipline tests/architecture-provenance.test.js
+// already uses for its own GIT-FREE reconstruction.
 
 const fs = require('node:fs')
 const path = require('node:path')
@@ -23,7 +28,7 @@ const assert = require('node:assert/strict')
 const { execFileSync } = require('node:child_process')
 
 const ROOT = path.join(__dirname, '..')
-const BASE_COMMIT = 'ac612eb07f68d57e8f43a312cc76275064930bde'
+const HEADINGS_FIXTURE_FILE = path.join(__dirname, 'fixtures', 'readme-base-headings.json')
 
 // Only Install and Quickstart are allowed to appear in both README.md (as a
 // condensed happy path) and docs/getting-started.md (verbatim, in full).
@@ -44,8 +49,10 @@ function headingText(line) {
 }
 
 function readBaseReadmeHeadings() {
-  const raw = execFileSync('git', ['show', BASE_COMMIT + ':README.md'], { cwd: ROOT, encoding: 'utf8' })
-  return raw.split('\n').filter(function (line) { return /^## /.test(line) }).map(headingText)
+  const fixture = JSON.parse(fs.readFileSync(HEADINGS_FIXTURE_FILE, 'utf8'))
+  assert.ok(Array.isArray(fixture.headings) && fixture.headings.length > 0,
+    'tests/fixtures/readme-base-headings.json must carry a non-empty headings array')
+  return fixture.headings
 }
 
 function docsTopLevelMdFiles() {

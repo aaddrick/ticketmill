@@ -11,11 +11,16 @@
 // wrong occurrence), and that every segment's bounds are internally
 // consistent.
 //
-// The base text is read from `fixture.baseCommit` via `git show`, NOT from
-// the live docs/ARCHITECTURE.md -- task 2 reduces that path to a stub, so
-// pinning to the base commit is what keeps this gate meaningful (and green)
-// both before and after the split runs, rather than only during task 1's
-// narrow pre-generation window.
+// The base text is read from tests/fixtures/architecture-split-base.txt, a
+// byte-for-byte committed copy of docs/ARCHITECTURE.md as it stood at
+// fixture.baseCommit -- NOT from the live docs/ARCHITECTURE.md (task 2
+// reduces that path to a stub) and NOT via `git show` against history
+// (a shallow CI checkout, e.g. actions/checkout@v4's default fetch-depth: 1,
+// does not have that blob, and the eventual squash-merge rewrites history
+// anyway). Committing the base text as a fixture is what keeps this gate
+// meaningful and runnable everywhere, forever, the same discipline
+// tests/architecture-provenance.test.js already uses for its own GIT-FREE
+// reconstruction.
 //
 // Deliberately NOT covered here: the true-inverse round-trip reconstruction
 // and its sha256 digests. That GIT-FREE gate lives in
@@ -23,30 +28,28 @@
 // file only checks for shape (see the 'sha256 is filled in' test below).
 //
 // tests/fixtures/ is NOT auto-discovered by bare `node --test` (only
-// tests/*.test.js is) -- this file is the actual test; the JSON is inert data.
+// tests/*.test.js is) -- this file is the actual test; the JSON and the base
+// text are both inert data.
 
 const fs = require('node:fs')
 const path = require('node:path')
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { execFileSync } = require('node:child_process')
 
 const ROOT = path.join(__dirname, '..')
 const FIXTURE_FILE = path.join(__dirname, 'fixtures', 'architecture-split.json')
+const BASE_TEXT_FILE = path.join(__dirname, 'fixtures', 'architecture-split-base.txt')
 
 function loadFixture() {
   return JSON.parse(fs.readFileSync(FIXTURE_FILE, 'utf8'))
 }
 
-// Base file lines, 1-indexed (baseLines[1] === line 1), read from the base
-// commit the fixture itself names rather than the live working tree, since
-// docs/ARCHITECTURE.md is reduced to a stub by the split this fixture drives.
+// Base file lines, 1-indexed (baseLines[1] === line 1), read from the
+// committed base-text fixture rather than the live working tree or git
+// history, since docs/ARCHITECTURE.md is reduced to a stub by the split
+// this fixture drives.
 function loadBaseLines() {
-  const fixture = loadFixture()
-  const raw = execFileSync('git', ['show', fixture.baseCommit + ':' + fixture.baseFile], {
-    cwd: ROOT,
-    encoding: 'utf8'
-  })
+  const raw = fs.readFileSync(BASE_TEXT_FILE, 'utf8')
   const parts = raw.split('\n')
   if (parts[parts.length - 1] === '') parts.pop()
   const lines = [undefined] // index 0 unused, lines are 1-indexed
@@ -94,6 +97,14 @@ test('fixture is valid JSON with the required top-level shape', function () {
     'reachabilityExempt', 'intentionallyAdded', 'intentionallyDuplicated', '_schema', 'sha256']) {
     assert.ok(Object.prototype.hasOwnProperty.call(fixture, key), 'fixture is missing top-level key: ' + key)
   }
+})
+
+test('committed base-text fixture matches the manifest\'s declared line count', function () {
+  const fixture = loadFixture()
+  const baseLines = loadBaseLines()
+  assert.strictEqual(baseLines.length - 1, fixture.baseFileLines,
+    'tests/fixtures/architecture-split-base.txt has ' + (baseLines.length - 1) +
+    ' lines, fixture.baseFileLines says ' + fixture.baseFileLines)
 })
 
 test('gate: every split output file now exists on disk (task 2 has run)', function () {

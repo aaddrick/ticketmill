@@ -1,0 +1,1310 @@
+# Ticketmill Architecture
+
+Ticketmill is a deterministic orchestration script (`workflows/ticketmill.js`) run
+by the Claude Code Workflow tool. Control flow (loops, gates, caps, breakers) is
+plain JavaScript; every unit of actual work is a schema-validated subagent call.
+
+## Pipeline
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/pipeline-overview-dark.svg">
+  <img alt="Ticketmill pipeline overview" src="diagrams/pipeline-overview-light.svg">
+</picture>
+
+Diagram sources live in [`docs/diagrams`](diagrams) as [D2](https://d2lang.com)
+and render to the SVG pairs above via `docs/diagrams/render.sh`. Edit the `.d2`
+files and re-run that script. The SVGs are generated, so don't hand-edit them.
+
+Shape and color carry meaning across every diagram below:
+
+| | Meaning |
+| --- | --- |
+| Plain box | An ordinary stage: one schema-validated subagent call |
+| Amber box | A gate or a capped loop: somewhere the run can iterate or stall |
+| Dashed box | An optional stage, gated on profile config, skipped by default |
+| Green box | A terminal state for that phase |
+| Blue box | The one place a human is required |
+| Dashed amber edge | A backward edge: rework, re-review, or a retry |
+
+### Select
+
+Runs once, before any worker starts.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/phase-select-dark.svg">
+  <img alt="Select phase: profile, roles, batch branch, issue list, preflight, claims" src="diagrams/phase-select-light.svg">
+</picture>
+
+The preflight probe decides where each issue re-enters the pipeline. That keeps
+a healing or resumed run cheap: an issue whose PR already merged into this
+batch branch costs one probe instead of a full pass. The three resume points
+are:
+
+- **skip**: a related PR already merged into this batch branch. The issue is
+  done, but it still counts toward the batch PR's `Closes` lines.
+- **review**: a PR is open. The issue resumes at the review loop rather than
+  re-implementing work that already exists.
+- **implement**: nothing exists yet, so the issue runs the full pipeline.
+
+Only `review` and `implement` claim the issue. Claims are advisory: a label
+plus a comment. Nothing about them locks the issue.
+
+### Plan
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/phase-plan-dark.svg">
+  <img alt="Plan phase: research, evaluate, plan, two contrarian gates" src="diagrams/phase-plan-light.svg">
+</picture>
+
+Both contrarian gates are iteration-capped. Hitting a cap with findings still
+open is never silent. It accumulates into `VERIFY_SKIPS` and surfaces in the
+batch PR's Verification Gaps section.
+
+### Build
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/phase-build-dark.svg">
+  <img alt="Build phase: implement, task review, quality loop, test loop, browser verify" src="diagrams/phase-build-light.svg">
+</picture>
+
+The test loop halts the issue on error rather than skipping verification. That
+is why `test_command` must be present in the profile as an explicit key.
+
+### Ship
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/phase-ship-dark.svg">
+  <img alt="Ship phase: docblocks, PR, spec and code review, merge auto-resolve, squash-merge" src="diagrams/phase-ship-light.svg">
+</picture>
+
+The per-issue PR merges into the batch branch, never into BASE. Merge
+auto-resolve gets one mechanical recovery attempt on a `CONFLICTING` PR before
+the issue escalates to `needs_human`.
+
+### Report
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/phase-report-dark.svg">
+  <img alt="Report phase: release claims, gated version bump, batch PR, run report, retrospective" src="diagrams/phase-report-light.svg">
+</picture>
+
+The batch PR is the one artifact a human is guaranteed to read. It carries the
+Verification Gaps section, the merge auto-resolution tally, and the friction
+and churn rollup.
+
+## Design decisions
+
+### One agent mechanism: persona-by-reference
+
+Roles map to agent files in the target repo (`profile.roles`). A stage prompt
+instructs its subagent to read `<root>/.claude/agents/<name>.md` first and adopt
+the persona; unfilled roles get a built-in charter inlined. The engine never
+passes `agentType`.
+
+Why not use the registry when available and inline otherwise? Because the two
+paths produce materially different agents (registry loads the file as a system
+prompt; truncated inlining ships a near-generic one), and which path you got
+would depend on whether the agent predated the session. Quality would vary
+run-to-run for reasons invisible in any log. One mechanism keeps behavior
+deterministic, makes freshly generated agents usable immediately, and costs one
+extra file read per stage.
+
+### The profile is required, and tests cannot be skipped silently
+
+The original engine halts its test loop on errors because its CI did not run the
+suite; a silent skip had shipped broken code. Porting that lesson to a
+stack-agnostic engine means the engine must never guess a toolchain: a wrong
+guess that finds no test command would skip verification and squash-merge
+untested work behind a green-looking batch PR.
+
+So: no profile, no run. `test_command` must be present as a key; `null` is legal
+only as an explicit decision recorded by mill-init after asking the human. Every
+skipped verification (null tests, missing agents, skipped browser checks,
+contrarian cap-outs) is accumulated in `VERIFY_SKIPS` and rendered as a
+Verification Gaps section in the batch PR body, which is the one artifact the
+reviewing human actually reads.
+
+### mill-init owns environment proof
+
+The doctor pass (scratch worktree, run installs + tests once) exists because a
+profile that "looks right" but cannot boot the suite fails per-issue, inside the
+test loop, at up to 10 iterations of model time per issue, looking like bad code
+instead of a bad environment. mill-init converts that into a single onboarding
+failure with an obvious cause, and records discovered preconditions in
+`verify_notes` for the engine to inject into test/fix prompts.
+
+### Invocation: scriptPath, with the engine copied into the target repo
+
+Workflow scripts are not a registered plugin component (no `workflows` field in
+plugin.json). mill-init therefore copies the engine into the target repo's
+`.claude/workflows/` so runs work on any machine with the repo checked out,
+plugin installed or not. The `mill` skill hard-stops when the Workflow tool is
+unavailable and explicitly forbids simulating the pipeline inline: an imitation
+run has no journal, no claims, no breakers, and no resumability, which is worse
+than not running.
+
+Because mill-init copies files verbatim into target repos, each copied file
+exists twice and the two must stay byte-identical. `scripts/lint-engine.js`
+byte-compares every such pair on each test run and fails loud on drift. Edit
+only the source, then run `node scripts/lint-engine.js --fix` in the same
+commit to write it verbatim over the installed copy. The pairs are the engine
+(`workflows/ticketmill.js`) and the worktree setup script
+(`scripts/setup-worktree.sh`).
+
+The setup script was added to that check after it drifted unnoticed for 29
+releases. It had picked up an empty-slug guard and a redirect that keeps `git
+branch` off stdout, and neither reached the installed copy, because the
+byte-compare only ever covered the engine. The stdout redirect is the reason
+this matters beyond tidiness: the script's contract with the engine is
+JSON-on-stdout, so anything else written there corrupts the parse. `--fix`
+also copies the source's mode, since a setup script that loses its executable
+bit is broken in a way a byte-compare cannot see.
+
+### Sandbox lint: catching rules `node --check` can't see
+
+The Workflow tool sandbox forbids `Date.now()`, `Math.random()`, argless
+`new Date()`, and any filesystem/Node API (`require`/`import`) inside the engine
+script: all legal JavaScript, so `node --check` passes on every one of them,
+but they throw at runtime and silently break resume (wall-clock time and
+randomness aren't available in that sandbox; see the comments near the top of
+`workflows/ticketmill.js`). That gap used to live only as tribal knowledge in
+`verify_notes`. `scripts/lint-engine.js` makes it a mechanical, line-by-line text
+scan wired into `test_command` right after `node --check`, so a violation fails
+CI instead of a live run. Pure-comment lines are skipped (the engine's own docs
+legitimately name these APIs), and a line carrying the literal `// sandbox-ok`
+marker is the only escape hatch, deliberately narrower than a pattern-based
+exception, so it has to be spelled out per line rather than silently suppressing
+a whole rule.
+
+### Batch branch model
+
+`args.branch` (BASE) receives exactly one PR per run, created for a human.
+Per-issue PRs squash-merge into `Batch_<timestamp>`; issue closure fires from the
+batch PR's `Closes #N` lines when the human merges it. This keeps N issues'
+worth of autonomous merges off the base branch while preserving per-issue review
+trails.
+
+### Closes lines: keyed off shipped issues, not raw completion status
+
+The batch PR's `Closes #N` lines used to come straight from `results.filter(r
+=> r.status === 'completed')`. That's correct for a single, unbroken pass, but
+it breaks on a healing or resumed run. An issue whose per-issue PR already
+merged into TARGET during a PRIOR pass preflights this pass as `status:
+'skipped'` (a related PR is already merged, so Select routes it straight to
+`resume_point: 'skip'`). Filtering on `completed` alone drops that issue from
+the Closes lines silently, and it stays open when the human merges the batch
+PR.
+
+`batchClosesIssues(results)` fixes this by keying inclusion on a `shipped` set
+instead of raw status: an issue counts as shipped when `status ===
+'completed'`, or when `status === 'skipped'` and `merged_into_target ===
+true`. `merged_into_target` is computed in JS at the `resume_point === 'skip'`
+return, as `pre.pr_state === 'merged' && pre.pr_base === TARGET`. That's a
+plain string match against TARGET, the one value in scope that's
+authoritative about which batch branch this run owns. It guards the
+mirror-image bug too: a PR merged into a DIFFERENT batch branch, a
+concurrent run's own TARGET or straight into BASE, must not count as shipped
+into this one. `pr_base` is a new preflight schema field, read from `gh pr
+list --json ...,baseRefName` at probe time alongside the existing `pr_state`.
+
+`batchClosesIssues` flatMaps over each result's `members` (falling back to
+`[r.issue]` when the result isn't grouped) and dedups, so a shipped
+consolidation group still closes every member, not just its primary. The
+same `shippedIssues` set now drives the batch PR's create/update gate, the
+title's issue count, and the "## Consolidated Groups" section as well as the
+Closes lines, so a resumed pass can't rebuild one of those four pieces
+in a way that disagrees with the other three.
+
+### Release stage: batch-level CHANGELOG and version bump, gated
+
+A batch of real engine changes once merged to BASE with the CHANGELOG and
+`.claude-plugin/plugin.json` version left stale (PR #56). Nothing in the
+pipeline ever bumped them; every stage assumed some other stage did. Fixing
+the stale state took a manual repair commit. The Report phase now owns this
+job as its own optional stage, gated on `profile.release`. Left unset (the
+default), the stage never runs and never calls an agent.
+
+`releaseEnabled(profile)` requires an explicit `profile.release.version_files`
+array with at least one entry. Setting it opts a repo in; it names the JSON
+file(s) carrying a top-level `"version"` key, plus an optional `changelog`
+path (default `CHANGELOG.md`) and an optional `bump` override
+(`"major"|"minor"|"patch"`). `version_files` should name only the canonical
+copy: a path also listed in `profile.lockstep_installed_paths` has its own
+mirroring tooling keeping it in sync, so bumping it here too would just fight
+that sync. `marketplace.json` carries no version field of its own and should
+never be listed.
+
+The stage runs once per batch, immediately before the batch-PR agent, and
+only when `shippedIssues.length` is nonzero. Running it there rather than
+per-issue is deliberate: a batch-level bump lands inside the human-reviewed
+TARGET -> BASE diff by construction, instead of scattering version churn
+across every per-issue PR that merges into the batch branch.
+
+**BASE-anchored derivation, never TARGET.** `deriveReleaseVersion(baseVersion,
+commitTypes, profile)` computes the next version from the version currently
+committed on `origin/BASE`, read by a read-only probe agent, never from
+`origin/TARGET`. A resumed or healing Report pass recomputes the identical
+next version instead of bumping a version TARGET already carries from an
+earlier pass. `commitTypes` comes from the batch's own commit log
+(`git log BASE..TARGET --pretty=%s`); any `feat` prefix shipped bumps minor,
+otherwise the bump is patch, unless `profile.release.bump` overrides it. A
+non-semver `baseVersion` makes the function throw, and the call site treats
+that as a non-fatal, logged skip rather than failing the run.
+
+**Idempotent CHANGELOG anchor.** `releaseChangelogAnchor(version, runTag)`
+builds the one heading the write agent looks for and regenerates in place:
+`## [<version>] - <runTag>`. It's anchored to the computed version and the
+run's fixed `RUN_TAG`, never to a wall-clock date, so calling it twice with
+the same batch produces the same string even if the second call happens after
+midnight. A prior pass's draft section gets its body replaced, not
+duplicated.
+
+**Ephemeral worktree, root never touched.** The write agent runs the
+`doc_writer` persona in a fresh `git worktree add` checked out from
+`origin/TARGET`, bumps the version file(s), regenerates the CHANGELOG
+section, commits, and pushes back to TARGET. `ROOT` itself is never checked
+out or mutated, and the worktree is removed in a `finally` block regardless
+of whether the write agent succeeded, so a dead agent can't leave it behind.
+A push failure is logged and pushed onto `VERIFY_SKIPS` rather than retried
+or treated as fatal: the commit still exists locally-to-the-worktree-run and
+can be pushed by hand before the batch PR merges.
+
+**Known collision, not corruption.** Two batch PRs open concurrently against
+the same BASE both compute BASE-plus-bump to the same next version, and
+collide on the version file and CHANGELOG section at the second human merge.
+That surfaces as an ordinary git conflict at the human merge gate. Manual
+version bumps carried the same exposure already; this stage doesn't add a
+new failure mode.
+
+**This repo's own profile now opts in.** Issue #83 named
+`.claude/ticketmill.json` as explicitly in scope, and the change landed the
+`release` object: `version_files: [".claude-plugin/plugin.json"]`,
+`changelog: "CHANGELOG.md"`, `bump: null`. `profile.release` is read once
+at engine startup, so the batch that adds the field still runs on the old,
+unset profile. The stage takes effect starting with the next self-mill
+run, not the run that turned it on. The two agent charters
+(`.claude/agents/ticketmill-implementer.md` and
+`ticketmill-code-reviewer.md`, both engine-owned) have been realigned to
+match: the implementer no longer bumps the version or adds a CHANGELOG
+entry per-issue, and the code reviewer no longer flags a per-issue PR for
+a missing bump. Both describe that release discipline as batch-level,
+owned by the gated Report-phase `release` stage.
+
+### Merge auto-resolve: one mechanical recovery attempt before needs_human
+
+A PR whose preflight reads `CONFLICTING` used to escalate straight to
+`needs_human`, even when the conflict was mechanical: a sibling issue's
+commits already landed on the batch branch, or two hunks that just don't
+overlap. `runMergeAutoResolve(ctx)` runs immediately before the merge stage
+and gives that case one recovery attempt first. It follows the same shape as
+`runBrowserCheck`: a probe decides whether to act at all, then a bounded chain
+of mechanical git stages plus one judgment stage does the work.
+
+The probe reads mergeability through `mergeSettlePoll`, a shared bash loop
+(up to 6 polls, 5 seconds apart) rather than one read. GitHub recomputes
+`mergeable: UNKNOWN` asynchronously for a few seconds after a push, so a
+single read can misjudge a perfectly fine PR as unresolvable. The merge
+stage's own preflight polls the same way right before it merges, for the same
+reason.
+
+Only `CONFLICTING` triggers the rest of the flow. On that state, the still-open
+worktree fetches and rebases onto the batch branch's current tip. A clean
+rebase counts as resolved too, even with zero conflicts, because the merged
+diff still differs from the head that spec and code review actually looked
+at. Surviving conflicts go to an implementer-persona resolver stage that
+prefers keeping both sides of a hunk over discarding either, since the other
+side is almost always a sibling issue's change already on the batch branch.
+A hunk that needs a semantic judgment call aborts the rebase instead of
+guessing.
+
+Every rebase, resolved or clean, is followed by a mandatory, forced run of
+`runTestLoop(ctx, true)`. The `forced` flag skips the loop's usual "no
+testable code changed" shortcut. It exists to answer one narrow question:
+does the exact tree about to be force-pushed pass. A rebase can pull in
+commits whose diff looks unchanged against the target while the tree that
+would actually get pushed has moved.
+
+A thrash guard runs right after: it checks the batch branch hasn't moved
+again while those tests were running. If it has, the state that just went
+green is already stale. The flow escalates instead of silently re-rebasing
+and pushing content the tests never verified, bumping
+`ctx.metrics.merge_thrash`. An earlier draft of this flow re-rebased and
+pushed at that point instead; the guard is a deliberate, contrarian-adjudicated
+reversal of that choice. The final push uses `--force-with-lease`, never a
+plain `--force`, so a stale lease from concurrent access fails loud instead of
+clobbering someone else's push.
+
+Gated on a real `test_command`: with `test_command: null` there's no suite to
+re-verify against, so the safety property this flow exists to provide doesn't
+apply. A `CONFLICTING` PR under a no-test profile falls straight through to
+the merge stage's own preflight, unchanged, exactly as before this mechanism
+existed.
+
+`ctx.metrics.merge_auto_resolved` increments only after the merge stage's own
+subsequent preflight confirms a real merge. The force-push alone never bumps
+it, so a PR that auto-resolve fixed but that then blocks at the merge stage
+for an unrelated reason can't inflate the count. When the merge does go through,
+the Implementation Complete comment says explicitly that the merged diff
+diverged from the head spec and code review reviewed.
+
+`aggregateMergeAutoResolve(results)` rolls the per-issue metrics up into a
+"## Merge Auto-Resolution" section for the batch PR body and the run report,
+following the same JS-computed, verbatim-injected pattern as
+`aggregateTokens` below: no subagent ever sums or double-checks this
+arithmetic. It reads `merge_auto_resolved` and `merge_thrash` off every
+result, including a `needs_human` result the thrash guard escalated, since
+`fail()` carries `ctx.metrics` through. The two counts never overlap: a
+thrashed issue escalates before it can also count as resolved.
+
+### Friction & churn: a weighted per-run score, not a raw iteration count
+
+A run's difficulty used to live only inside each issue's raw metrics:
+iteration counts per stage, scattered across a JSON blob nobody scanned
+across a whole batch. `computeFriction(results)` turns those counts into one
+score per issue, so a human can see which issues actually fought back
+without reading every per-issue block.
+
+Seven capped pipeline stages (approach, plan, task-review, quality, test,
+browser, pr-review) each contribute `min(1, iters/cap)` to that score.
+Clearing a gate under its cap costs nothing: an issue whose stages all pass
+first try scores 0 across every one of them, no matter how many stages it
+has. On top of the seven ratios, weighted signal terms add friction a
+capped ratio can't see. `needs_human` carries the heaviest weight (2), since
+it's the one outcome a run can produce that never resolved on its own.
+`merge_thrash` (1.5) follows, since it forces a mandatory re-test and
+re-rebase cycle. `contrarian_capped` (1) is a flat penalty for hitting a
+contrarian cap with findings still open, and `unresolved_count` (0.25 per
+finding) adds granularity on top of it, so a capped-out issue carrying five
+open findings scores higher than one carrying only one. `quality_degrades`
+(0.5) and `test_quality_fix_rounds` (0.3) round out the list. The order and
+size of these weights tracks how much extra rework each signal actually
+costs, independent of how often it fires.
+
+Each nonzero stage or signal becomes one entry in that issue's `drivers`
+list, sorted by contribution. That's what lets the rendered table explain
+why an issue ranked where it did, instead of showing a bare number.
+
+`computeChurn(results, opts)` runs alongside it, reading the
+`changed_files`/`touch_counts` fields #87 added to `ctx`, and finds two
+different shapes of rework:
+
+- **Cross-issue hotspots**: a file touched by `HOTSPOT_ISSUE_THRESHOLD` (2)
+  or more distinct issues in the same run. Two issues landing on the same
+  file already counts as a collision worth flagging. One issue touching many
+  files across a run is ordinary and never trips this.
+- **Re-fix chains**: a file one issue's own `touch_counts` revisited
+  `REFIX_THRESHOLD` (3) or more times. The bar mirrors the "3+ fix rounds is
+  a smell" heuristic the quality and test loops already apply informally.
+
+Both get bucketed through the same `matchesGlobs` helper the lane scheduler
+uses for `serialize_globs`/engine-owned globs. A file matching
+`serialize_globs` buckets there first, since the profile already expects it
+to run hot. Anything left matching `ENGINE_OWNED` buckets next, and
+everything else lands in `surprising`. A `surprising` hotspot is the one
+worth a human's attention: neither the profile nor the engine's own file
+list predicted it would collide.
+
+`composeFrictionChurn(results, opts)` combines both rollups into one "##
+Friction & Churn" section, following the same JS-computed, verbatim-injected
+pattern as `aggregateTokens` and `aggregateMergeAutoResolve` above. The whole
+section is gated on `has_signal`, so a clean run, every stage under its cap
+and no hotspots or re-fix chains, renders nothing rather than an empty
+heading. `buildRunRecord` carries the same rollup under a `friction_churn`
+key: machine-readable fields only, no markdown, additive alongside the
+existing `tokens` and `merge_auto_resolve` blocks.
+
+### Rework tax and gate yield: did the fight pay for itself
+
+Friction & churn scores how hard a run fought. Rework tax and gate yield ask
+a narrower question: how much of that fight was wasted motion, and did the
+paranoid gates catch anything worth their cost. Both are pure JS reducers,
+built the same way as `composeFrictionChurn` above. Each computes once,
+injects its markdown verbatim into the batch PR and run report, and adds
+machine-readable fields to `buildRunRecord` alongside `friction_churn`.
+
+**Completing the gate findings tally.** `recordGateOutcome` (#87) tallied
+findings for the approach and plan contrarian gates only. `reviewAndMerge`
+now calls it for `pr-review` too, the third and last per-issue gate. The
+disposition vocabulary carries over unchanged: `accepted` when both the spec
+and code reviewer approve in the same iteration (the same condition that
+trips the `approved = true` break just below it), `carried-unresolved` when
+the iteration cap is reached without a clean pass, and `re-litigated`
+otherwise, since the loop revises and sends the PR back for another review.
+A dead reviewer never reaches this line: `reviewAndMerge` already fails the
+run with `needs_human` first. One gap carries through the tally.
+`REVIEW_SCHEMA`'s `issues` field has no `severity`, unlike the contrarian
+gates' `CHALLENGE_SCHEMA`. The review prompts never ask for one, so
+`gate_findings['pr-review'].severity` stays zero across the board while
+`disposition` and `count` still carry real signal for that gate.
+
+**Per-stage token tracking.** `stage()` already attributed each retry loop's
+token delta to `ctx.tokens.total` and `ctx.tokens.byModel`. It now attributes
+the same delta to `ctx.tokens.byStage[key]`, keyed by the literal stage name
+the caller passed in, things like `quality-fix-i1` or `pr-fix`. No new
+sampling runs and no new failure mode opens up. The accumulation rides the
+same try/finally block that already guards the total and per-model sums.
+
+**`computeReworkTax(results, tokenAgg)`** classifies each `byStage` key
+against a fixed prefix list: `quality-fix`, `test-fix`, `test-quality-fix`,
+`pr-fix`, `merge-conflict-resolve`. Anything matching one of those prefixes
+counts as rework. Everything else counts as first-pass work. The list checks
+the compound `test-quality-fix` prefix before the shorter `quality-fix` and
+`test-fix` prefixes it would otherwise match as a substring, then sums both
+buckets per issue and across the run.
+
+The result is only as trustworthy as the token accounting under it. Above
+concurrency 1, overlapping issues' stages attribute the same shared counter
+movement to each of their own `byStage` keys, the exact over-count
+`aggregateTokens` already documents for its per-issue rows. `computeReworkTax`
+gates on `tokenAgg.reconcile_error` staying at or under
+`MAX_RECONCILE_ERROR_FOR_TRUST` (#90's honest reconciliation signal). It
+never gates on the coarser `reconciles` boolean, because an untrusted
+`reconcile_error` taints the rework fraction the same way it taints the run
+total. A run that fails the check still returns its raw per-issue sums. Only
+the run-level fraction and the rendered signal go quiet, with a stated
+reason, so a machine consumer can see what was computed without the run
+treating it as trustworthy.
+
+**`computeGateYield(results)`** rolls the three gates' `gate_findings`
+tallies into one table: findings, severity mix, and an accepted-to-dismissed
+ratio, summed across every issue in the run. Alongside it sits the signal
+the reducer exists for, an escaped defect: an issue where `pr-review` raised
+findings but neither `approach` nor `plan` raised any. The check counts
+findings rather than weighing severity, matching the issue's own definition.
+It answers one question directly: did the early gates ever get a look at
+this, or did it only surface because nothing upstream ever saw it.
+
+### Outcome grading: a quality anchor beside the friction signal
+
+Friction, churn, rework tax, and gate yield all measure how hard a run
+fought. None of them measure whether the result was any good. An issue
+can clear every gate on the first try, score zero friction, and still
+ship a defect that gets reverted the next day. Self-improvement built
+only on process signal is Goodhart-able for exactly that reason, so
+issue #92 adds a read-only pass that back-annotates a prior run's merged
+batch PRs with what actually happened to them, and records it in
+`<logs_dir>/outcomes.jsonl`.
+
+**Split across the sandbox boundary, like learnings.** The Select-phase
+sandbox has no fs/git/gh (see "Sandbox lint" above), so it can't walk
+`runs.jsonl` or shell out to `gh` itself. An `outcome-grade` agent stage
+does both jobs live: it reads the run-history ledger and each run's full
+record to build the list of gradable targets (a merged member issue of a
+prior run's batch PR), then resolves one raw observation per target with
+`gh pr view`, `gh issue view`, and `gh search`: live reads, never the
+run record's own possibly-stale status. It fires alongside `learnPromise`
+so its latency hides behind the same preflight probes, and it is
+strictly read-only: no git fetch, no local writes, no state-changing `gh`
+command.
+
+The agent never decides a grade. It returns `observations` (one raw
+object per target), `prior_ledger_lines` (the raw text of
+`outcomes.jsonl`, verbatim and unparsed), and `now` (its own `date -u`
+read, since the sandbox forbids `Date.now()`). Everything downstream of
+that is deterministic JS above the `TICKETMILL-TEST-HARNESS-SPLIT`
+marker, unit-tested directly in `tests/outcomes.test.js` without ever
+shelling out.
+
+**`gradeFromObservation`** applies a fixed precedence: `reverted` >
+`reopened` > `hotfix` > `later_batch_fix` > `closed_unmerged` >
+`abandoned` > `clean` > `pending`. The aging is deliberately asymmetric.
+A bad outcome is real the moment it's observed and grades immediately,
+at any age. A clean grade waits: `merged, no negative signal` only
+becomes `clean` once the
+PR has stood for `min_age_days` (default 7, profile-overridable via
+`outcome_grading.min_age_days`, mirroring the
+`profile.contrarian_max_iterations` guard). Before that it grades
+`pending`, because "no negative signal yet" is not the same claim as
+"held up cleanly". `closed_unmerged` and `abandoned` are a terminal
+escape hatch for targets that will never see a merge and so can never
+earn `clean` any other way.
+
+**`abandoned` needed its own wiring (issue #103).** The precedence list
+above already named `abandoned`, but nothing ever populated it: #92/PR#102
+left the field unset on every observation, so that branch was dead code.
+The fix threads `issue_state` off the same `gh issue view --json
+state,timelineItems` read step 2c already runs for `reopen_found` and
+`hotfix_ref`. No extra `gh` call needed. `deriveAbandoned(issue_state,
+live_merge_state)` then decides the field: true only when the issue is
+closed AND the batch PR's live state is `open`, `closed`, or `none`.
+`merged` is excluded on purpose, since a merged PR that later goes bad
+already has `closed_unmerged` and `clean` to describe it. `unknown` is
+excluded too, so a transient `gh pr view` read failure can never produce
+a terminal grade off a signal that never resolved. A failed `gh issue
+view` read reports `issue_state: "unknown"`, same fallback contract as
+the other fields in that step.
+
+**`diffOutcomeGrades`** is the only thing allowed to decide what gets
+appended. It compares this pass's freshly graded lines against
+`prior_ledger_lines` (both sides read last-line-wins, since the ledger is
+append-only) and keeps only lines that are new or whose grade changed,
+skipping any key whose prior grade is already terminal
+(`reverted`/`reopened`/`hotfix`/`later_batch_fix`/`closed_unmerged`/
+`abandoned`: `OUTCOME_TERMINAL_GRADES`) so settled history never gets
+bloated or second-guessed by a possibly-flaky re-read. `summarizeOutcomeCoverage`
+rolls the pass into `graded_count`/`negative_count`/`pending_count`/
+`sample_cap_hit`, so a later tier can read one small object instead of
+re-walking the ledger.
+
+**Persistence follows the `record`/`ledger` contract exactly.** The
+engine returns `outcomes` (the diffed, new-or-changed lines only),
+`outcomes_path`, and `outcomes_coverage` alongside `record`/`ledger`.
+`skills/mill/SKILL.md` seeds `outcomes.jsonl` if it doesn't exist yet and
+appends each entry as its own compact JSON line, in order: a plain,
+dumb append, never a rewrite or a dedup, matching how the skill already
+writes `runs.jsonl`. `outcomes.jsonl` is a per-host, gitignored local
+artifact, and target selection is bounded by
+`outcome_grading.sample_cap` (default 20, oldest-unobserved-first) so one
+pass stays cheap and history catches up over many runs instead of trying
+to grade everything at once.
+
+**`later_batch_fix` reopens a signal a plan review rejected once already
+(issue #104).** An early design for #92 tried to catch "this batch
+caused a later fix" by intersecting `changed_files` across two diffs,
+the batch PR's and a later PR's. Plan review killed it: in a
+monolith-shaped repo where nearly every issue touches
+`workflows/ticketmill.js`, file overlap is guaranteed and proves
+nothing. `later_batch_fix` asks a stronger question instead. Did the
+later fix PR's own `git blame` on the pre-image lines it just replaced
+name THIS batch PR's own squash-merge commit as the SHA that introduced
+them. That's a line-level, blame-forward resolution done entirely in
+the later PR's own coordinate space, never a synthesized intersection
+across two unrelated diffs.
+
+**`computeLaterBatchFix(observation)`** fires iff `batch_pr_merge_sha`
+is a non-empty string and appears in the union of every
+`churned_regions[].blamed_shas` entry. `churned_regions` is an array of
+`{file, blamed_shas}`, one entry per hunk in the later fix PR's diff,
+each already resolved live by the outcome-grade agent stage: a
+read-only `git blame <commit>^ -L <range> -- <file>` on this repo's own
+non-shallow local clone, never a `git fetch`. Anything malformed or
+absent (no SHA, no regions, a region missing `blamed_shas`) fails open
+to `false`, the same ethos as `ageInDays`/`deriveAbandoned`.
+
+**`isPlannedFollowup(bodyText)` keeps a pre-planned continuation out of
+the grade.** A later PR whose own body reads as a scheduled next step
+("follow-up from", "follow up from", "depends on", "deferred from";
+case-insensitive) isn't repairing a defect. It's doing work that was
+always going to happen. Validated against real history: #103's body
+("Follow-up from #92...") is excluded, while reactive language like
+"regression introduced by" stays eligible. `gradeFromObservation` only
+assigns `later_batch_fix` when `computeLaterBatchFix` fires AND
+`isPlannedFollowup` doesn't.
+
+**It sits below `hotfix`, above the terminal escapes.** A same-issue
+cross-reference (`hotfix`) is a more direct claim than a blame-forward
+resolution against a different PR, so it still wins when both are
+true. A real later fix landing is strictly more informative than
+`closed_unmerged`/`abandoned`, so `later_batch_fix` outranks both. It
+joined `OUTCOME_TERMINAL_GRADES` (a blame-forward resolution never
+un-happens) and `OUTCOME_NEGATIVE_GRADES` (it's the same "this shipped
+a defect" claim as revert/reopen/hotfix, just resolved a different
+way).
+
+**Revisit risk doesn't cover it yet, on purpose.** `later_batch_fix`'s
+evidence, `churned_regions`, lives in the later PR's own coordinate
+space, not a diff the revisit-risk pass can walk to a file list.
+Translating it back would reintroduce the coincidental-overlap risk
+the mechanism exists to avoid. `attachRevisitFiles` returns `files: []`
+for it, always: an explicit fail-open, not a silent gap. Real coverage
+is a follow-up.
+
+### Revisit risk: flagging a preflight from recent negative outcomes
+
+Outcome grading records whether a merged issue held up. Revisit risk reads
+that same ledger to warn the next issue before it starts. Issue #93 adds a
+Select-phase pass that flags a preflight when a file it's likely to touch
+was recently reverted, hot-fixed, or reopened, and threads that flag into
+the evaluate, approach-challenge, and plan prompts so the run treats the
+area with more care.
+
+**Same split as outcome grading, and the same PIN.** The Select sandbox
+still can't shell out, so a `revisit-risk` agent stage does the live
+reads. It cats `outcomes.jsonl` for `prior_ledger_lines` (raw, unparsed
+lines, the same contract as `OUTCOMES_SCHEMA`'s field of the same name),
+then for any ledger key already graded with a member of
+`OUTCOME_NEGATIVE_GRADES` (reverted, reopened, hotfix, or
+`later_batch_fix` as of issue #104) within a target-selection window,
+resolves that regression's `files` with a live `gh` read.
+`later_batch_fix` always resolves to `files: []` (see above); the other
+three grades resolve a real file list. It fires alongside `learnPromise` and
+`outcomeGradePromise`, in the same `STAGE_TOKENS.preflight` bracket, and
+it is strictly read-only. `computeRevisitRisk`, above the
+`TICKETMILL-TEST-HARNESS-SPLIT` marker, is the only place that decides a
+flag. The agent itself never grades.
+
+**A quality-fix iteration closed a PIN violation.** The first pass
+trusted the agent's own last-line-wins parse of `outcomes.jsonl` as the
+flag decision, the exact thing #92's `OUTCOMES_SCHEMA` was built to rule
+out, and code review caught it with a `changes_requested` verdict.
+`deriveNegativeOutcomeEvents` fixes it: it re-derives grade, `decided_at`,
+and `merged_at` straight from `prior_ledger_lines`, using the same
+`outcomeLineKey` grouping and last-line-wins logic `diffOutcomeGrades`
+already uses, and keeps only keys whose current grade is in
+`OUTCOME_NEGATIVE_GRADES`. `attachRevisitFiles` then merges on just the
+one piece of the agent's output that's genuinely judgment-requiring: the
+live-`gh`-resolved `files` list, keyed by `{issue, batch_pr}`. A negative
+key the agent never resolved files for still comes through with
+`files: []`, never fabricated.
+
+**The recency anchor is when the risk became known, not when the change
+merged.** `computeRevisitRisk` ages each event off `decided_at`, falling
+back to `merged_at` only when `decided_at` is missing, and compares that
+age against `profile.revisit_risk.window_days` (default 30, the same
+override guard as `outcome_grading.min_age_days`). A preflight needs to
+know how recently the team learned an area is risky. A regression that
+merged months ago but was only reverted this week is still fresh news to
+a run starting today, even though the underlying merge is old.
+
+**Matching and corroboration.** A preflight flags when any of its
+`predicted_files` (normalized: case-sensitive, slash-normalized)
+intersects an in-window event's `files`, with one reason string per
+match. `refix_chains` (#89's within-issue re-fix counts) can only
+annotate a file that already flagged from a real event overlap; they
+never flag on their own. Churn alone has no proven link to a bad outcome,
+and in a monolith-shaped repo like this one it would flag almost every
+engine-touching issue.
+
+**Threaded like `engineOwnedIntentional`.** `deriveUnits()` OR-folds
+`revisit_risk` across a group's live members with `unionRevisitRisk`. One
+flagged member is enough to flag the whole unit, and reasons concatenate
+rather than dedupe, since each one already names its own file, issue, and
+grade. `processIssue` reads the value off `pre` onto `ctx` once at init,
+the same pattern `engineOwnedIntentional` uses just above it, so every
+stage downstream sees the identical value. Its own default,
+`{flagged: false, reasons: []}`, matches `computeRevisitRisk`'s clean
+no-op shape, so a preflight that never carried the field (a resume-skip
+stub, say) can't crash a downstream read.
+
+**Rendering is a clean no-op when nothing is flagged.** `revisitRiskBlock(ctx)`
+returns an empty string unless `ctx.revisit_risk.flagged` is true, so a
+run with no history match renders byte-identical evaluate,
+approach-challenge, and plan prompts to before this feature existed. When
+it does fire, `pushDecision` records it in the decision chain once, right
+after worktree setup, and each of the three prompt sites then renders it
+inline: the flagged file and its prior grade, and a push toward a
+conservative approach with added regression coverage.
+
+### Engine-owned path guardrail: three regimes
+
+A worktree only sees committed state. A freshly forged agent file, or a
+profile field just added at the repo root, stays invisible there until it's
+committed. An implementer that "reconciles" what looks like a stale diff in
+the worktree can restore the old committed version straight from git
+history. A later batch merge then overwrites the uncommitted root-tree work
+without ever raising a conflict: that's nonconvexlabs-com#77, the incident
+this guardrail exists to close.
+
+Engine-owned paths are the run's own tooling: the ticketmill profile
+(`.claude/ticketmill.json`), the agent roster (`.claude/agents/**`), and the
+engine's own installed copy (`.claude/workflows/ticketmill.js`,
+`.claude/scripts/ticketmill/**`). A profile can extend that default set via
+`profile.engine_owned_globs`. These paths stay read-only for a run unless an
+issue's own title or body plainly names one of them.
+
+Three regimes cover what happens next.
+
+**(a) Select-phase skip.** When an issue's prose names an engine-owned path
+(`engineOwnedHit`, a case-sensitive substring match) and the preflight probe
+finds the root tree already dirty under that same path
+(`root_dirty_engine_paths`), the issue is routed straight to `resume_point:
+skip` before a worktree is ever built. This is the only regime the engine
+can catch ahead of time, and only because git tracks the dirt: an
+uncommitted rename or a change outside git's view still slips through.
+
+**(b) Deliberate engine work, clean root.** An issue whose prose names an
+engine-owned path, with a clean root tree, is intentional engine work: this
+repo's own ticketmill issues look exactly like this. `ctx.engineOwnedIntentional`
+is computed once at Select from title and body, then OR-folded across a
+consolidation group's live members in `deriveUnits()` so a non-primary
+group member's intent survives `pickPrimary`'s unrelated choice of primary.
+The post-implement gate reads that flag and leaves the diff exactly as
+committed.
+
+**(c) Incidental change.** Engine-owned paths turn up in the diff, but
+nothing in the issue's prose named them. `runEngineOwnedGate(ctx)` runs
+right before the test loop, not after like `runBrowserCheck`, so a revert it
+triggers gets re-validated by that same run's test suite in-band rather than
+landing unverified. A deterministic JS pass filters the diff against the
+engine-owned set, then splits it again with `isHardRevertPath`: a
+single-purpose stage hard-reverts every path that isn't also listed in
+`profile.lockstep_installed_paths`, committing and pushing the revert. A
+lockstep path is exempt because it's a deliberate installed copy of a
+source-of-truth file elsewhere in the repo, kept in sync by the repo's own
+tooling: this repo sets `[".claude/workflows/ticketmill.js"]`, since
+`scripts/lint-engine.js` already keeps it byte-identical to
+`workflows/ticketmill.js`. Reverting a lockstep path here would fight that
+sync instead of undoing an incidental restore, so any drift on that path is
+left for `lint-engine`'s byte-compare to catch on its own.
+
+Checkout alone doesn't cover every case. `git checkout origin/<TARGET> --
+<path>` fails with "pathspec did not match any file(s)" on a path absent
+from the baseline: a file created fresh on the branch. Checkout restores
+from a baseline copy, and a created file has none. So the diff probe also
+returns `added_files`, from a second `--diff-filter=A` command, and
+`runEngineOwnedGate` partitions `revertFiles` against that list:
+`createdFiles` get `git rm`, `existingFiles` still go through checkout, and
+both commands land in the same revert commit. An older or degraded probe
+response can omit `added_files`, since the schema field is optional.
+`createdFiles` then stays empty, and every path falls into the checkout
+group, reproducing the prior behavior: checkout fails on the missing
+pathspec, and the gate degrades to a recorded `ctx.deferred` follow-up
+instead of blocking the issue.
+
+`scopeGuard()` carries a fourth, advisory layer on top of the two gates
+above: a clause appended to every stage prompt, unconditionally, telling the
+agent never to stage, commit, or restore an engine-owned path outside these
+mechanisms. It has to stay generic rather than naming a regime, since an
+agent mid-stage has no reliable way to know which one it's in. The one
+stage that's deliberately excused from that clause is the regime (c) revert
+stage itself: its prompt opens with an explicit override, because it is the
+guardrail acting on the agent's behalf, ahead of the checkout instruction
+the general clause would otherwise contradict.
+
+The gate never halts a run on its own. A dead diff probe or a failed revert
+stage degrades to a recorded `ctx.deferred` follow-up instead of blocking an
+otherwise-green issue.
+
+### Incident-derived machinery (preserved from the source engine)
+
+| Mechanism | Incident it answers |
+|---|---|
+| Scope guard + comment markers + misfiled-comment deletion | A concurrent pipeline posted one issue's plan onto another issue |
+| Stub-task guard (`sanitizeTasks`) | A placeholder plan record shadowed a real plan and dispatched an empty task |
+| Settled-decisions ledger | Contrarian gates oscillated (drop -> hardcode -> drop) across iterations, burning opus time re-litigating |
+| "A finding is a hypothesis" in revision prompts | A wrong Major was adopted without verification, causing the oscillation above |
+| Handoff notes ledger | Env workarounds were rediscovered from scratch several stages later |
+| Test loop halts (never degrades) | Silent test skips shipped broken code |
+| Claim protocol with label-safety rules | A claim agent once replaced an issue's full label set |
+| Browser lock (mkdir + owner + stale-steal) | Concurrent agents hijacked each other's browser tabs |
+| Degrade windows + circuit breakers | Distinguish one flaky stage from a systemic failure worth stopping for |
+| `isBudgetExhaustedError` noun+verb match | A bare keyword sweep on "budget"/"ceiling" matched a target repo's own domain errors, misreporting an ordinary agent death as token exhaustion and halting every remaining issue |
+| `COMMIT_SHA_ASK` guard (Layer 1: advisory prompt) + `probeCommitShas` (Layer 2: post-hoc existence check) | Twice, an agent typed a fabricated or shortened commit SHA into a posted comment instead of reading the real one, requiring a fixup edit |
+| `VERIFY_SKIPS` entry on a contrarian cap-out | An approach or plan gate's cap-out reached only `ctx.unresolved`, never the batch PR's Verification Gaps section, so a caveat worth a human's attention could ship and merge unseen |
+| Report-phase release stage (`releaseEnabled`, `deriveReleaseVersion`) | A batch of real engine changes (PR #56) merged with the CHANGELOG and version file left stale, because the pipeline had always assumed some later stage bumped them and no stage ever did |
+
+### Commit SHA integrity: read it, don't recall it
+
+Every stage prompt that asks an agent to post a comment with a commit SHA
+appends `COMMIT_SHA_ASK`. It tells the agent to run
+`git -C <worktree> log -1 --format=%H` and paste that output exactly, with
+no edits. The instruction rules out typing, shortening, guessing, or
+recalling a SHA from memory.
+
+The rule exists because agents did exactly that. Twice, a posted comment
+carried a SHA the agent invented rather than one it read from git, and a
+later stage had to post a fixup comment with the correct value.
+
+`COMMIT_SHA_ASK` is declared once and reused across eight stage prompts:
+simplify, quality fix, browser fix, test fix, test quality fix, task
+implementation, task review fix, and PR review fix. Sharing one constant
+keeps the wording in sync across all of them if it changes later.
+
+#### Layer 2: post-hoc validation of the posted SHA (issue #79)
+
+`COMMIT_SHA_ASK` is advisory only: it tells an agent how to get the real
+SHA, but the `commit` field a stage returns is still unverified free text.
+Nothing stopped a stage from posting a fabricated or stale SHA anyway.
+`collectPostedCommit(ctx, stageName, r)` is called at all eight
+`COMMIT_SHA_ASK` sites and appends every non-null `commit` a stage reports
+to `ctx.postedCommits` (guarding a null stage result and a stage that
+reported no commit at all, e.g. a fix stage that made no changes).
+
+`probeCommitShas(ctx)` then validates that list once per issue, from
+`reviewAndMerge()`, immediately before `runMergeAutoResolve()`. Same
+read-only-dispatch shape as `probeChangedFiles()` immediately above it in
+`workflows/ticketmill.js`: it early-returns with **no dispatch** when
+`ctx.postedCommits` is empty (the common case: most stages never report a
+commit), otherwise it dispatches a single read-only haiku probe that runs
+`git -C <worktree> cat-file -e <sha>^{commit}` for every distinct SHA
+collected and reports back which ones did not resolve. The probe runs
+before merge-auto-resolve deliberately: a rebase there legitimately
+rewrites every commit's SHA, and validating pre-rebase (while every posted
+SHA still resolves in the worktree) means there is nothing left to
+re-validate afterward.
+
+The check is advisory-flag, never-halt, same as the engine-owned gate and
+`probeChangedFiles()`: a missing SHA pushes a `VERIFY_SKIPS` entry (so it
+surfaces in the batch PR's Verification Gaps section) and a `ctx.deferred`
+note naming the posting stage, but never blocks the issue. A dead probe
+(the agent call dies through every retry) degrades to a recorded
+`ctx.deferred` note instead, same fail-open posture as every other
+degrade-safe probe in this engine. One dispatch validates every SHA posted
+during the issue, not eight per-site round-trips.
+
+### Model policy
+
+Judgment gates (evaluate, plan, contrarian challenges, final code review) default
+to opus at high effort; workhorse implementation and reviews run sonnet;
+mechanical probes and the test runner are haiku at low effort. Override any stage
+via `profile.models`.
+
+### Contrarian cap depth is profile-configurable, and cap-outs are never silent
+
+`MAX_CONTRARIAN_ITERATIONS` was a hardcoded `3`. It's now a `let`, defaulting
+to `3` but overridable per repo through the optional
+`profile.contrarian_max_iterations` (any integer >= 1, validated at Select
+time and rejected otherwise). A repo whose issues run deep and contentious
+can raise the ceiling. One that wants faster turnaround can lower it.
+
+A trivial-complexity issue never gets the full ceiling, whatever the profile
+sets. `contrarianCapFor(complexity)` floors its per-gate cap at
+`Math.min(2, MAX_CONTRARIAN_ITERATIONS)`. A docs-only fix shouldn't burn opus
+time re-litigating a settled call, and a profile that drops the ceiling
+below 2 tightens trivial issues along with everything else. The function is
+pure and declared above the harness split marker, so tests exercise it
+directly instead of seeding module state.
+
+Hitting the cap on the approach or plan gate still lets the issue proceed
+with the gate's unresolved caveats, the same fallback the engine has always
+used. That cap-out now also pushes an entry onto `VERIFY_SKIPS`. Previously
+it landed only in `ctx.unresolved`, which feeds the first implementation
+task's prompt but never reaches the batch PR body. A caveat worth a human's
+attention could ship, merge, and never appear in the one artifact a reviewer
+actually reads. Every cap-out on either gate now lands in the batch PR's
+Verification Gaps section beside the other skipped-verification kinds.
+
+### Token tracking: instrumentation, never a gate
+
+`stage()` samples the runtime's `budget.spent()` (cumulative output tokens for
+the whole run) before and after each retry loop, attributing the delta to
+`ctx.tokens.total` and `ctx.tokens.byModel[opts.model]`. That sampling sits in
+its own `try/finally` wrapped around the existing retry loop. A tracking
+failure, whether `budget.spent()` throws or the runtime hook is missing
+outright, can never change `stage()`'s retry, STOP, or return behavior. This
+is instrumentation, not a gate: a run with no working counter still ships,
+just with "not tracked" standing in for the numbers instead of a false zero.
+
+Not every token spend has a `ctx` to attribute to. Preflight's learnings
+read, the claims Promise.all, and the Select-phase consolidation gate
+(`proposeConsolidation()` and `postConsolidationMarkers()`) all run before or
+between per-issue stages, outside any issue's context. `STAGE_TOKENS` (a
+`{ preflight, select }` map) and its `addStage(bucket, before)` helper
+bracket those four run-body regions the same way `stage()` brackets a retry
+loop: sample `spentTokens()` immediately before the region, then again right
+after, and accumulate the guarded delta. `addStage()` runs in its own
+try/catch, so a tracking failure there can't touch run-body control flow
+either. Every bracketed region sits strictly before `runPool()`, the only
+concurrent region in the engine, so these deltas stay exact regardless of
+`CONCURRENCY` even when the per-issue breakdown below them doesn't.
+
+`aggregateTokens(results, spent, concurrency, byStage, poolSpend)` turns the
+per-issue deltas, plus that `STAGE_TOKENS` map, into a "## Token Usage"
+section in plain JS. The pipeline injects the finished markdown into the
+batch PR and run report prompts verbatim, so no subagent is ever asked to sum
+or double-check the arithmetic. `byStage` is optional and defaults to `{}`,
+so 3-arg callers still work; each nonzero bucket folds into the running sum
+exactly once and renders as its own labeled row ("preflight (orchestration)",
+"select-phase (orchestration)"), never silently absorbed into the remainder
+row below it. `poolSpend`, a 5th optional argument, re-scopes the
+`reconcile_error` signal (issue #111, below).
+
+Only the per-issue rows are affected by concurrency. At concurrency 1, an
+issue's stage deltas can't overlap, so they're an exact partition of that
+issue's run: `reconciles: true` when `spent` and some tracked data both
+exist. Above concurrency 1, several issues' stages run against the same
+shared monotonic counter, and `agent()` returns schema content only, never a
+per-call usage figure. There is no way to split a shared counter's movement
+across concurrent callers, so a per-issue row over-counts and the breakdown
+is labeled approximate (`reconciles: false`). That downgrade only applies
+when some per-issue row is actually tracked (`anyTracked`).
+
+A resumed run can carry its whole breakdown in `STAGE_TOKENS` buckets alone,
+with every per-issue row untracked. There's no per-issue over-count to guard
+against there: those buckets are sampled outside the concurrent pool, so
+they stay exact regardless of `CONCURRENCY`. `reconciles` stays `true` for
+that stage-only shape even above concurrency 1 (issue #65). The narrative
+footnote follows the same split. It warns about approximation only when
+`anyTracked` is true, so a stage-only breakdown above concurrency 1 renders
+with no warning, having earned none.
+
+The "orchestration/unattributed" remainder row (`spent` minus the summed
+per-issue and stage deltas, floored at 0) renders whenever `budget.spent()`
+is available at all, not only when the table reconciles. A Quality Review
+finding caught the earlier version hiding this: a resumed run where no
+per-issue row and no stage bucket ever attributed a delta, but
+`budget.spent()` was still a real nonzero number, fell through to "Per-issue
+/ per-model breakdown: not tracked" while the "Run total" line above it still
+showed the true spend. The table and the summary line disagreed. The
+remainder row now carries that full, otherwise-invisible spend instead, and
+the breakdown renders (with per-issue cells reading "not tracked") as long as
+either `spent` or a stage/per-issue delta is available. Per-issue PR bodies
+get one line of the same figures (that issue's stages only, not the run
+total or the stage buckets).
+
+Tokens only, never dollars: price varies by model and shifts over time, so no
+currency figure appears anywhere in the engine, profile, or output. The
+per-model-tier breakdown is what lets a human run that math outside the tool.
+
+### Closing the attribution gap: reconcile_error re-scoped to the pool (issue #111)
+
+`reconcile_error` had a floor problem baked into its own denominator. It
+divided the attribution gap by the full run total, `spent`, and that total
+always includes PR-review, merge, report, retrospective, and outcome-grading
+spend, none of which `stage()` ever brackets. Even a perfectly-attributed
+per-issue pool still reported a permanent, nonzero `reconcile_error`, roughly
+a quarter of spend on a typical concurrency-1 run. `computeReworkTax`'s 0.05
+trust gate could never clear that floor, so the rework-tax signal went quiet
+on nearly every real run, defeating the point of #90's own reconciliation
+check.
+
+**`POOL_SPEND` brackets the one concurrent region from outside it.** The run
+body now samples `spentTokens()` immediately before and after the
+`runPool()` call, the same before/after idiom `addStage()` already uses for
+the preflight/select brackets above. The delta stays exact regardless of
+`CONCURRENCY`, since it's sampled outside any per-issue stage's own tracking.
+
+**When `poolSpend` is finite, `reconcile_error` re-scopes to it.** The
+denominator becomes `poolSpend`, and the numerator becomes `perIssueSum`, the
+per-issue tracked totals only, never the stage buckets (those are bracketed
+outside the pool by construction and were never part of what `poolSpend`
+measures). At concurrency 1 this reconciles near-exactly, since both sides
+sum the same contiguous deltas, and it still catches a future bare-`agent()`
+regression inside the pool at any concurrency. The run-total-vs-pool gap
+itself doesn't disappear. It surfaces honestly as its own
+`orchestration_overhead` field, `max(0, spent - poolSpend)`, rendered as its
+own markdown line, instead of being folded into (or driving) the
+attribution-error signal. `pool_spend` and `orchestration_overhead` are both
+`null` when `poolSpend` is absent or non-finite, and every existing 3-/4-arg
+caller keeps the pre-#111 formula byte for byte. `run_total`, `attributed`,
+and `remainder` are unchanged either way: they still describe the full run
+against the full `sumDeltas`.
+
+The estimator's coarser 0.5 bar (`ESTIMATOR_MAX_RECONCILE_ERROR`, "Cost
+estimator" below) predates this fix and was sized to admit that ~0.26
+baseline as expected, not pathological. Runs recorded going forward carry the
+pool-scoped `reconcile_error` instead, so a clean concurrency-1 run now
+reconciles near 0. The 0.5 bar stays in place unchanged: it's headroom for
+older ledger rows recorded under the pre-#111 formula now, rather than a
+ceiling calibrated to an expected quarter of unattributed spend.
+
+### Budget-exhaustion detection: a noun+verb match, not a keyword sweep
+
+`isBudgetExhaustedError(msg)` decides what a caught stage error means: real
+runtime token exhaustion, which trips the whole-run `tripStop()`, or an
+ordinary per-attempt death, which retries and then falls through to
+`recordAgentDeath()`. It used to fire on a bare keyword sweep: any message
+containing "budget", "token target", or "ceiling" tripped the whole run.
+That caught more than exhaustion. A target repo's own domain error, a
+"budget" feature or a "ceiling" config value, matched the same sweep with
+nothing to do with tokens. An ordinary agent death got misreported as
+exhaustion, and the whole batch halted with every remaining issue left
+unstarted.
+
+The check now requires a budget/ceiling noun (or `token` narrowed to its
+plural `tokens` or a qualified form like `token budget`/`token limit`) to
+co-occur with an exhaustion-shaped verb: exhaust, exceed, deplete, ran out,
+overrun/overage, went over, ran over, over budget, over the limit, or limit
+reached. Either alone isn't enough. The "over" family is anchored to those
+overrun-shaped phrases rather than the bare word "over", which turns up in
+ordinary prose ("budget review is over") without meaning exhaustion. Bare
+singular `token` was dropped from the noun set (issue #62): it was broad
+enough to co-occur with an exhaustion verb in unrelated auth/rate-limit
+errors (an expired auth token, an API rate limit, a CSRF token check), each
+misreported as budget exhaustion. Narrowing to the qualified/plural forms
+also closed a recall gap: the old bare-`token` pattern never matched the
+plural, so "ran out of tokens" fell through to the death-counter backstop
+instead of tripping the fast path.
+
+Anchoring to the runtime's exact exhaustion error string was rejected: that
+text isn't documented anywhere accessible, and the runtime's budget object
+exposes only `.spent()`, no `.remaining()` and no structured error field. A
+wrong guess would silently disable real exhaustion detection, so the match
+stays semantic instead. `recordAgentDeath()`'s existing three-consecutive-
+death circuit breaker is the backstop for any true exhaustion the tightened
+match still misses.
+
+### Cost estimator and token_budget guard: stopping before the ceiling, not after
+
+Everything above stops a run only once something has already gone wrong: the
+circuit breaker after three failures, the consecutive-death counter after
+three dead agents, the budget-exhaustion match after a real exhaustion error.
+Issue #97 adds a second, proactive layer that estimates a run's spend before
+it starts and can halt it before the account ceiling is ever reached.
+
+**The ledger gains a shape row.** `buildIssueShapeRows()` joins each result
+against its scheduling unit and its `tokenAgg.by_issue` entry into a compact
+`{issue, pf, tokens, tracked, member_count}` record, one per unit. A group
+unit's `pf` is already the union across members (`deriveUnits`' own
+contract), and its `tokens` is the whole group's total, never the primary
+issue's share alone. `buildRunRecord` carries these rows as `by_issue_shape`,
+plus `effective_concurrency` (`min(CONCURRENCY, lanes.length)`, the same
+number the lane-scheduling preview already logs), and `buildLedgerLine`
+copies both onto the `runs.jsonl` line verbatim. `schema_version` moves 1 ->
+2 for the addition. This is the estimator's only input: an issue's shape,
+and whether the run it happened in was single-lane enough to trust.
+
+**`estimateCost` medians over trusted rows only.** `buildTrustedPfBands()`
+keeps a `by_issue_shape` row only when its parent run has
+`effective_concurrency === 1` (attribution is only exact at that
+concurrency, see "Token tracking" above), `member_count === 1` (a group's
+whole-group total would inflate a singleton's band), and a `reconcile_error`
+at or under 0.5. That bar is deliberately coarser than the 0.05 one
+`computeReworkTax` uses to trust a run's own numbers. Before issue #111
+re-scoped `reconcile_error` to the per-issue pool (see "Closing the
+attribution gap" above), a clean single-lane run still left roughly a
+quarter of its spend as unbracketed orchestration overhead, and the strict
+bar would have starved the estimator down to almost no history at all. The
+0.5 bar stays unchanged, now mostly headroom for older ledger rows recorded
+under the pre-#111 formula: a run recorded after the fix reconciles near 0 at
+concurrency 1 and clears either bar easily. Rows are bucketed by
+predicted-files band (`0`, `1`, `2-3`,
+`4-7`, `8-15`, `16+`), and a band only reports a median once it holds 3 or
+more samples. Below that it degrades to `{estimate: null, confidence:
+'insufficient'}` rather than print a number built from one or two data
+points. A group's estimate is the sum of its members' own individual
+estimates, each banded on its own shape. Any unknown member poisons the sum
+to null instead of quietly understating it.
+
+**The dry_run preview surfaces the estimate before a run is even launched.**
+`buildCostEstimate()` wraps the estimator with three independent oversized
+flags and a batch projection. `structural` fires on a 4+ member
+consolidation group and needs no history at all. `pf_ceiling` fires on a
+predicted-files count at the top band, also history-free, but is evadable:
+the predicted-files probe fails open to `[]` on any doubt, so an
+under-predicted issue simply won't trip it. `multiple_of_median` fires when
+an estimate is 3x or more of the batch's own historical median, and needs
+trusted history to fire at all. The batch projection never reports a bare
+`projected_total` when any issue's estimate is null. It carries a
+`coverage_note` ("estimable K of N, M unknown") instead, so the preview
+never reads more confident than the data underneath it.
+
+**The `token_budget` guard runs underneath every real run, always on.**
+`resolveTokenBudget()` accepts an absolute OUTPUT-token ceiling or a
+relative `"Nx"` multiple of the batch's own historical median, run arg
+winning over `profile.token_budget`. A relative spec with no trusted history
+to multiply degrades to "guard off" rather than a false floor. Two checks
+layer inside `drainUnit`, ahead of the existing `STOP.tripped` check: a hard
+floor (`spentTokens() >= budget`) that needs no estimate at all, and an
+estimate-aware pre-check layered on top of it (`spent + estimateByIssue[issue]
+> budget`) that only fires when that unit carries a real number. `STOP`
+gained a `kind` field so this proactive trip stays distinct from every
+reactive breaker above: `state` reports `budget_halt`, not
+`circuit_breaker`, and carries its own `resume_hint` (raise the budget or
+split the remaining issues, then resume with `batch_branch`) instead of the
+generic "an agent kept dying" framing the reactive breakers use.
+
+**The sandbox has no filesystem, so the skill does the reading.**
+`skills/mill/SKILL.md` reads `runs.jsonl`, parses each line, and passes the
+array as `history` on every `Workflow()` call, dry_run and a live run alike,
+because the estimator and the pre-check are both pure functions over that
+array, not a file read. Skipping this step on a live run leaves the
+estimate-aware pre-check permanently dark. The hard floor still runs either
+way, since it needs no history to work.
+
+### Claims interop
+
+Ticketmill honors fresh claims left by its ancestor engine ("## Batch Processing
+Claimed" comments) as foreign claims, one-way, so both can coexist on a repo
+during a migration without double-processing issues.
+
+### Consolidation gate: grouping issues cheaper to resolve as one unit
+
+Select can propose folding several selected issues into ONE worktree, branch,
+research/plan pass, and PR when they share a subsystem and acceptance surface
+(or an explicit dependency) closely enough that solving them separately would
+duplicate work. This is a judgment call, not a heuristic: `proposeConsolidation()`
+is an opus-tier gate, prompted with a deliberately conservative bar. Grouping
+is the exception. Shared files alone are never sufficient reason, only a
+hint. The proposal then runs the same capped contrarian challenge pattern as
+the approach/plan gates before it can take effect, reusing `CHALLENGE_SCHEMA`
+and the settled-decisions ledger.
+
+Everywhere else, the engine layers a group on top of the existing per-issue
+path rather than replacing it: a unit is a singleton (`ctx.members = [ctx.issue]`,
+the original code path verbatim) or a group (`ctx.members.length > 1`), so a
+no-overlap run with zero proposed groups is byte-for-byte identical to the
+engine before this gate existed. Grouping tags plan tasks by originating issue
+(no synthesized merged-issue text); one primary issue carries the comment
+trail while absorbed members get a "consolidated into #X" marker comment; the
+group PR carries one `Closes #N` per member.
+
+**Stable group id, not the mutable primary.** A group's physical identity
+(worktree path, branch name, PR head) is bound to a `stableGroupId()`: the
+lowest issue number ever in the group, rather than to whichever issue is
+currently "primary." The two need to differ: claims settle after the proposal
+is judged, so a proposed primary can turn out to be already claimed or to flip
+to `skip` before materialization, forcing a re-anchor onto another live
+member. If the physical identity had been hard-bound to the primary, re-anchoring
+would mean silently moving a worktree/branch/PR that another process might
+already be looking at. Binding identity to a stable id instead makes re-anchor
+just a bookkeeping update: the same worktree and branch persist across a
+primary change, and a resumed run's marker heal recognizes the group by that
+id even after a re-anchor.
+
+**Cap-dissolves, not proceed-with-caveats.** The approach and plan contrarian
+gates proceed with unresolved caveats when the iteration cap is hit, because a
+single issue still has to go somewhere. A consolidation proposal has a safe
+fallback the others don't: independent per-issue processing, which is exactly
+what the engine already does everywhere else. So hitting `MAX_CONTRARIAN_ITERATIONS`
+on a group challenge, or a dead challenger/reviser mid-loop, DISSOLVES the
+group back to its independent member issues instead of shipping a
+still-contested grouping decision. Conservatism costs nothing here: dissolving
+only forgoes an efficiency, it never blocks progress.
+
+**Profile flag.** `profile.consolidation` (boolean, default `true`) disables
+the gate entirely when set to `false`. No proposal runs and no contrarian
+challenge runs, though a resumed run still heals any group a prior run already
+committed to via its comment markers, so turning the flag off mid-run can't
+strand a group that already exists on GitHub. Runs with at most one candidate
+issue (any resume_point) skip the gate for free: there is nothing to group.
+Only fresh `implement`-bound candidates are ever offered to the opus PROPOSE
+step for a brand-new grouping decision; the marker HEAL step runs over every
+candidate regardless of resume_point (see below).
+
+**Billing anchor.** A group's tokens book under the primary issue, not spread
+across members: `aggregateTokens()`'s per-issue breakdown keys off each
+result's `issue` field, which for a group unit is `ctx.issue`. That's the
+(possibly re-anchored) primary, so the run report's Token Usage table shows
+one row for the whole group and absorbed members show no row of their own.
+
+**Resumed groups stay grouped across every live resume_point.**
+`proposeConsolidation()` is handed EVERY selected issue's preflight, not just
+`implement`-bound ones, so its HEAL step can recognize a group whose members
+have since flipped to `process_pr` (the shared PR already exists: a prior run
+created it but crashed or failed before merging, in `reviewAndMerge`, which
+covers spec review, code review, and merge) or `skip` (one member resolved
+independently). `reconcileGroups()` keeps a member live, and IN the group,
+when its resume_point is `implement` OR `process_pr`; only `skip` excludes it.
+That is what keeps a post-PR-crash resume routing the whole group through ONE
+`process_pr` unit (one worktree, one `reviewAndMerge` call on the shared PR)
+instead of splintering into one independent `process_pr` singleton per
+member, each attempting to review/merge the SAME PR.
+
+**Known gap: partial-branch members aren't excluded.** A member issue that
+already has unmerged work sitting on its own `issue-<N>` branch
+(`commits_ahead > 0` on its preflight) is not currently filtered out of
+consolidation: neither `consolidationCandidates` nor `reconcileGroups()` checks
+`commits_ahead`. If such an issue is folded into a group, `setup-worktree.sh`
+runs against the group's `worktreeAnchor()` instead of the member's own
+branch, so those pre-existing commits are not carried forward. They are
+effectively orphaned rather than merged. This is a known caveat, not yet a
+mechanical exclusion; treat an `implement`-bound issue with nonzero
+`commits_ahead` as a poor consolidation candidate until `reconcileGroups` is
+extended to drop it.
+
+### Lane scheduling: serializing issues with predicted file conflicts
+
+Concurrent issues that touch the same file race by default: two implementers
+land conflicting edits, and review has to reconcile a diff nobody expected.
+Lane scheduling groups issues likely to overlap into one lane, and a single
+worker drains that lane serially instead of racing every unit against the
+whole pool.
+
+**Predictions come from preflight, not a title heuristic.** Each preflight
+probe resolves real repo-relative paths against `origin/TARGET` (fetched once
+up front, shared read-only across every issue's probe rather than refetched
+per issue) and reads `depends_on #N` / `follow-up to #N` references out of
+the issue body. Both fields fail open to `[]` on any doubt. A wrong guess
+would wrongly serialize two unrelated issues; an empty prediction only costs
+the batch today's ordinary racing behavior.
+
+**A deliverable-shape gate runs before that resolution, for net-new skill or
+doc issues.** Retro #94 ('add skills/mill-review/SKILL.md') is why. The
+original resolution always fell through to a broad `git grep`/`git ls-tree`
+match against `origin/TARGET`. The two ~7,300-line engine copies plus
+`.claude/ticketmill.json` mention nearly every ticketmill concept, so a
+net-new skill or doc issue's generic identifiers matched the engine cluster.
+The asset the issue was about to create resolved to nothing: a
+precision-zero prediction, serializing the issue into the wrong lane. The
+gate checks first. Does the issue read as adding a new skill or doc/markdown
+asset, and does the body avoid naming an engine/profile/schema keyword
+(`workflows/ticketmill.js`, `.claude/ticketmill.json`, `lint-engine`, or a
+term describing the engine/profile/schema itself)? If both hold,
+`predicted_files` becomes the new asset's path exactly as written, plus the
+repo's top-level README if it has one, and the broad resolution is skipped.
+Every other issue shape falls through to the identifier extraction and
+`git grep`/`git ls-tree` resolution unchanged.
+
+**`computeLanes()` is a union-find over predicted-file overlap, with two edge
+tiers.** Trusted edges, a `serialize_globs` pattern hit or a `depends_on`
+reference, always unite their units and are never dissolved. Heuristic
+edges, a shared predicted path or (only when no path matches) a shared
+basename, unite units too, but only survive a cohesion-aware collapse guard.
+A pair sharing two or more distinct paths is a genuine cluster, an
+implementation file plus its test, say, and always stands. A pair sharing
+exactly one path only survives as part of a weak-edge-only chain that
+reaches two distinct shared keys entirely on its own, never inherited from a
+neighboring strong cluster. A single popular path touched by many otherwise
+unrelated units, a magnet config or a central router, can't drag them into
+one lane by itself. That's the failure mode the guard exists to catch: one
+file everyone happens to touch is not evidence that any two of them conflict.
+
+**Document frequency is advisory, never a filter.** A path matched by more
+than half the batch (minimum 3 units) gets logged as a magnet signal, for
+visibility in run logs and the DRY_RUN preview. It never drops an
+intersection key or suppresses an edge; only the collapse guard does that.
+
+**A second, coarser guard runs immediately before the real drain.**
+`computeLanes()` guards each weak-edge chain locally, but a long run of
+pairwise-weak edges, each sharing a different path with its neighbor, can
+clear that local two-distinct-keys bar in aggregate without the lane, taken
+as a whole, actually cohering around anything. `applyRealRunCollapseGuard()`
+only recomputes when the batch is large enough to want the concurrency
+(`unitCount >= concurrency`) and the lanes produced are running noticeably
+narrower than a flat pool would (`collapse_ratio < 0.5`). A lane whose exact
+membership also comes out of `computeLanes({ trustedOnly: true })` is
+trusted and always kept. Everything else is re-checked whole-lane, fresh,
+for at least two paths shared across its own units, and dissolved back to
+one singleton lane per unit if it doesn't clear that bar.
+
+**`runPool()` steals whole lanes, not items.** A worker grabs the next
+unclaimed lane and drains every unit in it one at a time, in `depends_on`
+topological order, before stealing another lane. No `lanes` argument, or
+every lane a singleton (what `computeLanes()` returns when nothing
+overlaps), degenerates byte-for-byte to the pre-lane pool: one lane per item,
+drained in original order, `min(limit, items.length)` workers. STOP is still
+checked per unit, and a thrown error is still isolated to the one unit that
+threw, so lane draining changes nothing about failure isolation or
+resumability.
+
+**DRY_RUN previews the same lane graph, read-only.** The claim loop never
+runs during a preview, so a preview's lanes can still diverge from a real
+run's if a claim race flips a `resume_point` between the two. The preview
+reports each lane's issues, predicted files, and provenance (`trusted`,
+`heuristic`, or `none` for an unconnected singleton), plus `collapse_ratio`,
+`prediction_coverage`, any DF-flagged magnet paths, and whether the shared
+`origin/TARGET` fetch failed, which would mean every prediction in the
+preview is grounded against a stale ref.
+
+**The retrospective measures its own accuracy.** For each completed unit
+that predicted files and produced a merged PR, the retro agent diffs the
+PR's actual changed files against `predicted_files` and appends one
+coverage/precision row to a new "## Lane Prediction Accuracy" section in
+`process-retrospective.md`. That closes the loop: the same memory file a
+human reads to judge whether the prediction step is worth trusting, or needs
+a `serialize_globs` hint for a repo's actual magnet files.
+
+**Bounds are read-only aids, not correctness inputs.** A lane's merged
+`predicted_files` list caps at `MAX_LANE_PREDICTED_FILES` (60); the retro's
+predicted-vs-actual sample caps at `MAX_LANE_ACCURACY_SAMPLES` (40). Both
+only limit what a human or a prompt sees, never what `computeLanes()` unions
+or what `runPool()` drains.
+
+**Profile flag.** `serialize_globs` (optional, default `[]`) names patterns
+worth trusting even when predicted-file overlap alone wouldn't catch them: a
+shared schema, a central config, anything two issues could conflict on
+without their own predicted paths overlapping. Left unset, the engine still
+lanes on `depends_on` and predicted-file overlap alone.
+
+## Failure semantics
+
+- Stage dies twice -> the issue fails/halts at that stage with an issue comment
+  carrying resume instructions; the claim is released.
+- Three issue failures, or three consecutive agent deaths -> circuit breaker:
+  remaining issues are marked `not_started`, the report carries a resume plan.
+- `token_budget` reached or projected to be exceeded -> `budget_halt`, a state
+  distinct from `circuit_breaker`: the run stopped on purpose, before starting
+  an issue, not because an agent failed. Its own `resume_hint` names raising
+  the budget or splitting the remaining issues as the next step.
+- Quality loop degrades (non-fatal) but 3 degrades in a rolling window of 5 halt
+  the issue: that rate signals a systemic problem, not flakiness.
+- Reviewer death at the PR gate -> `needs_human`, PR left open; reviewer death at
+  the task gate -> provisional accept, flagged for extra PR-gate scrutiny.
+- A failed consolidation group -> ONE circuit-breaker increment, not one per
+  member (`fail()` runs exactly once per unit); every member issue's claim is
+  released; each member gets its own resume comment naming the group and the
+  failing stage, so any one member's trail is enough to understand the whole
+  unit halted together. On resume, preflight healing recognizes the group from
+  that comment's marker and re-proposes the SAME group rather than reprocessing
+  its members as independent issues.
