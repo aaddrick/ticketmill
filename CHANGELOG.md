@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.35 (2026-07-25)
+
+Repoints the stale manual-copy instruction in `.claude/ticketmill.json`'s
+LOCKSTEP-EDIT RULE verify_note to the `--fix` mode PR #66 added for issue
+#38 (#67). Patch bump (0.1.34 -> 0.1.35).
+
+- `.claude/ticketmill.json` (#67): the LOCKSTEP-EDIT RULE note now tells
+  agents to run `node scripts/lint-engine.js --fix` instead of the manual
+  `cp workflows/ticketmill.js .claude/workflows/ticketmill.js`, matching
+  the wording already in `docs/ARCHITECTURE.md`. Text-only change; no
+  engine behavior, lockstep enforcement, or lint logic is affected.
+
 ## 0.1.34 (2026-07-25)
 
 Tier 4 of the observability upgrade, one milled issue (#94): the
