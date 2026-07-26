@@ -65,12 +65,22 @@ function docsTopLevelMdFiles() {
   })
 }
 
-function countHeadingOccurrences(heading, files) {
+// Reads every file in `files` from disk exactly once, so the per-heading
+// census loop below doesn't re-read the same file for each of the 15
+// headings it checks.
+function loadHeadingLines(files) {
+  const byFile = new Map()
+  for (const file of files) {
+    byFile.set(file, fs.readFileSync(path.join(ROOT, file), 'utf8').split('\n'))
+  }
+  return byFile
+}
+
+function countHeadingOccurrences(heading, headingLinesByFile) {
   let count = 0
   const locations = []
-  for (const file of files) {
-    const text = fs.readFileSync(path.join(ROOT, file), 'utf8')
-    for (const line of text.split('\n')) {
+  for (const [file, lines] of headingLinesByFile) {
+    for (const line of lines) {
       if (headingText(line) === heading) {
         count++
         locations.push(file)
@@ -89,11 +99,12 @@ test('every base README H2 appears exactly once across README.md + docs/*.md, ex
   const headings = readBaseReadmeHeadings()
   const files = ['README.md'].concat(docsTopLevelMdFiles())
   assert.ok(files.includes('docs/getting-started.md'), 'docs/getting-started.md must exist for this census to be meaningful')
+  const headingLinesByFile = loadHeadingLines(files)
 
   const failures = []
   for (const heading of headings) {
     const expected = ALLOWED_DUPLICATES.has(heading) ? 2 : 1
-    const result = countHeadingOccurrences(heading, files)
+    const result = countHeadingOccurrences(heading, headingLinesByFile)
     if (result.count !== expected) {
       failures.push(heading + ': expected ' + expected + ' occurrence(s), found ' + result.count + ' (' + result.locations.join(', ') + ')')
     }
