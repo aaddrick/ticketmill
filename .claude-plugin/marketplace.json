@@ -4,7 +4,7 @@
   "owner": {
     "name": "aaddrick"
   },
-  "description": "Marketplace for the ticketmill plugin — autonomous GitHub issue batch processing.",
+  "description": "Marketplace for the ticketmill plugin: autonomous GitHub issue batch processing.",
   "plugins": [
     {
       "name": "ticketmill",

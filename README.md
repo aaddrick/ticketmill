@@ -76,7 +76,7 @@ it from your request; these are the knobs it can turn:
 | `dry_run` | Read-only preview: probes every issue and reports the routing plan |
 | `run_label` (alias `date`) | Tag for claims and report filenames. Pass today's date so reports don't collide |
 | `batch_branch` | Resume a prior run by reusing its `Batch_<timestamp>` branch |
-| `token_budget` | Halt the run BEFORE it overspends: an absolute OUTPUT-token count, or a relative `"Nx"` / `{multiple_of_median}` form. Run arg wins over the profile field of the same name — see the `mill` skill's `token_budget` section |
+| `token_budget` | Halt the run BEFORE it overspends: an absolute OUTPUT-token count, or a relative `"Nx"` / `{multiple_of_median}` form. Run arg wins over the profile field of the same name (see the `mill` skill's `token_budget` section) |
 | `root`, `repo` | Auto-discovered from git and gh; pass explicitly if the bootstrap probe fails |
 
 `concurrency` is parallelism across issues within one run: each pipeline gets
@@ -141,7 +141,7 @@ The run narrates itself in the places you already look:
   batch PR carries the Verification Gaps section: every check that did not run,
   in front of the human who is about to merge.
 - **The logs dir** (`logs_dir`, default `logs/ticketmill`). Each run writes
-  `runs/<run_label>.json` (the machine-readable record — per-issue metrics, tokens,
+  `runs/<run_label>.json` (the machine-readable record: per-issue metrics, tokens,
   and timelines, written deterministically by the mill skill so nothing is truncated)
   and appends one line to `runs.jsonl` (the cross-run ledger). It also writes
   `summary-<run_label>.md` (the human version) and appends to the running
@@ -297,7 +297,7 @@ load-bearing fields:
 | `verify_notes` | Environment preconditions injected into test/fix prompts (required services, seed data) |
 | `roles` | Role-to-agent map; `implementers` is the list the planner assigns tasks to |
 | `simplify_globs`, `docblock_globs`, `docs_dir` | Gate the simplify, docblock, and tech-docs stages; `null` skips |
-| `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes). Also accepts optional `lock_path` (default `/tmp/ticketmill-browser-lock`), `stale_seconds` (default `1800`), `poll_seconds` (default `15`), `port_span` (default `900`), and `artifact_dir` (default `/tmp/ticketmill-issue-{issue}`, `{issue}`-templated like `serve_command`'s `{port}`); **caveat:** the resolved `artifact_dir` is deleted with `rm -rf` on cleanup (both the per-issue browser-verify stage and the final batch cleanup), so it must be a dedicated scratch path — never a project directory, shared mount, or `$HOME` |
+| `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes). Also accepts optional `lock_path` (default `/tmp/ticketmill-browser-lock`), `stale_seconds` (default `1800`), `poll_seconds` (default `15`), `port_span` (default `900`), and `artifact_dir` (default `/tmp/ticketmill-issue-{issue}`, `{issue}`-templated like `serve_command`'s `{port}`); **caveat:** the resolved `artifact_dir` is deleted with `rm -rf` on cleanup (both the per-issue browser-verify stage and the final batch cleanup), so it must be a dedicated scratch path (never a project directory, shared mount, or `$HOME`) |
 | `models` | Per-stage model/effort overrides. Valid stage keys are enumerated in the header schema comment (`workflows/ticketmill.js`), adjacent to the `M` map that is their source of truth |
 | `consolidation` | Default `true`. Set `false` to disable the Select-phase consolidation gate entirely (a resumed run still heals any group a prior run already committed to) |
 | `release` | Optional, default `null` (Report-phase release stage skipped entirely). Set `{ version_files: [...] }` to opt in to a once-per-batch CHANGELOG entry and version bump on the canonical version file(s), landed before the batch PR. Also accepts optional `changelog` (default `CHANGELOG.md`) and `bump` (`"major"\|"minor"\|"patch"` override; unset derives `feat` -> minor, else patch, from the batch's shipped commit types) |
@@ -319,7 +319,7 @@ templates/         agents/contrarian.md, copied into repos that lack one
 scripts/           setup-worktree.sh (worktree creation), lint-engine.js (sandbox/lockstep gate)
 tests/             the test suite gating every run
 docs/              ARCHITECTURE.md, diagrams/ (D2 sources + generated SVGs, see render.sh)
-.claude/           this repo's own ticketmill profile, workflows/, and agents/ — it self-hosts its mill runs
+.claude/           this repo's own ticketmill profile, workflows/, and agents/ (it self-hosts its mill runs)
 ```
 
 Note: workflow scripts are not a registered Claude Code plugin component, which is

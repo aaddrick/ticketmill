@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup-worktree.sh — Deterministic worktree creation for the ticketmill engine.
+# setup-worktree.sh: deterministic worktree creation for the ticketmill engine.
 #
 # Usage: setup-worktree.sh <issue_number> <base_branch> <repo_root> <worktrees_dir> <repo_slug>
 # Outputs JSON to stdout: {"status":"success","worktree":"...","branch":"..."}
@@ -9,7 +9,7 @@
 # Worktree path: <worktrees_dir>/issue-<N>
 #
 # Idempotency: an existing worktree is reused when its branch matches the
-# issue-<N>-* PREFIX — not the exact title-derived slug. Issue titles are
+# issue-<N>-* PREFIX, not the exact title-derived slug. Issue titles are
 # editable mid-run; deriving the slug live and demanding an exact match would
 # make a title edit destroy an in-flight worktree.
 #
@@ -41,7 +41,7 @@ if [[ -d "$worktree" ]]; then
         echo "{\"status\":\"success\",\"worktree\":\"$worktree\",\"branch\":\"$existing_branch\"}"
         exit 0
     fi
-    # Wrong branch — remove stale worktree
+    # Wrong branch, remove stale worktree
     git -C "$REPO_ROOT" worktree remove --force "$worktree" 2>/dev/null || rm -rf "$worktree"
 fi
 
