@@ -595,3 +595,217 @@ test('computeRevisitRisk: refix_chains corroborates (appends a reason) only for 
   assert.strictEqual(out[0].revisit_risk.reasons.length, 2)
   assert.match(out[0].revisit_risk.reasons[1], /re-fixed/)
 })
+
+// ---- computeLaterBatchFix (issue #104) ----
+//
+// The sole place the later_batch_fix grade decision is made: fires iff
+// observation.batch_pr_merge_sha is present in the UNION of every
+// churned_regions[].blamed_shas entry — proof (via the later fix PR's own
+// blame-forward resolution) that the later fix repaired a line THIS batch PR's
+// squash-merge commit wrote, not bare changed_files overlap (the v1 mechanism
+// plan review rejected as guaranteed-coincidental in this repo). Fails open to
+// false on anything malformed or missing.
+
+test('computeLaterBatchFix: batch_pr_merge_sha present in a region\'s blamed_shas fires true', function () {
+  const context = harness.boot()
+  const obs = {
+    batch_pr_merge_sha: 'abc123',
+    churned_regions: [{ file: 'workflows/ticketmill.js', blamed_shas: ['deadbeef', 'abc123'] }],
+  }
+  assert.strictEqual(context.computeLaterBatchFix(obs), true)
+})
+
+test('computeLaterBatchFix: batch_pr_merge_sha matching in the SECOND region (union across all regions) fires true', function () {
+  const context = harness.boot()
+  const obs = {
+    batch_pr_merge_sha: 'abc123',
+    churned_regions: [
+      { file: 'a.js', blamed_shas: ['deadbeef'] },
+      { file: 'b.js', blamed_shas: ['abc123'] },
+    ],
+  }
+  assert.strictEqual(context.computeLaterBatchFix(obs), true)
+})
+
+test('computeLaterBatchFix: no matching SHA across any region fails open to false', function () {
+  const context = harness.boot()
+  const obs = {
+    batch_pr_merge_sha: 'abc123',
+    churned_regions: [{ file: 'a.js', blamed_shas: ['deadbeef', 'cafef00d'] }],
+  }
+  assert.strictEqual(context.computeLaterBatchFix(obs), false)
+})
+
+test('computeLaterBatchFix: missing batch_pr_merge_sha fails open to false, even with a matching-looking region', function () {
+  const context = harness.boot()
+  const obs = { churned_regions: [{ file: 'a.js', blamed_shas: ['abc123'] }] }
+  assert.strictEqual(context.computeLaterBatchFix(obs), false)
+})
+
+test('computeLaterBatchFix: empty-string batch_pr_merge_sha fails open to false (never matches an empty blamed_shas hole)', function () {
+  const context = harness.boot()
+  const obs = { batch_pr_merge_sha: '', churned_regions: [{ file: 'a.js', blamed_shas: [''] }] }
+  assert.strictEqual(context.computeLaterBatchFix(obs), false)
+})
+
+test('computeLaterBatchFix: missing/non-array churned_regions fails open to false', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.computeLaterBatchFix({ batch_pr_merge_sha: 'abc123' }), false)
+  assert.strictEqual(context.computeLaterBatchFix({ batch_pr_merge_sha: 'abc123', churned_regions: 'nope' }), false)
+})
+
+test('computeLaterBatchFix: a region missing/non-array blamed_shas is skipped, not thrown', function () {
+  const context = harness.boot()
+  const obs = {
+    batch_pr_merge_sha: 'abc123',
+    churned_regions: [{ file: 'a.js' }, { file: 'b.js', blamed_shas: null }, { file: 'c.js', blamed_shas: ['abc123'] }],
+  }
+  assert.strictEqual(context.computeLaterBatchFix(obs), true)
+})
+
+test('computeLaterBatchFix: a null entry inside churned_regions is skipped, not thrown', function () {
+  const context = harness.boot()
+  const obs = { batch_pr_merge_sha: 'abc123', churned_regions: [null, { file: 'a.js', blamed_shas: ['abc123'] }] }
+  assert.strictEqual(context.computeLaterBatchFix(obs), true)
+})
+
+test('computeLaterBatchFix: null/undefined observation degrades to false, never throws', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.computeLaterBatchFix(null), false)
+  assert.strictEqual(context.computeLaterBatchFix(undefined), false)
+})
+
+// ---- isPlannedFollowup (issue #104) ----
+//
+// The planning-edge exclusion: a later PR/issue whose OWN body declares itself
+// a pre-planned continuation of prior work must never be graded
+// later_batch_fix. Validated (task 1) against real repo history: must drop
+// #103's actual body ("Follow-up from #92") but NOT drop reactive-repair
+// language like "regression introduced by".
+
+test('isPlannedFollowup: the real #103 body ("Follow-up from #92...") is excluded as planned', function () {
+  const context = harness.boot()
+  const body = 'Follow-up from #92: reconcile the CHANGELOG entry that batch PR #106 left stale.'
+  assert.strictEqual(context.isPlannedFollowup(body), true)
+})
+
+test('isPlannedFollowup: reactive-repair language ("regression introduced by...") is NOT excluded', function () {
+  const context = harness.boot()
+  const body = 'Fixes a regression introduced by #106 in the outcome-grading precedence order.'
+  assert.strictEqual(context.isPlannedFollowup(body), false)
+})
+
+test('isPlannedFollowup: is case-insensitive ("FOLLOW-UP FROM #92")', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.isPlannedFollowup('FOLLOW-UP FROM #92'), true)
+})
+
+test('isPlannedFollowup: also matches "depends on" and "deferred from"', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.isPlannedFollowup('This depends on #92 landing first.'), true)
+  assert.strictEqual(context.isPlannedFollowup('Deferred from the original #92 scope.'), true)
+})
+
+test('isPlannedFollowup: plain unrelated prose is not planned', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.isPlannedFollowup('This PR fixes a null-pointer crash on startup.'), false)
+})
+
+test('isPlannedFollowup: non-string/missing body degrades to false, never throws', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.isPlannedFollowup(null), false)
+  assert.strictEqual(context.isPlannedFollowup(undefined), false)
+  assert.strictEqual(context.isPlannedFollowup(42), false)
+})
+
+// ---- gradeFromObservation: later_batch_fix precedence (issue #104) ----
+//
+// later_batch_fix sits AFTER hotfix (a same-issue cross-referenced fix is the
+// stronger, more direct claim) and BEFORE closed_unmerged/abandoned (a real
+// later fix landing is strictly more informative than either terminal
+// escape).
+
+function laterFixObservation(over) {
+  return baseObservation(Object.assign({
+    hotfix_pr: null,
+    batch_pr_merge_sha: 'abc123',
+    churned_regions: [{ file: 'workflows/ticketmill.js', blamed_shas: ['abc123'] }],
+    later_fix_body: 'Fixes a regression introduced by the earlier batch.',
+  }, over))
+}
+
+test('gradeFromObservation: a blame-forward SHA match with no planning language grades later_batch_fix', function () {
+  const context = harness.boot()
+  const g = context.gradeFromObservation(laterFixObservation(), NOW, { min_age_days: 7 })
+  assert.strictEqual(g.grade, 'later_batch_fix')
+})
+
+test('gradeFromObservation: hotfix still outranks later_batch_fix when both conditions are true', function () {
+  const context = harness.boot()
+  const g = context.gradeFromObservation(laterFixObservation({ hotfix_pr: 777 }), NOW, { min_age_days: 7 })
+  assert.strictEqual(g.grade, 'hotfix')
+})
+
+test('gradeFromObservation: reverted/reopened still outrank later_batch_fix', function () {
+  const context = harness.boot()
+  const gReverted = context.gradeFromObservation(laterFixObservation({ reverted: true }), NOW, { min_age_days: 7 })
+  assert.strictEqual(gReverted.grade, 'reverted')
+  const gReopened = context.gradeFromObservation(laterFixObservation({ reopened: true }), NOW, { min_age_days: 7 })
+  assert.strictEqual(gReopened.grade, 'reopened')
+})
+
+test('gradeFromObservation: later_batch_fix outranks closed_unmerged', function () {
+  const context = harness.boot()
+  const g = context.gradeFromObservation(laterFixObservation({ pr_state: 'closed', merged_at: null }), NOW, { min_age_days: 7 })
+  assert.strictEqual(g.grade, 'later_batch_fix')
+})
+
+test('gradeFromObservation: later_batch_fix outranks abandoned', function () {
+  const context = harness.boot()
+  const g = context.gradeFromObservation(laterFixObservation({ pr_state: 'open', merged_at: null, abandoned: true }), NOW, { min_age_days: 7 })
+  assert.strictEqual(g.grade, 'later_batch_fix')
+})
+
+test('gradeFromObservation: a planned-followup body (isPlannedFollowup) suppresses later_batch_fix, falling through to the next branch (clean)', function () {
+  const context = harness.boot()
+  const g = context.gradeFromObservation(laterFixObservation({ later_fix_body: 'Follow-up from #92: see that issue for context.' }), NOW, { min_age_days: 7 })
+  assert.notStrictEqual(g.grade, 'later_batch_fix')
+  assert.strictEqual(g.grade, 'clean')
+})
+
+test('gradeFromObservation: no blamed-SHA match (computeLaterBatchFix false) never grades later_batch_fix', function () {
+  const context = harness.boot()
+  const g = context.gradeFromObservation(laterFixObservation({ batch_pr_merge_sha: 'zzz999' }), NOW, { min_age_days: 7 })
+  assert.notStrictEqual(g.grade, 'later_batch_fix')
+})
+
+// ---- dual grade-set membership (issue #104 lockstep fix) ----
+//
+// later_batch_fix must be a member of BOTH OUTCOME_TERMINAL_GRADES (it never
+// legitimately re-grades once observed) AND OUTCOME_NEGATIVE_GRADES (it is a
+// genuine anti-Goodhart quality-negative signal, unlike closed_unmerged/
+// abandoned which are terminal escapes, not evidence of a bad outcome).
+
+test('later_batch_fix is a member of both OUTCOME_TERMINAL_GRADES and OUTCOME_NEGATIVE_GRADES', function () {
+  const context = harness.boot()
+  const terminal = harness.readGlobal(context, 'OUTCOME_TERMINAL_GRADES')
+  const negative = harness.readGlobal(context, 'OUTCOME_NEGATIVE_GRADES')
+  assert.notStrictEqual(terminal.indexOf('later_batch_fix'), -1)
+  assert.notStrictEqual(negative.indexOf('later_batch_fix'), -1)
+})
+
+test('diffOutcomeGrades: later_batch_fix is skip-terminal — a settled later_batch_fix in the prior ledger is never re-emitted', function () {
+  const context = harness.boot()
+  const prior = [context.buildOutcomeLine({ run_tag: 'r1', batch_pr: 1, issue: 5, grade: 'later_batch_fix', decided_at: 'x' })]
+  const current = [context.buildOutcomeLine({ run_tag: 'r1', batch_pr: 1, issue: 5, grade: 'clean', decided_at: 'y' })]
+  const diff = context.diffOutcomeGrades(current, prior)
+  assert.strictEqual(diff.length, 0)
+})
+
+test('deriveNegativeOutcomeEvents: a later_batch_fix ledger line is emitted (it is a member of OUTCOME_NEGATIVE_GRADES)', function () {
+  const context = harness.boot()
+  const lines = [rawLedgerLine(context, { grade: 'later_batch_fix' })]
+  const out = context.deriveNegativeOutcomeEvents(lines)
+  assert.strictEqual(out.length, 1)
+  assert.strictEqual(out[0].grade, 'later_batch_fix')
+})

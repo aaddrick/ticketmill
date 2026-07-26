@@ -5891,14 +5891,22 @@ function buildBudgetEstimateMap(history, units) {
 // rule). 'pending' and 'clean' are deliberately excluded: 'pending' is a
 // placeholder by definition, and 'clean' stays open to correction (a PR
 // certified clean today can still be reverted next week) — only a target that
-// can never produce new signal (a revert/reopen/hotfix already happened, or the
-// PR never merged at all) is truly done.
-const OUTCOME_TERMINAL_GRADES = ['reverted', 'reopened', 'hotfix', 'closed_unmerged', 'abandoned']
+// can never produce new signal (a revert/reopen/hotfix/later_batch_fix already
+// happened, or the PR never merged at all) is truly done. 'later_batch_fix'
+// (issue #104) is terminal for the same reason 'hotfix' is: once a later PR's
+// own blame-forward resolution has named this batch PR's merge SHA as the
+// origin of the lines it just repaired, that fact never un-happens.
+const OUTCOME_TERMINAL_GRADES = ['reverted', 'reopened', 'hotfix', 'later_batch_fix', 'closed_unmerged', 'abandoned']
 // OUTCOME_NEGATIVE_GRADES: the anti-Goodhart quality-negative signals proper —
 // excludes closed_unmerged/abandoned, which are a terminal ESCAPE for a target
 // that can never reach "clean" (no merge occurred), not evidence of a bad
-// outcome, so they must not inflate a negative-outcome rate.
-const OUTCOME_NEGATIVE_GRADES = ['reverted', 'reopened', 'hotfix']
+// outcome, so they must not inflate a negative-outcome rate. 'later_batch_fix'
+// (issue #104) belongs here: a later PR blame-forward-resolved to this batch
+// PR's own merge SHA is exactly the kind of quality-negative "this shipped a
+// defect that needed a real repair" signal reverted/reopened/hotfix already
+// capture, just via a different, stronger-evidence mechanism than bare
+// changed_files overlap (see computeLaterBatchFix below).
+const OUTCOME_NEGATIVE_GRADES = ['reverted', 'reopened', 'hotfix', 'later_batch_fix']
 
 // outcomeLineKey: the ledger's identity key — run_tag + batch_pr + issue (one row
 // per member issue of a batch PR, not one row per PR, so a multi-issue batch PR
@@ -5935,7 +5943,14 @@ function ageInDays(isoTimestamp, now) {
 // pickOutcomeSignals: the compact, audit-friendly subset of an observation's raw
 // fields carried onto the ledger line as `signals` — enough to explain WHY a
 // grade was assigned (mirrors gate_yield's raw-count-alongside-verdict idiom)
-// without echoing back the full agent payload.
+// without echoing back the full agent payload. later_fix_pr/batch_pr_merge_sha/
+// churned_regions (issue #104) are the raw inputs computeLaterBatchFix decides
+// the later_batch_fix grade from — carried through verbatim (same fail-open
+// defaulting as every other field here) so a ledger line can be audited without
+// re-deriving the blame-forward resolution. Deliberately excludes the later
+// fix's raw body text (isPlannedFollowup's input) — that's prose, not a compact
+// signal, and the grade it excluded/didn't-exclude is already legible from
+// which grade got written.
 function pickOutcomeSignals(observation) {
   const o = observation || {}
   return {
@@ -5946,7 +5961,67 @@ function pickOutcomeSignals(observation) {
     hotfix_pr: o.hotfix_pr != null ? o.hotfix_pr : null,
     issue_state: o.issue_state != null ? o.issue_state : null,
     abandoned: !!o.abandoned,
+    later_fix_pr: o.later_fix_pr != null ? o.later_fix_pr : null,
+    batch_pr_merge_sha: o.batch_pr_merge_sha != null ? o.batch_pr_merge_sha : null,
+    churned_regions: Array.isArray(o.churned_regions) ? o.churned_regions : [],
   }
+}
+
+// computeLaterBatchFix (issue #104): the sole place the later_batch_fix grade
+// decision is made — reintroduces the v1-dropped "this batch caused a later
+// fix" signal, but gated on a fundamentally different, stronger mechanism than
+// the raw changed_files overlap plan review rejected (guaranteed-coincidental
+// in this repo, where every tier touches workflows/ticketmill.js). Instead of
+// "did the two diffs touch the same file", this asks "did the later fix PR's
+// own blame-forward resolution name THIS batch PR's own squash-merge commit as
+// the SHA that introduced the lines it just changed" — proof the later fix is
+// repairing a line the batch PR itself wrote, resolved entirely in the later
+// PR's own coordinate space (a read-only `git blame` on the pre-image lines it
+// replaced), never a synthesized/translated hunk-range intersection across two
+// diffs' distinct coordinate spaces (the mechanism approach-challenge
+// iteration 1 replaced).
+//
+// observation.churned_regions: an array of { file, blamed_shas } entries — one
+// per churned region (hunk) in the later fix PR's diff, each already resolved
+// live by the Select-phase agent. blamed_shas is itself an array (a region can
+// span lines last touched by more than one prior commit) of commit SHA
+// strings.
+//
+// Fires iff observation.batch_pr_merge_sha is a non-empty string AND appears
+// in the UNION of every region's blamed_shas. Fails open to false on anything
+// malformed or missing (no batch_pr_merge_sha, no churned_regions, a region
+// missing blamed_shas) — same fail-open ethos as ageInDays/deriveAbandoned: an
+// unresolvable signal must never manufacture a grade.
+function computeLaterBatchFix(observation) {
+  const o = observation || {}
+  const sha = o.batch_pr_merge_sha
+  if (typeof sha !== 'string' || sha === '') return false
+  const regions = Array.isArray(o.churned_regions) ? o.churned_regions : []
+  for (const region of regions) {
+    if (!region) continue
+    const blamed = Array.isArray(region.blamed_shas) ? region.blamed_shas : []
+    if (blamed.indexOf(sha) !== -1) return true
+  }
+  return false
+}
+
+// isPlannedFollowup (issue #104): the planning-edge exclusion validated by task
+// 1 against real history — a later PR/issue whose OWN body declares itself a
+// pre-planned continuation of prior work (not a reactive repair) must never be
+// graded later_batch_fix, no matter what computeLaterBatchFix's blame-forward
+// resolution finds. Case-insensitive substring match against a small,
+// deliberately narrow set of planning phrases. Task 1 confirmed this drops
+// #103's body ("Follow-up from #92") but does NOT drop reactive-repair
+// language like "regression introduced by", which must stay eligible.
+// Non-string input (missing body) degrades to '' — never planned, never
+// throws.
+function isPlannedFollowup(bodyText) {
+  const text = typeof bodyText === 'string' ? bodyText.toLowerCase() : ''
+  const PLANNED_PHRASES = ['follow-up from', 'follow up from', 'depends on', 'deferred from']
+  for (const phrase of PLANNED_PHRASES) {
+    if (text.indexOf(phrase) !== -1) return true
+  }
+  return false
 }
 
 // gradeFromObservation (issue #92): the deterministic grade decision. Takes ONE
@@ -5966,13 +6041,20 @@ function pickOutcomeSignals(observation) {
 //   1. reverted   — a revert commit referencing this PR/issue was found.
 //   2. reopened   — the issue's timeline shows it reopened after this run closed it.
 //   3. hotfix     — a later PR cross-references this issue as a fix for it.
-//   4. closed_unmerged — batch_pr closed without ever merging: this target can
+//   4. later_batch_fix (issue #104) — computeLaterBatchFix's blame-forward
+//      resolution named this batch PR's own merge SHA as the origin of the
+//      lines a later PR just repaired, AND that later PR/issue isn't itself
+//      declaring a pre-planned continuation (isPlannedFollowup). Sits below
+//      hotfix (a same-issue cross-referenced fix is the stronger, more direct
+//      claim) and above closed_unmerged/abandoned (a real later fix landing is
+//      strictly more informative than either terminal escape).
+//   5. closed_unmerged — batch_pr closed without ever merging: this target can
 //      never reach "clean" (there was nothing to hold up), so it gets a terminal
 //      escape now instead of sitting `pending` forever.
-//   5. abandoned  — the issue itself was abandoned (closed, no PR ever merged),
+//   6. abandoned  — the issue itself was abandoned (closed, no PR ever merged),
 //      same terminal-escape reasoning as closed_unmerged.
-//   6. clean      — merged, no negative signal, and >= min_age_days old.
-//   7. pending    — everything else (merged but still too young, or state unknown).
+//   7. clean      — merged, no negative signal, and >= min_age_days old.
+//   8. pending    — everything else (merged but still too young, or state unknown).
 function gradeFromObservation(observation, now, cfg) {
   const o = observation || {}
   const c = cfg || OUTCOME_GRADING
@@ -5982,6 +6064,9 @@ function gradeFromObservation(observation, now, cfg) {
   if (o.reverted) return { grade: 'reverted', signals: signals }
   if (o.reopened) return { grade: 'reopened', signals: signals }
   if (o.hotfix_pr) return { grade: 'hotfix', signals: signals }
+  if (computeLaterBatchFix(o) && !isPlannedFollowup(o.later_fix_body)) {
+    return { grade: 'later_batch_fix', signals: signals }
+  }
   if (o.pr_state === 'closed' && !o.merged_at) return { grade: 'closed_unmerged', signals: signals }
   if (o.abandoned) return { grade: 'abandoned', signals: signals }
 
