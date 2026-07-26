@@ -179,6 +179,34 @@ test('gradeFromObservation: signals object always carries the raw fields the gra
   assert.strictEqual(plain(g.signals).pr_state, 'merged')
 })
 
+test('gradeFromObservation: signals threads later_fix_pr/batch_pr_merge_sha/churned_regions (issue #104 audit-trail fields) through verbatim when present', function () {
+  const context = harness.boot()
+  const obs = baseObservation({
+    merged_at: daysAgoIso(10),
+    later_fix_pr: 321,
+    batch_pr_merge_sha: 'cafef00d',
+    churned_regions: [{ file: 'workflows/ticketmill.js', blamed_shas: ['cafef00d'] }],
+  })
+  const g = context.gradeFromObservation(obs, NOW, { min_age_days: 7 })
+  const signals = plain(g.signals)
+  assert.strictEqual(signals.later_fix_pr, 321)
+  assert.strictEqual(signals.batch_pr_merge_sha, 'cafef00d')
+  assert.deepStrictEqual(signals.churned_regions, [{ file: 'workflows/ticketmill.js', blamed_shas: ['cafef00d'] }])
+})
+
+test('gradeFromObservation: signals fail-opens later_fix_pr/batch_pr_merge_sha to null and churned_regions to [] when absent from the observation', function () {
+  const context = harness.boot()
+  // baseObservation deliberately omits later_fix_pr/batch_pr_merge_sha/churned_regions —
+  // pickOutcomeSignals must default each independently (not share one sentinel),
+  // same fail-open contract as every other signals field.
+  const obs = baseObservation({ merged_at: daysAgoIso(10) })
+  const g = context.gradeFromObservation(obs, NOW, { min_age_days: 7 })
+  const signals = plain(g.signals)
+  assert.strictEqual(signals.later_fix_pr, null)
+  assert.strictEqual(signals.batch_pr_merge_sha, null)
+  assert.deepStrictEqual(signals.churned_regions, [])
+})
+
 // ---- buildOutcomeLine: schema_version stamp + compact shape ----
 
 test('buildOutcomeLine stamps schema_version:1 and carries every field verbatim', function () {
