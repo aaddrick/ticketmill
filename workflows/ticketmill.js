@@ -3097,8 +3097,7 @@ async function probeChangedFiles(ctx) {
 // degrade-recorded via ctx.deferred, never blocks — mirrors probeChangedFiles.
 async function probeCommitShas(ctx) {
   if (!ctx.postedCommits.length) return
-  const shas = []
-  for (const p of ctx.postedCommits) { if (shas.indexOf(p.commit) === -1) shas.push(p.commit) }
+  const shas = [...new Set(ctx.postedCommits.map(function (p) { return p.commit }))]
   const probe = await stage(ctx, 'commit-sha-probe', [
     'READ-ONLY probe for issue #' + ctx.issue + ': confirm each commit SHA below actually exists in worktree ' + ctx.worktree + '.',
     'For EACH sha in the list, run exactly (substituting the sha):',
