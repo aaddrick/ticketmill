@@ -1,9 +1,42 @@
 # Changelog
 
-## [0.1.40] - 2026-07-26-docs
+## 0.1.40 (2026-07-26)
 
-- docs: split ARCHITECTURE.md into a docs/architecture/ subfolder, leave the old path as a pointer (#154)
-- issue #155 (#155)
+Documentation only. Two files had grown into things nobody reads end to end:
+`docs/ARCHITECTURE.md` at 78KB and 32 sections, and a `README.md` that stopped
+being a front page somewhere around the profile schema table. Both are now
+split by what a reader is actually there for.
+
+The architecture write-up moves to `docs/architecture/`, nine topic files plus
+an index: pipeline, agents and models, profile and environment, invocation and
+guardrails, branching and merge, metrics, cost and tokens, scheduling, failure
+semantics. `docs/ARCHITECTURE.md` stays at its old path as a pointer carrying
+the file map, which matters more than it looks: four agent charters, both
+diagram guides, and a long tail of CHANGELOG history cite that path by name,
+and the stub keeps every one of them resolving.
+
+README keeps what someone deciding whether to try the tool needs and hands the
+rest to seven topic documents under `docs/`: getting started, run options,
+profile, agents, skills, running a batch, and troubleshooting. `docs/index.md`
+is the home that reaches all of them.
+
+The split is a verbatim extraction, not a rewrite, and it is enforced rather
+than asserted. `tests/architecture-provenance.test.js` hashes the reconstructed
+segments against a checked-in fixture, so prose that drifts during the move
+fails the suite instead of shipping quietly. `tests/docs-links.test.js` resolves
+every relative link in every tracked markdown file and checks two-hop
+reachability from `docs/index.md`; `tests/architecture-split.test.js` and
+`tests/readme-docs-census.test.js` cover the rest. The suite is 596 tests.
+
+Referrers were repointed in the same pass: the four charters in
+`.claude/agents/`, `docs/diagrams/{AGENTS,CLAUDE}.md`, and
+`docs/diagrams/render.sh`. The six `<picture>` blocks that moved a directory
+down now use `../diagrams/`. Two engine comments still name the old path and
+were left alone deliberately, since `workflows/ticketmill.js` and its lockstep
+mirror are engine-owned and outside a docs issue's scope; the stub keeps them
+working, and #160 tracks the cleanup.
+
+Issues #154 and #155. Follow-ups filed: #157, #159, #160.
 
 ## 0.1.39 (2026-07-26)
 
