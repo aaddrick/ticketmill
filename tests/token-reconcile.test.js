@@ -85,3 +85,105 @@ test('reconcile_error is 0 for an exactly-attributed run', function () {
   assert.strictEqual(agg.reconcile_error, 0)
   assert.strictEqual(agg.attributed, 300)
 })
+
+// ---- issue #111: the 5-arg poolSpend path re-scopes reconcile_error to the
+// per-issue-attributable pool slice, surfacing the run-total-vs-pool gap as
+// its own named orchestration_overhead field instead of folding it into the
+// attribution-error signal. ----
+
+// Shared fixture: a single-issue full-pipeline run where late, unbracketed
+// stages (PR-review/merge/report/retrospective/outcome-grading/revisit-probe)
+// dominate the run total, but the per-issue pool itself (poolSpend, bracketed
+// immediately around runPool() by the caller) reconciles almost exactly
+// against what the per-issue row + stage buckets attribute inside it.
+function poolFixture() {
+  return {
+    results: [
+      {
+        issue: 1,
+        tokens: {
+          total: 98,
+          byModel: { opus: 98 },
+          tracked: true,
+          byStage: { implement: 70, 'quality-fix-i1': 28 },
+        },
+      },
+    ],
+    byStage: { preflight: 15, select: 5 },
+    poolSpend: 100,
+    runTotal: 1200, // heavy late-stage overhead the pool never saw
+  }
+}
+
+test('poolSpend (issue #111): single-issue full-pipeline fixture with heavy late-stage overhead reconciles under the trust threshold via the pool-scoped denominator', function () {
+  const context = harness.boot()
+  const f = poolFixture()
+  const agg = context.aggregateTokens(f.results, f.runTotal, 1, f.byStage, f.poolSpend)
+
+  assert.strictEqual(agg.run_total, f.runTotal)
+  assert.strictEqual(agg.pool_spend, f.poolSpend)
+  // perIssueSum (98) vs poolSpend (100) -> |100-98|/100 = 0.02, well under the
+  // 0.05 trust threshold, even though run_total (1200) dwarfs the pool.
+  assert.ok(Math.abs(agg.reconcile_error - (2 / 100)) < 1e-9)
+  assert.ok(agg.reconcile_error < 0.05, 'pool-scoped reconcile_error must clear the trust threshold despite the huge run_total')
+  // orchestration_overhead is the honest run-total-vs-pool gap, reported as
+  // its own field rather than folded into reconcile_error.
+  assert.strictEqual(agg.orchestration_overhead, f.runTotal - f.poolSpend)
+  // attributed/run_total are UNCHANGED by poolSpend: per-issue total (98) plus
+  // both stage buckets (15 + 5) still fold into sumDeltas exactly once.
+  assert.strictEqual(agg.attributed, 98 + 15 + 5)
+})
+
+test('poolSpend (issue #111): feeding that TOKEN_AGG into computeReworkTax flips trusted true (the acceptance gate)', function () {
+  const context = harness.boot()
+  const f = poolFixture()
+  const tokenAgg = context.aggregateTokens(f.results, f.runTotal, 1, f.byStage, f.poolSpend)
+
+  const rt = context.computeReworkTax(f.results, tokenAgg)
+
+  assert.strictEqual(rt.trusted, true)
+  assert.strictEqual(rt.suppressed_reason, null)
+  // the rework-bearing byStage classifies as expected: 28 rework / 70 first-pass.
+  assert.strictEqual(rt.run_rework, 28)
+  assert.strictEqual(rt.run_first_pass, 70)
+  assert.strictEqual(rt.has_signal, true)
+})
+
+test('poolSpend (issue #111): concurrency>1 pool over-count still yields a large reconcile_error and computeReworkTax reports untrusted', function () {
+  const context = harness.boot()
+  const results = [
+    { issue: 1, tokens: { total: 200, byModel: { opus: 200 }, tracked: true, byStage: { implement: 150, 'quality-fix-i1': 50 } } },
+    { issue: 2, tokens: { total: 200, byModel: { opus: 200 }, tracked: true, byStage: { implement: 200 } } },
+  ]
+  // Overlapping concurrent stages over-count a shared monotonic counter: the
+  // per-issue sum (400) exceeds the true pool spend (300).
+  const poolSpend = 300
+  const runTotal = 350
+  const agg = context.aggregateTokens(results, runTotal, 2, {}, poolSpend)
+
+  assert.strictEqual(agg.attributed, 400, 'per-issue sums still fold into sumDeltas unchanged by poolSpend')
+  assert.ok(Math.abs(agg.reconcile_error - (Math.abs(poolSpend - 400) / poolSpend)) < 1e-9)
+  assert.ok(agg.reconcile_error > 0.05, 'concurrency>1 over-count must still blow past the trust threshold under the pool-scoped formula')
+
+  const rt = context.computeReworkTax(results, agg)
+  assert.strictEqual(rt.trusted, false)
+  assert.ok(rt.suppressed_reason.indexOf('exceeds the trust threshold') !== -1)
+})
+
+test('poolSpend (issue #111): omitting the 5th arg reproduces pre-#111 reconcile_error exactly, with pool_spend/orchestration_overhead both null', function () {
+  const context = harness.boot()
+  const results = [
+    { issue: 1, tokens: { total: 100, byModel: { opus: 100 }, tracked: true } },
+    { issue: 2, tokens: { total: 150, byModel: { opus: 150 }, tracked: true } },
+  ]
+  const agg4 = context.aggregateTokens(results, 300, 1, {}) // 4-arg call
+  const agg3 = context.aggregateTokens(results, 300, 1) // 3-arg call
+
+  for (const agg of [agg3, agg4]) {
+    assert.strictEqual(agg.pool_spend, null)
+    assert.strictEqual(agg.orchestration_overhead, null)
+    // matches the pre-#111 |spent - attributed| / spent formula, byte-identical
+    // to the first test in this file (spent 300, attributed 250).
+    assert.ok(Math.abs(agg.reconcile_error - (50 / 300)) < 1e-9)
+  }
+})
