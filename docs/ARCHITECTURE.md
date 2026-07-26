@@ -844,14 +844,16 @@ either. Every bracketed region sits strictly before `runPool()`, the only
 concurrent region in the engine, so these deltas stay exact regardless of
 `CONCURRENCY` even when the per-issue breakdown below them doesn't.
 
-`aggregateTokens(results, spent, concurrency, byStage)` turns the per-issue
-deltas, plus that `STAGE_TOKENS` map, into a "## Token Usage" section in plain
-JS. The pipeline injects the finished markdown into the batch PR and run
-report prompts verbatim, so no subagent is ever asked to sum or double-check
-the arithmetic. `byStage` is optional and defaults to `{}`, so 3-arg callers
-still work; each nonzero bucket folds into the running sum exactly once and
-renders as its own labeled row ("preflight (orchestration)", "select-phase
-(orchestration)"), never silently absorbed into the remainder row below it.
+`aggregateTokens(results, spent, concurrency, byStage, poolSpend)` turns the
+per-issue deltas, plus that `STAGE_TOKENS` map, into a "## Token Usage"
+section in plain JS. The pipeline injects the finished markdown into the
+batch PR and run report prompts verbatim, so no subagent is ever asked to sum
+or double-check the arithmetic. `byStage` is optional and defaults to `{}`,
+so 3-arg callers still work; each nonzero bucket folds into the running sum
+exactly once and renders as its own labeled row ("preflight (orchestration)",
+"select-phase (orchestration)"), never silently absorbed into the remainder
+row below it. `poolSpend`, a 5th optional argument, re-scopes the
+`reconcile_error` signal (issue #111, below).
 
 Only the per-issue rows are affected by concurrency. At concurrency 1, an
 issue's stage deltas can't overlap, so they're an exact partition of that
@@ -889,6 +891,48 @@ total or the stage buckets).
 Tokens only, never dollars: price varies by model and shifts over time, so no
 currency figure appears anywhere in the engine, profile, or output. The
 per-model-tier breakdown is what lets a human run that math outside the tool.
+
+### Closing the attribution gap: reconcile_error re-scoped to the pool (issue #111)
+
+`reconcile_error` had a floor problem baked into its own denominator. It
+divided the attribution gap by the full run total, `spent`, and that total
+always includes PR-review, merge, report, retrospective, and outcome-grading
+spend, none of which `stage()` ever brackets. Even a perfectly-attributed
+per-issue pool still reported a permanent, nonzero `reconcile_error`, roughly
+a quarter of spend on a typical concurrency-1 run. `computeReworkTax`'s 0.05
+trust gate could never clear that floor, so the rework-tax signal went quiet
+on nearly every real run, defeating the point of #90's own reconciliation
+check.
+
+**`POOL_SPEND` brackets the one concurrent region from outside it.** The run
+body now samples `spentTokens()` immediately before and after the
+`runPool()` call, the same before/after idiom `addStage()` already uses for
+the preflight/select brackets above. The delta stays exact regardless of
+`CONCURRENCY`, since it's sampled outside any per-issue stage's own tracking.
+
+**When `poolSpend` is finite, `reconcile_error` re-scopes to it.** The
+denominator becomes `poolSpend`, and the numerator becomes `perIssueSum`, the
+per-issue tracked totals only, never the stage buckets (those are bracketed
+outside the pool by construction and were never part of what `poolSpend`
+measures). At concurrency 1 this reconciles near-exactly, since both sides
+sum the same contiguous deltas, and it still catches a future bare-`agent()`
+regression inside the pool at any concurrency. The run-total-vs-pool gap
+itself doesn't disappear. It surfaces honestly as its own
+`orchestration_overhead` field, `max(0, spent - poolSpend)`, rendered as its
+own markdown line, instead of being folded into (or driving) the
+attribution-error signal. `pool_spend` and `orchestration_overhead` are both
+`null` when `poolSpend` is absent or non-finite, and every existing 3-/4-arg
+caller keeps the pre-#111 formula byte for byte. `run_total`, `attributed`,
+and `remainder` are unchanged either way: they still describe the full run
+against the full `sumDeltas`.
+
+The estimator's coarser 0.5 bar (`ESTIMATOR_MAX_RECONCILE_ERROR`, "Cost
+estimator" below) predates this fix and was sized to admit that ~0.26
+baseline as expected, not pathological. Runs recorded going forward carry the
+pool-scoped `reconcile_error` instead, so a clean concurrency-1 run now
+reconciles near 0. The 0.5 bar stays in place unchanged: it's headroom for
+older ledger rows recorded under the pre-#111 formula now, rather than a
+ceiling calibrated to an expected quarter of unattributed spend.
 
 ### Budget-exhaustion detection: a noun+verb match, not a keyword sweep
 
@@ -952,11 +996,15 @@ keeps a `by_issue_shape` row only when its parent run has
 concurrency, see "Token tracking" above), `member_count === 1` (a group's
 whole-group total would inflate a singleton's band), and a `reconcile_error`
 at or under 0.5. That bar is deliberately coarser than the 0.05 one
-`computeReworkTax` uses to trust a run's own numbers: a clean single-lane
-run still leaves roughly a quarter of its spend as orchestration overhead
-that no per-issue row claims, the same shape `aggregateTokens` already
-documents, so the strict bar would starve the estimator down to almost no
-history at all. Rows are bucketed by predicted-files band (`0`, `1`, `2-3`,
+`computeReworkTax` uses to trust a run's own numbers. Before issue #111
+re-scoped `reconcile_error` to the per-issue pool (see "Closing the
+attribution gap" above), a clean single-lane run still left roughly a
+quarter of its spend as unbracketed orchestration overhead, and the strict
+bar would have starved the estimator down to almost no history at all. The
+0.5 bar stays unchanged, now mostly headroom for older ledger rows recorded
+under the pre-#111 formula: a run recorded after the fix reconciles near 0 at
+concurrency 1 and clears either bar easily. Rows are bucketed by
+predicted-files band (`0`, `1`, `2-3`,
 `4-7`, `8-15`, `16+`), and a band only reports a median once it holds 3 or
 more samples. Below that it degrades to `{estimate: null, confidence:
 'insufficient'}` rather than print a number built from one or two data

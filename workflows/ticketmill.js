@@ -2051,18 +2051,53 @@ const STAGE_LABELS = { preflight: 'preflight (orchestration)', select: 'select-p
 //                  where every per-issue result is untracked but the stage
 //                  buckets are populated (e.g. a resumed run) still counts as
 //                  "tracked" and still renders a breakdown, via anyStage.
+//   poolSpend    - optional (issue #111; absent/non-finite preserves every
+//                  byte of pre-#111 behavior for existing 3-/4-arg callers,
+//                  including reconcile_error's denominator): the exact
+//                  budget.spent() delta bracketed immediately around the
+//                  runPool() call (sampled OUTSIDE this function, by the
+//                  caller — see the runPool() call site), i.e. the per-issue
+//                  pool's own share of the run. When finite, reconcile_error
+//                  is RE-SCOPED off the full run total to this pool-scoped
+//                  denominator: |poolSpend - perIssueSum| / poolSpend, where
+//                  perIssueSum is ONLY the per-issue tracked totals (NOT
+//                  byStage's preflight/select buckets, which are bracketed
+//                  outside the pool by construction and so are never part of
+//                  what poolSpend measures). At concurrency 1 this reconciles
+//                  near-exactly (both sides sum the same contiguous
+//                  spentTokens() deltas), same caveat as `reconciles` above —
+//                  it still catches a future bare-agent() regression inside
+//                  the pool, and remains a real (non-tautological) check at
+//                  concurrency > 1. The run-total-vs-pool gap (max(0, spent -
+//                  poolSpend) — preflight/select-phase orchestration plus
+//                  anything else sampled outside the pool, e.g. the
+//                  claims-release sweep) is surfaced honestly as its own
+//                  `orchestration_overhead` field/markdown line instead of
+//                  being folded into (or driving) the attribution-error
+//                  signal. `pool_spend`/`orchestration_overhead` are both null
+//                  when poolSpend is absent/non-finite. run_total/attributed/
+//                  remainder (below) are UNCHANGED by poolSpend — they still
+//                  describe the full run against the full sumDeltas, exactly
+//                  as before.
 // remainder (whatever budget.spent() counted that no per-issue row or stage
 // bucket attributed — max(0, spent - sumDeltas)) is computed and rendered as
 // its own "orchestration/unattributed" row whenever `spent` is available,
 // regardless of concurrency/reconciles — including the approximate
 // concurrency>1 case, so that spend is never left implicit — since the stage
 // buckets are already folded into sumDeltas, it is never double-counted.
-function aggregateTokens(results, spent, concurrency, byStage) {
+function aggregateTokens(results, spent, concurrency, byStage, poolSpend) {
   const list = results || []
   const stages = byStage || {}
   const byIssue = []
   const byModel = {}
   let sumDeltas = 0
+  // perIssueSum (issue #111): the per-issue-attributable slice only — NOT
+  // stage buckets (those are bracketed outside the pool by construction, see
+  // the poolSpend param doc above) — tracked separately from sumDeltas
+  // (which still folds stage buckets in, for run_total/attributed/remainder,
+  // unchanged from pre-#111 behavior) so the re-scoped reconcile_error has
+  // the right numerator when poolSpend is finite.
+  let perIssueSum = 0
   let anyTracked = false
 
   for (const r of list) {
@@ -2071,6 +2106,7 @@ function aggregateTokens(results, spent, concurrency, byStage) {
       anyTracked = true
       const total = t.total || 0
       sumDeltas += total
+      perIssueSum += total
       byIssue.push({ issue: r.issue, total: total, by_model: Object.assign({}, t.byModel || {}), tracked: true })
       const models = t.byModel || {}
       for (const m in models) {
@@ -2106,24 +2142,44 @@ function aggregateTokens(results, spent, concurrency, byStage) {
   const tracked = trackedAny || hasSpent
   const reconciles = hasSpent && trackedAny && (concurrency === 1 || !anyTracked)
   const remainder = hasSpent ? Math.max(0, spent - sumDeltas) : null
-  // reconcile_error (issue #90): the HONEST, concurrency-independent reconciliation
-  // signal, unlike `reconciles` (which is defined true whenever concurrency===1 and
-  // some spend is tracked, OR whenever concurrency>1 but no per-issue row is tracked
-  // (trackedAny is carried entirely by exact, region-bracketed stage buckets, so
-  // there's no per-issue over-count to guard against) — in neither case ever
-  // comparing the attributed sum to the real total — so a concurrency:1 run reports
-  // reconciles:true even with a large unattributed gap). reconcile_error = |spent -
-  // attributed| / spent captures both
-  // failure modes: the concurrency>1 over-count (attributed > spent, error grows past
-  // 0) AND the concurrency:1 under-attribution (the ~26% of PR-review/merge/report
-  // spend left unbracketed — attributed < spent). Downstream efficiency metrics
-  // (rework-tax, issue #91) MUST gate on this fraction being small, never on the
-  // `reconciles` boolean. null when budget.spent() is unavailable, or when spent is 0
-  // and nothing was attributed (trivially exact, error 0) — see below.
+  const hasPoolSpend = isFiniteNumber(poolSpend)
+  // reconcile_error (issue #90, re-scoped by #111): the HONEST reconciliation
+  // signal downstream efficiency metrics (rework-tax, issue #91) MUST gate on,
+  // never on the `reconciles` boolean above (which is defined true whenever
+  // concurrency===1 and some spend is tracked, OR whenever concurrency>1 but
+  // no per-issue row is tracked — in neither case ever comparing the
+  // attributed sum to a real total).
+  //
+  // When poolSpend is finite (issue #111): re-scoped to the per-issue-
+  // attributable slice — reconcile_error = |poolSpend - perIssueSum| /
+  // poolSpend, where poolSpend is the exact budget.spent() delta bracketed
+  // around the runPool() call and perIssueSum is ONLY the per-issue tracked
+  // totals (stage buckets are bracketed outside the pool, so they're outside
+  // this denominator too — see the poolSpend param doc above). This avoids
+  // the old formula's dominant failure mode: unbracketed late-stage spend
+  // (PR-review/merge/report/retrospective/...) inflating |spent -
+  // attributed| against the FULL run total even though that spend was never
+  // attributable to a per-issue row in the first place. The run-total-vs-pool
+  // gap is surfaced honestly instead, as orchestration_overhead below.
+  //
+  // When poolSpend is absent/non-finite: falls back to the pre-#111 formula,
+  // byte-identical for existing 3-/4-arg callers — reconcile_error = |spent -
+  // attributed| / spent, null when budget.spent() is unavailable, or when
+  // spent is 0 and nothing was attributed (trivially exact, error 0).
   const attributed = sumDeltas
-  const reconcileError = !hasSpent
-    ? null
-    : (spent > 0 ? Math.abs(spent - sumDeltas) / spent : (sumDeltas === 0 ? 0 : null))
+  const reconcileError = hasPoolSpend
+    ? (poolSpend > 0 ? Math.abs(poolSpend - perIssueSum) / poolSpend : (perIssueSum === 0 ? 0 : null))
+    : (!hasSpent
+        ? null
+        : (spent > 0 ? Math.abs(spent - sumDeltas) / spent : (sumDeltas === 0 ? 0 : null)))
+  // pool_spend / orchestration_overhead (issue #111): both null unless
+  // poolSpend is finite. orchestration_overhead is the honest run-total-vs-
+  // pool gap (max(0, spent - poolSpend)) — e.g. preflight/select-phase
+  // orchestration plus anything else sampled outside the pool before this
+  // aggregation runs (see the poolSpend param doc above) — reported as its
+  // own named field/line rather than folded into (or driving) reconcile_error.
+  const poolSpendOut = hasPoolSpend ? poolSpend : null
+  const orchestrationOverhead = (hasSpent && hasPoolSpend) ? Math.max(0, spent - poolSpend) : null
   const models = Object.keys(byModel).sort()
 
   const lines = []
@@ -2132,6 +2188,9 @@ function aggregateTokens(results, spent, concurrency, byStage) {
   lines.push(hasSpent
     ? 'Run total (output tokens, via budget.spent()): **' + spent + '**'
     : 'Run total: not tracked (budget.spent() unavailable this run)')
+  if (hasSpent && hasPoolSpend) {
+    lines.push('Orchestration overhead (outside the per-issue pool): **' + orchestrationOverhead + '**')
+  }
   lines.push('')
 
   if (!tracked) {
@@ -2190,6 +2249,8 @@ function aggregateTokens(results, spent, concurrency, byStage) {
     remainder: remainder,
     attributed: attributed,
     reconcile_error: reconcileError,
+    pool_spend: poolSpendOut,
+    orchestration_overhead: orchestrationOverhead,
     tracked: tracked,
     reconciles: reconciles,
     markdown: lines.join('\n'),
@@ -5381,6 +5442,8 @@ function buildRunRecord(f) {
       by_stage: t.by_stage,
       attributed: t.attributed,
       reconcile_error: t.reconcile_error,
+      pool_spend: t.pool_spend,
+      orchestration_overhead: t.orchestration_overhead,
       tracked: t.tracked,
       reconciles: t.reconciles,
     },
@@ -7216,7 +7279,17 @@ if (isFiniteNumber(tokenBudgetResolved.budget)) {
 const TOKEN_BUDGET_CTX = { budget: tokenBudgetResolved.budget, estimateByIssue: budgetEstimate.estimateByIssue }
 
 // ---- Process: per-issue pipeline with issue-level concurrency + breakers ----
+// poolBefore/poolAfter (issue #111): bracket the ONE concurrent region
+// (runPool() drains `units` through processIssue at CONCURRENCY, so this is
+// the only place multiple issues' agent() calls can overlap) from OUTSIDE it
+// — exact regardless of CONCURRENCY, same addStage() idiom as the
+// STAGE_TOKENS preflight/select brackets above, just inlined here since the
+// delta (POOL_SPEND, below) feeds aggregateTokens' new 5th param rather than
+// a STAGE_TOKENS bucket.
+const poolBefore = spentTokens()
 const results = await runPool(units, CONCURRENCY, processIssue, lanes, TOKEN_BUDGET_CTX)
+const poolAfter = spentTokens()
+const POOL_SPEND = (isFiniteNumber(poolBefore) && isFiniteNumber(poolAfter)) ? Math.max(0, poolAfter - poolBefore) : null
 
 const counts = {}
 for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1
@@ -7264,7 +7337,7 @@ if (HELD_CLAIMS.length) {
 }
 
 // ---- Token usage: JS-computed aggregation (no LLM math), injected verbatim below ----
-const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY, STAGE_TOKENS)
+const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY, STAGE_TOKENS, POOL_SPEND)
 
 // ---- Merge auto-resolution: JS-computed run-level rollup, injected verbatim below ----
 const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)
