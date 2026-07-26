@@ -1861,6 +1861,52 @@ const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotch
 const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> log -1 --format=%H — it prints the ' +
   'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
   'or recall a SHA from memory.'
+
+// ----- preflight step 5 (predicted_files lane-scheduling hint) (issue #113) -----
+// A PURE FUNCTION of (ROOT, TARGET), NOT a plain string: it is invoked at the
+// preflight call site (below the TICKETMILL-TEST-HARNESS-SPLIT marker) with the
+// runtime ROOT/TARGET values discovered by the bootstrap probe. ROOT/TARGET are
+// module-scope `let = null` and only assigned real values below the split marker
+// (~6442/6561/6572) — a load-time string here would capture null and bake
+// `git -C null ... origin/null` into every probe, regressing predicted_files to []
+// for every issue. Retro (#94, 'add skills/mill-review/SKILL.md'): the original
+// step-5 identifier->tree resolution (5b/5c below) always falls through to a
+// broad `git grep`/`git ls-tree` match against origin/TARGET, and the two
+// ~7,300-line engine copies plus .claude/ticketmill.json mention nearly every
+// ticketmill concept — so a net-new skill/doc issue's generic identifiers
+// grep-match the engine cluster while the not-yet-created asset path itself
+// resolves to nothing, yielding a precision-0 engine-cluster prediction instead
+// of the real (narrow) diff. The deliverable-shape gate below intercepts that
+// case before the broad resolution runs; every other issue shape (in particular
+// anything naming an engine/profile/schema keyword) falls through to steps a-c
+// verbatim, unchanged from the original prompt.
+const PREDICTED_FILES_ASK = (ROOT, TARGET) => [
+  '5. predicted_files (best-effort lane-scheduling hint — fail open to [] on ANY doubt, never guess a path):',
+  '   Deliverable-shape gate (check this FIRST, before extracting identifiers below): does the issue title/body',
+  '      read as adding/creating a NEW skill or a new doc/markdown asset (e.g. "add a skill", "new SKILL.md",',
+  '      "add docs for X", a new .md file described in prose)? AND does the body NOT explicitly name an',
+  '      engine/profile/schema keyword — "workflows/ticketmill.js", ".claude/ticketmill.json", "lint-engine", or a',
+  '      term describing the engine/profile/schema itself (e.g. "engine-owned", "profile", "schema")?',
+  '      If BOTH hold: predicted_files = the new asset\'s path exactly as written in the title/body, plus the',
+  '      repo\'s top-level README (e.g. README.md) if the repo has one — do NOT resolve or grep anything for this',
+  '      case. Skip steps a-c below entirely.',
+  '      Otherwise (the gate does not hold, or the deliverable shape is unclear on any doubt): fall through to',
+  '      steps a-c below, unchanged.',
+  '   a. From the issue title + body, extract ONLY high-signal identifiers: backticked spans (`like this`),',
+  '      quoted spans ("like this"), path-like strings (contain a / or a file extension such as .js/.md/.json/.sh),',
+  '      and code-symbol tokens (PascalCase, camelCase, snake_case, or ALL_CAPS words of 3+ chars).',
+  '      REJECT bare dictionary/English nouns used in ordinary prose (e.g. "engine", "button", "config" alone,',
+  '      with no code formatting, path shape, or distinctive casing) — those are not identifiers.',
+  '      If nothing clears this bar, predicted_files = [] and skip the rest of this step.',
+  '   b. Resolve each surviving identifier against the REAL tree at origin/' + TARGET + ' (already fetched read-only',
+  '      before this step; never the working directory, which may be on a different branch):',
+  '      git -C ' + ROOT + ' grep -l -I -F -i -- "<identifier>" origin/' + TARGET + ' for a content match, and',
+  '      git -C ' + ROOT + ' ls-tree -r --name-only origin/' + TARGET + ' filtered for a',
+  '      case-insensitive substring match for a path/filename match. Keep ONLY the exact repo-relative paths those',
+  '      commands actually return — never fabricate or normalize a path yourself.',
+  '   c. Dedupe and cap at 20 paths. If every resolution comes back empty, or any command errors, predicted_files = [].',
+].join('\n')
+
 // collectPostedCommit (issue #79, Layer 2): collects every non-null commit a
 // stage reports into ctx.postedCommits so probeCommitShas() (below) can later
 // confirm each one actually exists in the worktree, once, before merge-auto-
@@ -6820,20 +6866,7 @@ let preflights = (await Promise.all(issueList.map(function (it) {
     '   git -C ' + ROOT + ' status --porcelain -- ' + enginePathspec.join(' '),
     '   Return every dirty path under that pathspec as root_dirty_engine_paths (empty array if the pathspec is clean).',
     '',
-    '5. predicted_files (best-effort lane-scheduling hint — fail open to [] on ANY doubt, never guess a path):',
-    '   a. From the issue title + body, extract ONLY high-signal identifiers: backticked spans (`like this`),',
-    '      quoted spans ("like this"), path-like strings (contain a / or a file extension such as .js/.md/.json/.sh),',
-    '      and code-symbol tokens (PascalCase, camelCase, snake_case, or ALL_CAPS words of 3+ chars).',
-    '      REJECT bare dictionary/English nouns used in ordinary prose (e.g. "engine", "button", "config" alone,',
-    '      with no code formatting, path shape, or distinctive casing) — those are not identifiers.',
-    '      If nothing clears this bar, predicted_files = [] and skip the rest of this step.',
-    '   b. Resolve each surviving identifier against the REAL tree at origin/' + TARGET + ' (already fetched read-only',
-    '      before this step; never the working directory, which may be on a different branch):',
-    '      git -C ' + ROOT + ' grep -l -I -F -i -- "<identifier>" origin/' + TARGET + ' for a content match, and',
-    '      git -C ' + ROOT + ' ls-tree -r --name-only origin/' + TARGET + ' filtered for a',
-    '      case-insensitive substring match for a path/filename match. Keep ONLY the exact repo-relative paths those',
-    '      commands actually return — never fabricate or normalize a path yourself.',
-    '   c. Dedupe and cap at 20 paths. If every resolution comes back empty, or any command errors, predicted_files = [].',
+    PREDICTED_FILES_ASK(ROOT, TARGET),
     '6. depends_on (best-effort lane-scheduling hint — fail open to [] on ANY doubt):',
     '   a. Scan the issue body for "depends on #N", "depends-on #N", or "follow-up to #N" (case-insensitive). Collect each N.',
     '   b. Drop any N that is not one of this batch\'s issue numbers (' + batchIssueNumbers.join(', ') + '), and drop N == ' + it.number + '.',
