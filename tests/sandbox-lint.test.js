@@ -41,6 +41,20 @@ function seedAt(baseSource, insertLine, codeLine) {
 }
 
 /**
+ * Seed the non-engine lockstep pairs lint-engine.js checks, so a sandbox is
+ * shaped like the real repo. Without this, every sandbox run fails on a
+ * missing source before it reaches the assertion under test. Both sides are
+ * written identical, so these pairs stay silent and only the engine pair
+ * varies per test.
+ */
+function seedOtherLockstepPairs(dir) {
+  const script = '#!/usr/bin/env bash\necho "{}"\n'
+  fs.mkdirSync(path.join(dir, '.claude', 'scripts', 'ticketmill'), { recursive: true })
+  fs.writeFileSync(path.join(dir, 'scripts', 'setup-worktree.sh'), script)
+  fs.writeFileSync(path.join(dir, '.claude', 'scripts', 'ticketmill', 'setup-worktree.sh'), script)
+}
+
+/**
  * Build a throwaway directory shaped like the real repo (scripts/lint-engine.js +
  * workflows/ticketmill.js + .claude/workflows/ticketmill.js) so lint-engine.js's
  * __dirname-relative path resolution targets the sandbox, not the real engine.
@@ -53,6 +67,7 @@ function makeSandbox(workflowsSource, claudeSource) {
   fs.copyFileSync(REAL_LINT_SCRIPT, path.join(dir, 'scripts', 'lint-engine.js'))
   fs.writeFileSync(path.join(dir, 'workflows', 'ticketmill.js'), workflowsSource)
   fs.writeFileSync(path.join(dir, '.claude', 'workflows', 'ticketmill.js'), claudeSource === undefined ? workflowsSource : claudeSource)
+  seedOtherLockstepPairs(dir)
   return dir
 }
 
@@ -95,6 +110,7 @@ function makeSandboxWithoutClaudeCopy(workflowsSource) {
   fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true })
   fs.copyFileSync(REAL_LINT_SCRIPT, path.join(dir, 'scripts', 'lint-engine.js'))
   fs.writeFileSync(path.join(dir, 'workflows', 'ticketmill.js'), workflowsSource)
+  seedOtherLockstepPairs(dir)
   return dir
 }
 
@@ -174,6 +190,76 @@ test('lint-engine byte-compare sync check fails when the two engine copies diffe
     assert.ok(
       output.includes('.claude/workflows/ticketmill.js:1:') && output.includes('out of sync'),
       'expected an out-of-sync violation reported against .claude/workflows/ticketmill.js:1:; got:\n' + output,
+    )
+  })
+})
+
+// The setup script is the second lockstep pair. It went unenforced for 29
+// releases and drifted: scripts/setup-worktree.sh gained an empty-slug guard
+// and a stdout redirect that never reached the installed copy. The redirect
+// matters because the script's contract with the engine is JSON-on-stdout, so
+// a bare `git branch` writing to stdout corrupts the parse.
+test('lint-engine sync check fails when the setup-worktree copies differ', function () {
+  withSandbox(realEngineSource, realEngineSource, function (dir) {
+    const copyPath = path.join(dir, '.claude', 'scripts', 'ticketmill', 'setup-worktree.sh')
+    fs.writeFileSync(copyPath, fs.readFileSync(copyPath, 'utf8') + '# drifted\n')
+
+    const result = runSandboxLint(dir)
+    const output = result.stdout + result.stderr
+
+    assert.notStrictEqual(result.code, 0, 'expected a drifted setup script to fail; got:\n' + output)
+    assert.ok(
+      output.includes('.claude/scripts/ticketmill/setup-worktree.sh:1:') && output.includes('out of sync'),
+      'expected an out-of-sync violation against the installed setup script; got:\n' + output,
+    )
+  })
+})
+
+test('--fix repairs a drifted setup-worktree copy and preserves its mode', function () {
+  withSandbox(realEngineSource, realEngineSource, function (dir) {
+    const sourcePath = path.join(dir, 'scripts', 'setup-worktree.sh')
+    const copyPath = path.join(dir, '.claude', 'scripts', 'ticketmill', 'setup-worktree.sh')
+    fs.chmodSync(sourcePath, 0o755)
+    fs.writeFileSync(copyPath, '# drifted, and not executable\n')
+    fs.chmodSync(copyPath, 0o644)
+
+    const result = runSandboxLintFix(dir)
+    const output = result.stdout + result.stderr
+
+    assert.strictEqual(result.code, 0, 'expected --fix to exit 0; got:\n' + output)
+    assert.ok(
+      fs.readFileSync(sourcePath).equals(fs.readFileSync(copyPath)),
+      'expected the setup script copies to be byte-identical after --fix',
+    )
+    // A copy that lost its executable bit is broken in a way byte-compare misses.
+    assert.ok(fs.statSync(copyPath).mode & 0o111, 'expected --fix to restore the executable bit')
+  })
+})
+
+test('--fix creates a missing setup-worktree copy rather than failing', function () {
+  withSandbox(realEngineSource, realEngineSource, function (dir) {
+    const copyPath = path.join(dir, '.claude', 'scripts', 'ticketmill', 'setup-worktree.sh')
+    fs.rmSync(copyPath)
+
+    const result = runSandboxLintFix(dir)
+    const output = result.stdout + result.stderr
+
+    assert.strictEqual(result.code, 0, 'expected --fix to create the missing copy; got:\n' + output)
+    assert.ok(fs.existsSync(copyPath), 'expected --fix to have created the installed setup script')
+  })
+})
+
+test('check mode fails loudly when an installed copy is missing entirely', function () {
+  withSandbox(realEngineSource, realEngineSource, function (dir) {
+    fs.rmSync(path.join(dir, '.claude', 'scripts', 'ticketmill', 'setup-worktree.sh'))
+
+    const result = runSandboxLint(dir)
+    const output = result.stdout + result.stderr
+
+    assert.notStrictEqual(result.code, 0, 'expected a missing installed copy to fail check mode')
+    assert.ok(
+      output.includes('.claude/scripts/ticketmill/setup-worktree.sh') && output.includes('not found'),
+      'expected a not-found error naming the missing copy; got:\n' + output,
     )
   })
 })

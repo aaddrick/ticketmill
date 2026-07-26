@@ -58,6 +58,8 @@ if [[ -z "$branch" ]]; then
         | sed 's/[^a-z0-9]/-/g; s/-\{2,\}/-/g; s/^-//; s/-$//' \
         | cut -c1-50)
 
+    [[ -z "$slug" ]] && slug="untitled"
+
     branch="issue-${ISSUE_NUMBER}-${slug}"
 fi
 
@@ -67,7 +69,7 @@ git -C "$REPO_ROOT" fetch origin "$BASE_BRANCH" --quiet \
 
 # --- Create branch if it doesn't exist ---
 if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
-    git -C "$REPO_ROOT" branch "$branch" "origin/$BASE_BRANCH" \
+    git -C "$REPO_ROOT" branch "$branch" "origin/$BASE_BRANCH" >/dev/null 2>&1 \
         || die "Could not create branch $branch"
 fi
 

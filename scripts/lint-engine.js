@@ -45,6 +45,21 @@ const ROOT = path.resolve(__dirname, '..')
 const ENGINE_PATH = path.join(ROOT, 'workflows', 'ticketmill.js')
 const CLAUDE_ENGINE_PATH = path.join(ROOT, '.claude', 'workflows', 'ticketmill.js')
 
+// Every source -> installed-copy pair mill-init drops into a target repo.
+// Each entry is byte-compared in check mode and overwritten source-to-copy by
+// --fix. The engine was the only enforced pair until the setup script drifted:
+// scripts/setup-worktree.sh gained an empty-slug guard and a stdout redirect
+// (its contract with the engine is JSON-on-stdout, so a bare `git branch`
+// writing to stdout corrupts the parse), and neither reached the installed
+// copy for 29 releases because nothing compared them.
+const LOCKSTEP_PAIRS = [
+  { source: ENGINE_PATH, copy: CLAUDE_ENGINE_PATH },
+  {
+    source: path.join(ROOT, 'scripts', 'setup-worktree.sh'),
+    copy: path.join(ROOT, '.claude', 'scripts', 'ticketmill', 'setup-worktree.sh'),
+  },
+]
+
 const SANDBOX_OK = '// sandbox-ok'
 
 const RULES = [
@@ -103,31 +118,41 @@ function main() {
     process.exit(1)
   }
 
-  if (fixMode) {
-    // Hardcoded source->copy: workflows/ticketmill.js is always the source
-    // of truth. This creates .claude/workflows/ticketmill.js if it's
-    // missing, so the check-mode hard error for a missing copy doesn't
-    // apply here.
-    fs.copyFileSync(ENGINE_PATH, CLAUDE_ENGINE_PATH)
-  } else if (!fs.existsSync(CLAUDE_ENGINE_PATH)) {
-    console.error(path.relative(ROOT, CLAUDE_ENGINE_PATH) + ' not found')
-    process.exit(1)
-  }
+  // Hardcoded source->copy in every pair: the tracked source is always the
+  // source of truth, and --fix never reads the copy to decide what to write.
+  // --fix creates a missing copy, so the check-mode hard error below does not
+  // apply in fix mode.
+  LOCKSTEP_PAIRS.forEach(function (pair) {
+    if (!fs.existsSync(pair.source)) {
+      console.error(path.relative(ROOT, pair.source) + ' not found')
+      process.exit(1)
+    }
+    if (fixMode) {
+      fs.mkdirSync(path.dirname(pair.copy), { recursive: true })
+      fs.copyFileSync(pair.source, pair.copy)
+      // Copy the mode too: setup-worktree.sh is executed, so a copy that
+      // loses its executable bit is broken in a way a byte-compare misses.
+      fs.chmodSync(pair.copy, fs.statSync(pair.source).mode)
+    } else if (!fs.existsSync(pair.copy)) {
+      console.error(path.relative(ROOT, pair.copy) + ' not found')
+      process.exit(1)
+    }
+  })
 
   // Same scan in both modes: a sandbox violation in the source must still
   // fail --fix, not be silently carried into a freshly synced copy.
   const violations = lintEngineSource(ENGINE_PATH)
 
-  const engineBuf = fs.readFileSync(ENGINE_PATH)
-  const claudeEngineBuf = fs.readFileSync(CLAUDE_ENGINE_PATH)
-  if (!engineBuf.equals(claudeEngineBuf)) {
-    violations.push(
-      path.relative(ROOT, CLAUDE_ENGINE_PATH) +
-        ':1: out of sync with ' + path.relative(ROOT, ENGINE_PATH) +
-        " — the two engine copies must be byte-identical; run 'node " +
-        "scripts/lint-engine.js --fix' to sync them"
-    )
-  }
+  LOCKSTEP_PAIRS.forEach(function (pair) {
+    if (!fs.readFileSync(pair.source).equals(fs.readFileSync(pair.copy))) {
+      violations.push(
+        path.relative(ROOT, pair.copy) +
+          ':1: out of sync with ' + path.relative(ROOT, pair.source) +
+          ". Installed copies must be byte-identical to their source; run " +
+          "'node scripts/lint-engine.js --fix' to sync them"
+      )
+    }
+  })
 
   if (violations.length) {
     violations.forEach(function (v) {
@@ -136,7 +161,10 @@ function main() {
     process.exit(1)
   }
 
-  console.log('lint-engine: clean (' + path.relative(ROOT, ENGINE_PATH) + ')')
+  console.log(
+    'lint-engine: clean (' + path.relative(ROOT, ENGINE_PATH) + ', ' +
+      LOCKSTEP_PAIRS.length + ' lockstep pairs in sync)'
+  )
 }
 
 main()
