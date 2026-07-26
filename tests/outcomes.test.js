@@ -141,6 +141,16 @@ test('deriveAbandoned: issue closed, batch PR still open -> true (the genuine ga
   assert.strictEqual(context.deriveAbandoned('closed', 'open'), true)
 })
 
+test('deriveAbandoned: issue closed, no batch PR ever created (live_merge_state "none") -> true', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.deriveAbandoned('closed', 'none'), true)
+})
+
+test('deriveAbandoned: issue closed, batch PR itself closed unmerged -> true', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.deriveAbandoned('closed', 'closed'), true)
+})
+
 test('deriveAbandoned: issue closed, batch PR merged -> false (a merged PR never yields abandoned)', function () {
   const context = harness.boot()
   assert.strictEqual(context.deriveAbandoned('closed', 'merged'), false)
@@ -154,6 +164,11 @@ test('deriveAbandoned: issue closed, live_merge_state unknown -> false (a transi
 test('deriveAbandoned: issue still open -> false, regardless of live_merge_state', function () {
   const context = harness.boot()
   assert.strictEqual(context.deriveAbandoned('open', 'open'), false)
+})
+
+test('deriveAbandoned: issue_state "unknown" (valid OUTCOMES_SCHEMA enum member) -> false, even with an otherwise-qualifying live_merge_state', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.deriveAbandoned('unknown', 'open'), false)
 })
 
 test('gradeFromObservation: signals object always carries the raw fields the grade was decided from', function () {
