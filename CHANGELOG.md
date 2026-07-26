@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.40] - 2026-07-26-docs
+
+- docs: split ARCHITECTURE.md into a docs/architecture/ subfolder, leave the old path as a pointer (#154)
+- issue #155 (#155)
+
 ## 0.1.39 (2026-07-26)
 
 Fixes a drift that had been live since v0.1.9 and closes the gap that let it
