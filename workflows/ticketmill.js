@@ -4567,16 +4567,18 @@ async function reviewAndMerge(ctx) {
   const mar = await runMergeAutoResolve(ctx)
   if (!mar.ok) return fail(ctx, STOP.tripped ? 'halted' : 'needs_human', 'merge-auto-resolve', mar.error + ' — PR #' + ctx.pr + ' left open for human review')
 
-  // Quality review (task 1, iteration 1), issue #79: mar.resolved === true means
-  // runMergeAutoResolve rebased the branch onto TARGET and force-pushed (see its
-  // own doc comment) — a rebase rewrites the SHA of every commit on the branch,
-  // even a clean one, because parent hashes change. Every entry collectPostedCommit()
-  // gathered BEFORE this point (task-implement/fix/test/pr-fix stages) now names a
-  // pre-rebase SHA that legitimately no longer exists — not a fabrication. Clear
+  // Post-rebase postedCommits reset (issue #79 quality-fix, iteration 1):
+  // mar.resolved === true means runMergeAutoResolve rebased the branch onto
+  // TARGET and force-pushed (see its own doc comment) — a rebase rewrites the
+  // SHA of every commit on the branch, even a clean one, because parent
+  // hashes change. Every entry collectPostedCommit() gathered BEFORE this
+  // point (task-implement/fix/test/pr-fix stages) now names a pre-rebase SHA
+  // that legitimately no longer exists — not a fabrication. Clear
   // ctx.postedCommits here so probeCommitShas() below only checks SHAs posted
   // AFTER the rewrite (there are none yet at this point in the flow, which is
-  // correct: nothing has posted a NEW commit since the force-push, so the probe
-  // will simply no-op via its own empty-list early return for this issue).
+  // correct: nothing has posted a NEW commit since the force-push, so the
+  // probe will simply no-op via its own empty-list early return for this
+  // issue).
   if (mar.resolved) ctx.postedCommits = []
 
   // ---- CHANGED-FILES PROBE (issue #87) — unconditional, once per issue, after
