@@ -133,6 +133,29 @@ test('gradeFromObservation: a still-open batch PR with no other signal grades pe
   assert.strictEqual(g.grade, 'pending')
 })
 
+// ---- deriveAbandoned (issue #103): wires issue closed-state through to the ----
+// ---- `abandoned` observation field gradeFromObservation's branch 5 reads.  ----
+
+test('deriveAbandoned: issue closed, batch PR still open -> true (the genuine gap #103 closes)', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.deriveAbandoned('closed', 'open'), true)
+})
+
+test('deriveAbandoned: issue closed, batch PR merged -> false (a merged PR never yields abandoned)', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.deriveAbandoned('closed', 'merged'), false)
+})
+
+test('deriveAbandoned: issue closed, live_merge_state unknown -> false (a transient gh read failure never yields a terminal grade)', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.deriveAbandoned('closed', 'unknown'), false)
+})
+
+test('deriveAbandoned: issue still open -> false, regardless of live_merge_state', function () {
+  const context = harness.boot()
+  assert.strictEqual(context.deriveAbandoned('open', 'open'), false)
+})
+
 test('gradeFromObservation: signals object always carries the raw fields the grade was decided from', function () {
   const context = harness.boot()
   const obs = baseObservation({ merged_at: daysAgoIso(10), hotfix_pr: 42 })
