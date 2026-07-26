@@ -1,21 +1,49 @@
 # Plan phase, per issue. Two contrarian gates, both iteration-capped.
-# Keep this to six ranks — see the note in phase-select.d2 about width.
+#
+# GRID SNAKE. Reading order is boustrophedon: row 1 left-to-right, then the
+# flow drops straight down the LAST column and the next row reads back
+# right-to-left.
+#
+# Why a grid and not a layout engine: neither bundled engine can wrap a long
+# chain into rows. d2 does not expose ELK's `wrapping.strategy`, and a
+# `direction` set on a container is ignored by both dagre and ELK. Grid
+# placement is the only way to fold a chain, and it fills row-major over the
+# declaration order below.
+#
+# THE DIAGONAL RULE: grid connections are center-to-center straight segments
+# with no path-finding. An edge is orthogonal only if its two cells share a row
+# or a column, and only if they are neighbours -- an edge spanning two cells in
+# a row draws straight THROUGH the cell between them. Everything else is a
+# diagonal. Place nodes so every edge joins neighbours.
+#
+# Grid columns share a width, so one wide cell widens its whole column.
+#
+# Spacer cells (`sp*`) are invisible padding that push the wrap into the right
+# column. They are load-bearing -- deleting one reflows the entire grid.
 
-direction: right
+grid-rows: 2
+grid-columns: 4
+horizontal-gap: 130
+vertical-gap: 70
 
+# row 1, left to right
 wt: "Setup worktree\ninstalls + env" { class: stage }
 res: "Research" { class: stage }
 ev: "Evaluate\napproach" { class: stage }
 ca: "Contrarian\napproach gate" { class: gate }
-pl: "Plan tasks" { class: stage }
+# row 2, right to left
+sp1: "" { style.opacity: 0 }
+out: "To Build" { class: terminal }
 cp: "Contrarian\nplan gate" { class: gate }
+pl: "Plan tasks" { class: stage }
 
 wt -> res: { class: flow }
 res -> ev: { class: flow }
-ev -> ca: "proposal" { class: flow }
-ca -> ev: "challenge\ncapped" { class: loop }
+# One bidirectional connector, not two edges. Grid draws both directions of a
+# 2-cycle on the same center-to-center line, so a second edge stacks its label
+# on top of the first. Keep these labels short -- a label wider than the gap
+# covers the connector it belongs to.
+ev <-> ca: "⇄ challenge\ncapped" { class: loop }
 ca -> pl: "approved" { class: flow }
-pl -> cp: "plan" { class: flow }
-cp -> pl: "challenge\ncapped" { class: loop }
-cp -> "To Build": "approved" { class: flow }
-"To Build".class: terminal
+pl <-> cp: "⇄ challenge\ncapped" { class: loop }
+cp -> out: "approved" { class: flow }

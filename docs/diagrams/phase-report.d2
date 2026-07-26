@@ -1,19 +1,41 @@
-# Report phase: runs once per batch, after every issue has settled.
+# Report phase: runs once per batch, after every issue settles.
+#
+# GRID SNAKE. Reading order is boustrophedon: row 1 left-to-right, then the
+# flow drops straight down the LAST column and the next row reads back
+# right-to-left.
+#
+# Why a grid and not a layout engine: neither bundled engine can wrap a long
+# chain into rows. d2 does not expose ELK's `wrapping.strategy`, and a
+# `direction` set on a container is ignored by both dagre and ELK. Grid
+# placement is the only way to fold a chain, and it fills row-major over the
+# declaration order below.
+#
+# THE DIAGONAL RULE: grid connections are center-to-center straight segments
+# with no path-finding. An edge is orthogonal only if its two cells share a row
+# or a column, and only if they are neighbours -- an edge spanning two cells in
+# a row draws straight THROUGH the cell between them. Everything else is a
+# diagonal. Place nodes so every edge joins neighbours.
+#
+# Grid columns share a width, so one wide cell widens its whole column.
+#
+# Spacer cells (`sp*`) are invisible padding that push the wrap into the right
+# column. They are load-bearing -- deleting one reflows the entire grid.
 
-direction: right
+grid-rows: 2
+grid-columns: 3
+horizontal-gap: 100
+vertical-gap: 70
 
+# row 1, left to right
 rl: "Release\nheld claims" { class: stage }
 rvb: "Release stage\ngated: CHANGELOG\n+ version bump" { class: optional }
 bp: "Batch PR into BASE\nnever auto-merged\ncarries Verification Gaps" { class: human }
+# row 2, right to left
+sp1: "" { style.opacity: 0 }
+rt: "Retrospective\nfeeds the next run" { class: stage }
 ro: "Run report\nJSON + markdown" { class: stage }
-rt: "Retrospective" { class: stage }
-next: "next\nrun" {
-  shape: circle
-  class: optional
-}
 
 rl -> rvb: { class: flow }
 rvb -> bp: { class: flow }
 bp -> ro: { class: flow }
 ro -> rt: { class: flow }
-rt -> next: "learnings feed\nthe next run" { class: loop }

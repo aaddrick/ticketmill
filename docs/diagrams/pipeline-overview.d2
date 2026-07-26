@@ -1,49 +1,45 @@
-# Ticketmill pipeline, top level. Detail for each phase lives in phase-*.d2.
-# Render with ./render.sh — do not hand-edit the generated SVGs.
-# Plain-text labels only: |md| blocks render via foreignObject, which does not
-# survive being loaded through an <img> tag on every renderer.
+# Ticketmill pipeline, top level. Detail per phase in phase-*.d2.
+#
+# GRID SNAKE. Reading order is boustrophedon: row 1 left-to-right, then the
+# flow drops straight down the LAST column and the next row reads back
+# right-to-left.
+#
+# Why a grid and not a layout engine: neither bundled engine can wrap a long
+# chain into rows. d2 does not expose ELK's `wrapping.strategy`, and a
+# `direction` set on a container is ignored by both dagre and ELK. Grid
+# placement is the only way to fold a chain, and it fills row-major over the
+# declaration order below.
+#
+# THE DIAGONAL RULE: grid connections are center-to-center straight segments
+# with no path-finding. An edge is orthogonal only if its two cells share a row
+# or a column, and only if they are neighbours -- an edge spanning two cells in
+# a row draws straight THROUGH the cell between them. Everything else is a
+# diagonal. Place nodes so every edge joins neighbours.
+#
+# Grid columns share a width, so one wide cell widens its whole column.
+#
+# Spacer cells (`sp*`) are invisible padding that push the wrap into the right
+# column. They are load-bearing -- deleting one reflows the entire grid.
 
-direction: down
+grid-rows: 2
+grid-columns: 4
+horizontal-gap: 90
+vertical-gap: 70
 
-sel: "SELECT\n\nprofile · roles · batch branch\nissue list · preflight · claims" {
-  class: stage
-}
-
-pool: "WORKER POOL\n\nconcurrency 1–5\nlane-serial groups · circuit breakers" {
-  class: gate
-}
-
-issue: "PER ISSUE" {
-  class: phase
-
-  plan: "Plan\n\nresearch → evaluate → plan tasks\ntwo contrarian gates" {
-    class: stage
-  }
-
-  build: "Build\n\nimplement ⇄ task review → quality\ntest loop → browser verify" {
-    class: stage
-  }
-
-  ship: "Ship\n\ndocblocks → PR → spec + code review\ntech docs → squash-merge" {
-    class: stage
-  }
-
-  plan -> build: { class: flow }
-  build -> ship: { class: flow }
-}
-
-rep: "REPORT\n\nrelease claims · gated version bump\nbatch PR · run report · retrospective" {
-  class: stage
-}
-
-gate: "HUMAN MERGE GATE\n\nbatch PR into BASE — never auto-merged" {
-  class: human
-}
+# row 1, left to right
+sel: "SELECT\n\nprofile · roles · batch branch\nissue list · preflight · claims" { class: stage }
+pool: "WORKER POOL\n\nconcurrency 1-5 · lane-serial\ngroups · circuit breakers" { class: gate }
+plan: "PLAN\n\nresearch → evaluate → tasks\ntwo contrarian gates" { class: stage }
+build: "BUILD\n\nimplement ⇄ review → quality\ntest loop → browser" { class: stage }
+# row 2, right to left
+sp1: "" { style.opacity: 0 }
+gate: "HUMAN MERGE GATE\n\nbatch PR into BASE\nnever auto-merged" { class: human }
+rep: "REPORT\n\nrelease · batch PR\nrun report · retrospective" { class: stage }
+ship: "SHIP\n\ndocblocks → PR → review\ntech docs → squash-merge" { class: stage }
 
 sel -> pool: { class: flow }
-pool -> issue.plan: "fan out" {
-  class: flow
-  style.stroke-width: 3
-}
-issue.ship -> rep: { class: flow }
+pool -> plan: "fan out" { class: flow }
+plan -> build: { class: flow }
+build -> ship: { class: flow }
+ship -> rep: { class: flow }
 rep -> gate: { class: flow }
