@@ -94,6 +94,41 @@ test('buildRunRecord scales cleanly past the old 30000-char slice with no trunca
   assert.strictEqual(round.results[99].metrics.quality_iters, 100)
 })
 
+// ---- issue #85: pr/follow_ups/timeline pass-through at 18-issue scale ----
+//
+// #85 reported that the OLD Report phase's `resultsJson.slice(0, 30000)` truncation
+// (the same defect #86 fixed above) left by_issue entries #39-#48 and #57 of an
+// 18-issue run with pr: null, an empty follow_ups array, and an empty timeline, even
+// though every one of those issues had a real merged PR. buildRunRecord's `results:
+// f.results` pass-through (no slice, no agent) already carries these fields, but the
+// shared fixtureResults() above sets follow_ups: [] on every entry — an empty array
+// would pass a `follow_ups is an array` check even if the field were silently reset,
+// so it can't prove real pass-through. This fixture instead gives every entry a
+// POPULATED follow_ups array and a multi-entry timeline, so a non-empty assertion
+// actually demonstrates the full array/timeline survived, not just its shape.
+test('buildRunRecord retains a real pr, populated follow_ups, and a non-empty timeline for every by_issue entry at 18-issue scale (#85)', function () {
+  const context = harness.boot()
+  const results = fixtureResults(18)
+  results.forEach(function (r) {
+    r.follow_ups = ['file a follow-up for #' + r.issue]
+    r.timeline = ['approach: sound', 'plan: sound', 'merged PR #' + r.pr]
+  })
+  const record = makeRecord(context, results)
+
+  assert.strictEqual(record.results.length, 18)
+  for (const r of record.results) {
+    assert.strictEqual(typeof r.pr, 'number', 'issue ' + r.issue + ' lost its real pr (got ' + r.pr + ')')
+    assert.ok(Number.isFinite(r.pr), 'issue ' + r.issue + ' pr must be a real, finite number, not null')
+
+    assert.ok(Array.isArray(r.follow_ups), 'issue ' + r.issue + ' lost its follow_ups array')
+    assert.ok(r.follow_ups.length > 0, 'issue ' + r.issue + ' follow_ups was emptied — fixture seeded it populated')
+
+    assert.ok(Array.isArray(r.timeline), 'issue ' + r.issue + ' lost its timeline array')
+    assert.ok(r.timeline.length > 0, 'issue ' + r.issue + ' timeline was emptied')
+    assert.ok(r.timeline.length > 1, 'issue ' + r.issue + ' timeline lost entries — fixture seeded it multi-entry')
+  }
+})
+
 // ---- shape / header fields ----
 
 test('buildRunRecord carries the schema header and threads token honesty fields', function () {
