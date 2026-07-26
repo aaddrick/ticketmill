@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Regenerate every diagram SVG from its .d2 source.
 #
-# Each diagram body is rendered twice — once against theme-light.d2 and once
-# against theme-dark.d2 — because d2 inlines custom fills rather than emitting
-# them into its prefers-color-scheme block, so a single SVG cannot carry both
+# Each diagram body is rendered twice, once against theme-light.d2 and once
+# against theme-dark.d2, because d2 inlines custom fills rather than emitting
+# them into its prefers-color-scheme block. A single SVG cannot carry both
 # palettes. ARCHITECTURE.md pairs the two through a <picture> element.
 #
 # Needs d2 on PATH (https://d2lang.com/tour/install), or D2 pointing at it:
