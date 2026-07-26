@@ -95,9 +95,9 @@ test('every base README H2 appears exactly once across README.md + docs/*.md, ex
 })
 
 test('Install and Quickstart, the only allow-listed duplicates, land in README.md and docs/getting-started.md specifically', function () {
+  const readmeHeadings = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8').split('\n').map(headingText)
+  const gettingStartedHeadings = fs.readFileSync(path.join(ROOT, 'docs', 'getting-started.md'), 'utf8').split('\n').map(headingText)
   for (const heading of ALLOWED_DUPLICATES) {
-    const readmeHeadings = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8').split('\n').map(headingText)
-    const gettingStartedHeadings = fs.readFileSync(path.join(ROOT, 'docs', 'getting-started.md'), 'utf8').split('\n').map(headingText)
     assert.ok(readmeHeadings.includes(heading), heading + ' must still appear in README.md')
     assert.ok(gettingStartedHeadings.includes(heading), heading + ' must appear verbatim in docs/getting-started.md')
   }
