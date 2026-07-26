@@ -73,6 +73,18 @@ function buildFirstLineIndex(baseLines) {
   return map
 }
 
+// Shared by the rewrites and proseRefs gates: each {line, from} pair's `from`
+// must appear exactly once, verbatim, on its own recorded base line.
+function assertFromOccursOnceOnLine(baseLines, entries, label) {
+  for (const r of entries) {
+    const text = baseLines[r.line]
+    assert.ok(text !== undefined, label + ' line ' + r.line + ' is out of bounds')
+    const count = text.split(r.from).length - 1
+    assert.strictEqual(count, 1,
+      label + ' at line ' + r.line + ': from=' + JSON.stringify(r.from) + ' must appear exactly once, found ' + count)
+  }
+}
+
 test('fixture is valid JSON with the required top-level shape', function () {
   const fixture = loadFixture()
   assert.strictEqual(fixture.baseFile, 'docs/ARCHITECTURE.md')
@@ -186,25 +198,15 @@ test('rewrites: every {line, from} pair appears exactly once, verbatim, on its o
   const fixture = loadFixture()
   const baseLines = loadBaseLines()
   assert.strictEqual(fixture.rewrites.length, 13)
-  for (const r of fixture.rewrites) {
-    const text = baseLines[r.line]
-    assert.ok(text !== undefined, 'rewrite line ' + r.line + ' is out of bounds')
-    const count = text.split(r.from).length - 1
-    assert.strictEqual(count, 1,
-      'rewrite at line ' + r.line + ': from=' + JSON.stringify(r.from) + ' must appear exactly once, found ' + count)
-  }
+  assertFromOccursOnceOnLine(baseLines, fixture.rewrites, 'rewrite')
 })
 
 test('proseRefs: every {line, from} pair appears exactly once, verbatim, on its own base line', function () {
   const fixture = loadFixture()
   const baseLines = loadBaseLines()
   assert.strictEqual(fixture.proseRefs.length, 4)
+  assertFromOccursOnceOnLine(baseLines, fixture.proseRefs, 'proseRef')
   for (const r of fixture.proseRefs) {
-    const text = baseLines[r.line]
-    assert.ok(text !== undefined, 'proseRef line ' + r.line + ' is out of bounds')
-    const count = text.split(r.from).length - 1
-    assert.strictEqual(count, 1,
-      'proseRef at line ' + r.line + ': from=' + JSON.stringify(r.from) + ' must appear exactly once, found ' + count)
     assert.ok(typeof r.reason === 'string' && r.reason.length > 0, 'proseRef at line ' + r.line + ' must carry a reason')
   }
 })
