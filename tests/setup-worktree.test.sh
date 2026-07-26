@@ -8,7 +8,7 @@
 # touches the network or a real GitHub issue.
 #
 # Assertions check the script's JSON stdout (parsed with `node -e`) and the
-# resulting git state — never the script's source text.
+# resulting git state, never the script's source text.
 set -euo pipefail
 
 REPO_TOP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -42,8 +42,8 @@ assert_eq() {
 }
 
 # Evaluates a `[[ ... ]]` (or any) condition given as a single string. Using
-# eval (rather than "$@") lets callers pass real [[ ]] syntax — including
-# glob/pattern matches like `[[ "$x" == foo-* ]]` — which "$@" can't execute
+# eval (rather than "$@") lets callers pass real [[ ]] syntax, including
+# glob/pattern matches like `[[ "$x" == foo-* ]]`, which "$@" can't execute
 # since `[[` is only special as the first word of a real command, not as a
 # positional argument to another command.
 assert_true() {
@@ -66,7 +66,7 @@ assert_valid_json() {
 
 # Reads a top-level string field out of a JSON blob. Falls back to an empty
 # string on parse failure so one bad case can't abort the whole harness via
-# set -e — the preceding assert_valid_json call is what records that failure.
+# set -e. The preceding assert_valid_json call is what records that failure.
 json_get() {
     local json="$1" key="$2"
     node -e '
@@ -80,7 +80,7 @@ json_get() {
 # --- scratch repo builder ---------------------------------------------------
 # Populates globals: WORK (scratch root), ORIGIN (bare, seeded with
 # $BASE_BRANCH), REPO_ROOT (a clone of ORIGIN), WORKTREES_DIR (not yet
-# created — the script creates it), GH_BIN (dir holding a fake `gh`).
+# created, the script creates it), GH_BIN (dir holding a fake `gh`).
 new_scratch() {
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/setup-worktree-test.XXXXXX")
     CLEANUP_DIRS+=("$WORK")
@@ -109,7 +109,7 @@ EOF
 }
 
 # Invokes the real script with the fake gh prepended to PATH. Always pass the
-# scratch REPO_ROOT/WORKTREES_DIR explicitly — never the real repo.
+# scratch REPO_ROOT/WORKTREES_DIR explicitly, never the real repo.
 run_script() {
     PATH="$GH_BIN:$PATH" "$SCRIPT" "$@"
 }

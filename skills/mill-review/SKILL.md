@@ -207,7 +207,7 @@ Do this once. Both Step 7 surfaces render the same derived values.
    observed" language. These are learnings the file keeps active but has
    partially walked back inline rather than deprecating outright. Flag both
    kinds. Don't silently drop either.
-7. **Ranked "what I'd change next."** A short (5–7 item) judgment list, each
+7. **Ranked "what I'd change next."** A short (5-7 item) judgment list, each
    item citing the run_tag(s)/evidence backing it, ordered by how much
    evidence supports it. A chronic stage confirmed across most of the window
    outranks a one-off observation from a single run. This is the one

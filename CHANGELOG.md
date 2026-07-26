@@ -19,16 +19,33 @@ box sized to its own content, at 1177x423.
 The rule is now chains in a grid, branches on the layout engine, and
 `docs/diagrams/{CLAUDE,AGENTS}.md` says so.
 
-Prose: the `## Pipeline` section of `docs/ARCHITECTURE.md`, the two guidance
-files, and the 0.1.36 and 0.1.37 changelog entries all went through
-`aaddrick-voice` with the removing-ai-tells checklist, gatekeeper-reviewed.
-Every em dash and en dash is gone from that text, replaced contextually rather
-than swapped one for one. Two proposed edits were rejected: "cap-outs are never
-silent" stays, since it is this repo's own phrase and a section heading further
-down the same file, and `test_command` "must" be present rather than "has to
-be", because that is a hard requirement. Pre-existing prose in `README.md` and
-the agent charters was left alone, as the process scopes each pass to newly
-written text.
+Prose: every authored line in the repo went through `aaddrick-voice` with the
+removing-ai-tells checklist, gatekeeper-reviewed. That covers `README.md`,
+`CONTRIBUTING.md`, `docs/ARCHITECTURE.md`, `CHANGELOG.md`, the five agent
+charters in `.claude/agents/` plus the `templates/agents/contrarian.md` copy,
+all four `skills/*/SKILL.md` documents, `.claude-plugin/marketplace.json`, the
+`verify_notes` in `.claude/ticketmill.json`, and the comments in the setup and
+test shell scripts. Roughly 290 em and en dashes are gone, each replaced by the
+punctuation its local grammar called for rather than swapped one for one.
+
+Charters and skill documents are system prompts, so those passes were
+punctuation-only and checked against a token-level diff: code spans, paths,
+identifiers, constants, argument names, and defaults are byte-identical to
+before. Every prohibition that previously trailed a dash became its own
+sentence, so no rule reads as optional now. Three replacements sit inside
+fenced blocks and were kept deliberately: the repo-layout annotation in
+`README.md`, a JS comment in a `mill` example, and the anti-pattern line in
+`forge-agent`'s agent template, which would otherwise write a dash into every
+generated agent.
+
+Two proposed edits were rejected: "cap-outs are never silent" stays, since it
+is this repo's own phrase and a section heading further down the same file, and
+`test_command` "must" be present rather than "has to be", because that is a
+hard requirement.
+
+`workflows/ticketmill.js` is excluded. Around 360 of its dashes sit inside
+agent prompt strings, where an edit is a behavior change rather than a style
+change, and the rest are code comments not worth that risk to reach.
 
 ## 0.1.37 (2026-07-26)
 
@@ -249,8 +266,8 @@ data.
   no predicted file matches a recently-reverted or hot-fixed area,
   the probe is a clean no-op and no flag appears.
 - Tests (#93): `computeRevisitRisk` cases added to
-  `tests/outcomes.test.js` — a matching-history case that raises the
-  flag and a no-history case that stays silent. Full suite 504
+  `tests/outcomes.test.js` (a matching-history case that raises the
+  flag and a no-history case that stays silent). Full suite 504
   `node --test` cases green; engine copies byte-identical
   (lockstep-linted).
 
@@ -334,22 +351,22 @@ and records it, so later tiers have an eval anchor.
   member issues, skips already-terminally-graded targets, bounded by
   `sample_cap`) and live `gh pr view`/`gh issue view`/`gh search`
   reads, returning raw observations plus the verbatim prior ledger
-  lines only — never a grade decision. The engine grades post-hoc in
+  lines only, never a grade decision. The engine grades post-hoc in
   deterministic JS and adds `outcomes`/`outcomes_path`/
   `outcomes_coverage` to the final return, next to `record`/`ledger`.
 - Deterministic ledger write (#92): `skills/mill/SKILL.md` seeds
   `<logs_dir>/outcomes.jsonl` if absent and appends each returned
   outcome as one compact JSON line, in run order. Append-only, like
-  the `runs.jsonl` step beside it — the skill never rewrites, dedups,
+  the `runs.jsonl` step beside it: the skill never rewrites, dedups,
   or drops a line; `diffOutcomeGrades` already decided what to emit.
   `outcomes.jsonl` is a per-host, gitignored local artifact.
 
 Proactive token cost estimator and budget guard (#97), so ticketmill
 can stop before the account ceiling instead of after. Depends on the
 `runs.jsonl` ledger (#86) and pairs with the rework-tax reducer
-(#91). Before this, the only budget guards were reactive — the
+(#91). Before this, the only budget guards were reactive: the
 3-consecutive-death circuit breaker and the budget-exhausted-error
-trip — which only fire after the account limit is already killing
+trip, which only fire after the account limit is already killing
 agents. This adds a pre-run estimate and an always-on hard-floor
 guard that halt cleanly before spend gets that far.
 
@@ -372,7 +389,7 @@ guard that halt cleanly before spend gets that far.
   estimate+confidence, three independent oversized flags (structural
   group size, predicted-files-band ceiling, multiple-of-global-median),
   and a batch projection that never reports a bare total when any
-  member is unknown — it always carries an "estimable K of N, M
+  member is unknown. It always carries an "estimable K of N, M
   unknown" coverage note.
 - Always-on `token_budget` guard (#97): resolved from a run arg or
   `profile.token_budget`, as an absolute OUTPUT-token ceiling or a
@@ -479,7 +496,7 @@ upgrade lands across later batches.
 
 - Release stage (#57): the pipeline used to defer the CHANGELOG entry and
   `.claude-plugin/plugin.json` version bump to "the docblocks/PR-consolidation
-  stage," but no stage ever actually performed it — Batch 2026-07-19-e (PR
+  stage," but no stage ever actually performed it. Batch 2026-07-19-e (PR
   #56) merged real engine changes to main with the version and CHANGELOG left
   stale, requiring a manual repair commit (v0.1.28). Adds an OPTIONAL,
   profile-gated `release` field (`version_files`, `changelog`, `bump`)
@@ -487,13 +504,13 @@ upgrade lands across later batches.
   batch-PR agent, so the bump lands inside the human-reviewed diff by
   construction. The stage regenerates a single CHANGELOG section in place
   (idempotent across resumes) and bumps the configured version file(s) in an
-  ephemeral `git worktree` — the run root is never mutated, and a push
+  ephemeral `git worktree`. The run root is never mutated, and a push
   failure is non-fatal-but-logged. The `release` field is defined in the
   engine; activating it in this repo's own `.claude/ticketmill.json` was
   attempted, then deferred/reverted per the engine-owned-paths scope guard
   (`.claude/ticketmill.json` is out of scope for this issue), so profile
   activation is a follow-up. The new stage will not fire for this batch
-  regardless, since the running engine at the run root predates it — so
+  regardless, since the running engine at the run root predates it, so
   this entry and the version bump (0.1.28 -> 0.1.29) are done by hand this
   one time.
 
@@ -606,7 +623,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
 - Fix (#3, task 3 quality fix): resolved a prompt self-contradiction flagged
   in quality review. `scopeGuard()`'s engine-owned advisory clause is
   prepended to EVERY stage prompt, including `runEngineOwnedGate`'s own
-  `engine-owned-revert` stage — so the agent carrying out a regime (c)
+  `engine-owned-revert` stage, so the agent carrying out a regime (c)
   revert was told, one paragraph earlier in the same prompt, never to stage,
   commit, or restore those exact paths. The revert stage's prompt now opens
   with an explicit override line stating the guard clause does not apply to
@@ -621,8 +638,8 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
 - Engine-owned path guardrail, task-time backstop (#3, task 3 of 4): two
   layers now enforce regimes (b)/(c) of the three-regime model during
   implementation, on top of task 2's select-phase regime (a) skip.
-  Layer 1 (advisory): `scopeGuard()` — prepended to EVERY stage prompt,
-  unconditionally, not just at concurrency > 1 — appends a clause naming
+  Layer 1 (advisory): `scopeGuard()` (prepended to EVERY stage prompt,
+  unconditionally, not just at concurrency > 1) appends a clause naming
   `ENGINE_OWNED` and instructing agents never to stage, commit, or restore
   those paths from git history for any reason, surfacing a discrepancy as a
   deferred note instead. Layer 2 (deterministic backstop): a new
@@ -633,15 +650,15 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   batch baseline; JS (never the agent) filters via `matchesGlobs` against
   `ENGINE_OWNED`, then routes on `ctx.engineOwnedIntentional` (now threaded
   onto `ctx` at `processIssue()` init from the `deriveUnits()`-shaped unit):
-  regime (b) — this issue's own prose targets the set — leaves the
-  implementation exactly as committed, no revert; regime (c) — it doesn't,
-  but engine-owned paths showed up anyway — a single-purpose stage hard
-  reverts ONLY the paths where `isHardRevertPath(f, ENGINE_OWNED,
+  regime (b), where this issue's own prose targets the set, leaves the
+  implementation exactly as committed, no revert; regime (c), where it
+  doesn't but engine-owned paths showed up anyway, a single-purpose stage
+  hard reverts ONLY the paths where `isHardRevertPath(f, ENGINE_OWNED,
   LOCKSTEP_INSTALLED_PATHS)` is true to the batch baseline, commits, and
   pushes, while lockstep-installed paths (e.g. this repo's own
   `.claude/workflows/ticketmill.js`) are left in place for the test loop's
   own lint-engine byte-compare to catch any divergence in-band. The gate
-  never halts the run on its own — a dead probe or a failed/dead revert
+  never halts the run on its own: a dead probe or a failed/dead revert
   degrades to a recorded `ctx.deferred` follow-up instead of blocking an
   otherwise-green issue. Added `tests/engine-owned.test.js` coverage for
   `runEngineOwnedGate` across every regime and edge case, including a
@@ -665,7 +682,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   group's live members (`memberRefs.some`) instead of inheriting only the
   primary's own flag, since `pickPrimary` picks a primary for group-identity
   reasons unrelated to intent. A deterministic pass between the preflight log
-  and the consolidation gate — regime (a) of the three-regime model — flips
+  and the consolidation gate, regime (a) of the three-regime model, flips
   `resume_point` to `skip` for any issue where `engineOwnedIntentional` is
   true AND `root_dirty_engine_paths` is non-empty, naming the dirty paths and
   the safe path in the reason; the existing skip branch, claim filter, and
@@ -676,7 +693,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   from both consolidation candidacy and the claim filter, and
   `tests/consolidation.test.js` coverage proving a group's
   `engineOwnedIntentional` is true even when the deliberate-engine member
-  isn't the primary. Regime (b) (deliberate engine work, clean root — e.g.
+  isn't the primary. Regime (b) (deliberate engine work, clean root; e.g.
   issue #3 itself) and the post-implement hard-revert gate (regime (c)) are
   task 3.
 
@@ -684,7 +701,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
 
 - Engine-owned path guardrail, foundation (#3, task 1 of 4): added
   `ENGINE_OWNED_GLOBS` (`.claude/ticketmill.json`, `.claude/agents/**`,
-  `.claude/workflows/ticketmill.js`, `.claude/scripts/ticketmill/**`) — paths
+  `.claude/workflows/ticketmill.js`, `.claude/scripts/ticketmill/**`): paths
   a run must treat as read-only, extensible via a new optional
   `profile.engine_owned_globs` (`mergeEngineOwnedGlobs`). Added a new optional
   `profile.lockstep_installed_paths` (default `[]`) naming engine-owned paths
@@ -698,7 +715,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   `isHardRevertPath(file, engineGlobs, lockstepPaths)` (file-level predicate
   built on the existing `matchesGlobs`, not a glob-string set difference, so a
   lockstep path nested under a directory glob is correctly exempted). Neither
-  helper is wired into a gate yet — that's tasks 2 (select-phase skip) and 3
+  helper is wired into a gate yet. That's tasks 2 (select-phase skip) and 3
   (post-implement hard-revert) of #3.
 
 ## 0.1.20 (2026-07-19)
@@ -716,7 +733,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   explicitly calls out but no test previously verified: `runMergeAutoResolve`
   resolves cleanly (rebase, forced green tests, force-push all succeed) but
   the merge stage's own subsequent preflight then blocks for an unrelated
-  reason — asserting `ctx.metrics.merge_auto_resolved` stays at 0 in that
+  reason, asserting `ctx.metrics.merge_auto_resolved` stays at 0 in that
   case, not just when auto-resolve itself declines or aborts.
 
 ## 0.1.19 (2026-07-19)
@@ -733,7 +750,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   hunks go to an implementer-persona conflict-resolver stage that prefers
   keeping both sides' changes and runs `git rebase --abort` rather than guess
   on a semantic conflict. A forced, skip-bypassing `runTestLoop` run on the
-  exact rebased state is mandatory before anything is pushed — the test suite
+  exact rebased state is mandatory before anything is pushed: the test suite
   is the safety property, not the resolver's judgment. A thrash guard checks
   the batch branch didn't move again while tests ran and escalates (bumping
   `ctx.metrics.merge_thrash`) rather than replaying an unverified rebase, so
@@ -778,7 +795,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
 ## 0.1.17 (2026-07-19)
 
 - Test quality fix (#11): the previous test pass only exercised the pure
-  `aggregateTokens()` helper — the half of #11 that does the actual token
+  `aggregateTokens()` helper. The half of #11 that does the actual token
   attribution, `stage()`'s tokensBefore/tokensAfter instrumentation and the
   guarded `spentTokens()` wrapper it depends on, had no direct coverage, and
   `tests/harness.js`'s `makeCtx()` fixture had no `tokens` field, so every
@@ -787,7 +804,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   directly across all its guard branches (budget missing, `.spent` not a
   function, `.spent()` throwing, and non-finite/non-numeric returns), and
   eight more call `context.stage(...)` directly with a scripted, stateful
-  `budget.spent()` to prove the delta math end-to-end — the `Math.max(0, ...)`
+  `budget.spent()` to prove the delta math end-to-end: the `Math.max(0, ...)`
   clamp on a backwards-moving counter, one before/after sample spanning the
   whole retry loop (not one per attempt), `byModel` accumulation across
   multiple calls to the same model, the no-model and no-`ctx.tokens` no-ops,
@@ -801,7 +818,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
 - Fixed `aggregateTokens()` (#11 quality review) so `resultsJson.tokens.run_total`
   never disagrees with the "## Token Usage" markdown it ships alongside. When
   `budget.spent()` is unavailable but a stage delta was still tracked,
-  `run_total` used to fall back to the summed deltas — a real number — while
+  `run_total` used to fall back to the summed deltas (a real number) while
   the markdown unconditionally said "Run total: not tracked". `run_total` is
   now `null` in that case too, matching the prose. Added a regression test in
   `tests/token-usage.test.js`.
@@ -819,7 +836,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   whole breakdown is labelled approximate, since a single shared monotonic
   counter can't be split across overlapping concurrent stages. Surfaced in
   the batch PR body, the run report JSON/markdown, and per-issue PR bodies
-  (subtotal only). Tokens only — no currency or per-token price anywhere, and
+  (subtotal only). Tokens only: no currency or per-token price anywhere, and
   a missing/unavailable counter renders "not tracked" rather than a false
   zero. Added `tests/token-usage.test.js` covering both reconciliation modes
   and the "not tracked" degrade path via the harness.
@@ -840,11 +857,11 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
 
 - Added `.github/workflows/ci.yml`: runs the profile's `test_command` on
   every pull request (no branch filter) and on pushes to `main`, on
-  `ubuntu-latest` with Node 22. `permissions: contents: read` only — no
+  `ubuntu-latest` with Node 22. `permissions: contents: read` only, no
   secrets, no `gh` auth, no `GITHUB_TOKEN` beyond checkout's default. The
   run step extracts the command via
   `jq -r '.test_command // ""' .claude/ticketmill.json` and executes it
-  with `bash -c`, so the command itself is never restated in the YAML —
+  with `bash -c`, so the command itself is never restated in the YAML.
   `.claude/ticketmill.json` stays the single source of truth. An empty
   `test_command` prints a `::notice::` and exits 0 instead of failing. A
   syntax error anywhere in the profile's test chain (engine, scripts,
@@ -855,7 +872,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
 - Added `scripts/lint-engine.js`, a zero-dependency sandbox-rule lint for
   `workflows/ticketmill.js`. The Workflow tool sandbox forbids `Date.now()`,
   `Math.random()`, argless `new Date()`, and any filesystem/Node API
-  (`require`/`import`) — all legal JavaScript, so `node --check` passes on
+  (`require`/`import`): all legal JavaScript, so `node --check` passes on
   them, but they throw at runtime or silently break resume. The lint does a
   dumb, loud, line-by-line text scan for those constructs and prints
   `file:line: message` on any hit, skipping pure-comment lines (the engine's
@@ -863,7 +880,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   literal `// sandbox-ok` marker, the only escape hatch (no weaker
   pattern-based exceptions).
 - The same script also fails if `.claude/workflows/ticketmill.js` is not
-  byte-identical to `workflows/ticketmill.js` — the two are supposed to be
+  byte-identical to `workflows/ticketmill.js`: the two are supposed to be
   the same engine, and drift means one copy was edited without the other.
   Wired `node scripts/lint-engine.js` into `test_command` in
   `.claude/ticketmill.json` immediately after `node --check`, and reinforced
@@ -892,7 +909,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   upstream title changes (a pre-planted sentinel file proves the worktree
   isn't destroyed), stale-worktree replacement when the checked-out branch
   doesn't match the prefix, a missing-args usage error, and an unfetchable
-  base-branch error — the last two assert a non-zero exit plus the JSON error
+  base-branch error. The last two assert a non-zero exit plus the JSON error
   shape. Also runs `shellcheck` on the script when available.
 - Fixed a real contract bug the new suite caught: `git branch <name>
   origin/<base>` in `scripts/setup-worktree.sh` was unredirected and leaked a
@@ -901,14 +918,14 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   match the adjacent `worktree add` call.
 - Wired `&& bash tests/setup-worktree.test.sh` onto the profile's
   `test_command` in `.claude/ticketmill.json`, appended after the existing
-  `node --test` entry — a `.test.sh` file is invisible to `node --test`'s
+  `node --test` entry: a `.test.sh` file is invisible to `node --test`'s
   `tests/*.test.js` discovery, so both suites run and neither shadows the
   other.
 
 ## 0.1.10 (2026-07-19)
 
 - Wired `node --test` into the profile's `test_command`, after the existing
-  `node --check` / `bash -n` / manifest-JSON smoke checks — the 33-test suite
+  `node --check` / `bash -n` / manifest-JSON smoke checks. The 33-test suite
   added in issue #4 (`tests/`: a truncate-and-evaluate vm harness plus unit
   tests for `sanitizeTasks`, `scopeGuard`, the decision/settled/notes ledger
   helpers, `timeline`, `pickFixAgent`, `globToRe`/`matchesGlobs`, and the test
@@ -920,7 +937,7 @@ Batch 2026-07-19-e (PR #56, squash-merged as 3665bb4): eight issues.
   covered helper on disk turns `node --test` red (3/33 failing), then cleanly
   reverting it back to green.
 - `test_command` uses bare `node --test` (auto-discovers `tests/*.test.js`),
-  not `node --test tests/` — the directory-argument form throws
+  not `node --test tests/`: the directory-argument form throws
   `MODULE_NOT_FOUND` on Node 22.22.0.
 
 ## 0.1.9 (2026-07-19)

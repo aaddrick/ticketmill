@@ -154,7 +154,7 @@ over the `.claude` copy; the two are never meant to diverge.
 
 The Workflow tool sandbox forbids `Date.now()`, `Math.random()`, argless
 `new Date()`, and any filesystem/Node API (`require`/`import`) inside the engine
-script — all legal JavaScript, so `node --check` passes on every one of them,
+script: all legal JavaScript, so `node --check` passes on every one of them,
 but they throw at runtime and silently break resume (wall-clock time and
 randomness aren't available in that sandbox; see the comments near the top of
 `workflows/ticketmill.js`). That gap used to live only as tribal knowledge in
@@ -162,7 +162,7 @@ randomness aren't available in that sandbox; see the comments near the top of
 scan wired into `test_command` right after `node --check`, so a violation fails
 CI instead of a live run. Pure-comment lines are skipped (the engine's own docs
 legitimately name these APIs), and a line carrying the literal `// sandbox-ok`
-marker is the only escape hatch — deliberately narrower than a pattern-based
+marker is the only escape hatch, deliberately narrower than a pattern-based
 exception, so it has to be spelled out per line rather than silently suppressing
 a whole rule.
 
@@ -277,7 +277,7 @@ run, not the run that turned it on. The two agent charters
 `ticketmill-code-reviewer.md`, both engine-owned) have been realigned to
 match: the implementer no longer bumps the version or adds a CHANGELOG
 entry per-issue, and the code reviewer no longer flags a per-issue PR for
-a missing bump — both describe that release discipline as batch-level,
+a missing bump. Both describe that release discipline as batch-level,
 owned by the gated Report-phase `release` stage.
 
 ### Merge auto-resolve: one mechanical recovery attempt before needs_human
@@ -481,7 +481,7 @@ sandbox has no fs/git/gh (see "Sandbox lint" above), so it can't walk
 does both jobs live: it reads the run-history ledger and each run's full
 record to build the list of gradable targets (a merged member issue of a
 prior run's batch PR), then resolves one raw observation per target with
-`gh pr view`, `gh issue view`, and `gh search` — live reads, never the
+`gh pr view`, `gh issue view`, and `gh search`: live reads, never the
 run record's own possibly-stale status. It fires alongside `learnPromise`
 so its latency hides behind the same preflight probes, and it is
 strictly read-only: no git fetch, no local writes, no state-changing `gh`
@@ -530,7 +530,7 @@ appended. It compares this pass's freshly graded lines against
 append-only) and keeps only lines that are new or whose grade changed,
 skipping any key whose prior grade is already terminal
 (`reverted`/`reopened`/`hotfix`/`later_batch_fix`/`closed_unmerged`/
-`abandoned` — `OUTCOME_TERMINAL_GRADES`) so settled history never gets
+`abandoned`: `OUTCOME_TERMINAL_GRADES`) so settled history never gets
 bloated or second-guessed by a possibly-flaky re-read. `summarizeOutcomeCoverage`
 rolls the pass into `graded_count`/`negative_count`/`pending_count`/
 `sample_cap_hit`, so a later tier can read one small object instead of
@@ -573,7 +573,7 @@ to `false`, the same ethos as `ageInDays`/`deriveAbandoned`.
 
 **`isPlannedFollowup(bodyText)` keeps a pre-planned continuation out of
 the grade.** A later PR whose own body reads as a scheduled next step
-("follow-up from", "follow up from", "depends on", "deferred from" —
+("follow-up from", "follow up from", "depends on", "deferred from";
 case-insensitive) isn't repairing a defect. It's doing work that was
 always going to happen. Validated against real history: #103's body
 ("Follow-up from #92...") is excluded, while reactive language like
@@ -792,7 +792,7 @@ keeps the wording in sync across all of them if it changes later.
 
 #### Layer 2: post-hoc validation of the posted SHA (issue #79)
 
-`COMMIT_SHA_ASK` is advisory only — it tells an agent how to get the real
+`COMMIT_SHA_ASK` is advisory only: it tells an agent how to get the real
 SHA, but the `commit` field a stage returns is still unverified free text.
 Nothing stopped a stage from posting a fabricated or stale SHA anyway.
 `collectPostedCommit(ctx, stageName, r)` is called at all eight
@@ -804,13 +804,13 @@ reported no commit at all, e.g. a fix stage that made no changes).
 `reviewAndMerge()`, immediately before `runMergeAutoResolve()`. Same
 read-only-dispatch shape as `probeChangedFiles()` immediately above it in
 `workflows/ticketmill.js`: it early-returns with **no dispatch** when
-`ctx.postedCommits` is empty (the common case — most stages never report a
+`ctx.postedCommits` is empty (the common case: most stages never report a
 commit), otherwise it dispatches a single read-only haiku probe that runs
 `git -C <worktree> cat-file -e <sha>^{commit}` for every distinct SHA
 collected and reports back which ones did not resolve. The probe runs
 before merge-auto-resolve deliberately: a rebase there legitimately
-rewrites every commit's SHA, and validating pre-rebase — while every posted
-SHA still resolves in the worktree — means there is nothing left to
+rewrites every commit's SHA, and validating pre-rebase (while every posted
+SHA still resolves in the worktree) means there is nothing left to
 re-validate afterward.
 
 The check is advisory-flag, never-halt, same as the engine-owned gate and
@@ -818,7 +818,7 @@ The check is advisory-flag, never-halt, same as the engine-owned gate and
 surfaces in the batch PR's Verification Gaps section) and a `ctx.deferred`
 note naming the posting stage, but never blocks the issue. A dead probe
 (the agent call dies through every retry) degrades to a recorded
-`ctx.deferred` note instead — same fail-open posture as every other
+`ctx.deferred` note instead, same fail-open posture as every other
 degrade-safe probe in this engine. One dispatch validates every SHA posted
 during the issue, not eight per-site round-trips.
 
@@ -915,7 +915,7 @@ finding caught the earlier version hiding this: a resumed run where no
 per-issue row and no stage bucket ever attributed a delta, but
 `budget.spent()` was still a real nonzero number, fell through to "Per-issue
 / per-model breakdown: not tracked" while the "Run total" line above it still
-showed the true spend — the table and the summary line disagreed. The
+showed the true spend. The table and the summary line disagreed. The
 remainder row now carries that full, otherwise-invisible spend instead, and
 the breakdown renders (with per-issue cells reading "not tracked") as long as
 either `spent` or a stage/per-issue delta is available. Per-issue PR bodies
@@ -981,8 +981,8 @@ nothing to do with tokens. An ordinary agent death got misreported as
 exhaustion, and the whole batch halted with every remaining issue left
 unstarted.
 
-The check now requires a budget/ceiling noun — or `token` narrowed to its
-plural `tokens` or a qualified form like `token budget`/`token limit` — to
+The check now requires a budget/ceiling noun (or `token` narrowed to its
+plural `tokens` or a qualified form like `token budget`/`token limit`) to
 co-occur with an exhaustion-shaped verb: exhaust, exceed, deplete, ran out,
 overrun/overage, went over, ran over, over budget, over the limit, or limit
 reached. Either alone isn't enough. The "over" family is anchored to those
@@ -992,7 +992,7 @@ singular `token` was dropped from the noun set (issue #62): it was broad
 enough to co-occur with an exhaustion verb in unrelated auth/rate-limit
 errors (an expired auth token, an API rate limit, a CSRF token check), each
 misreported as budget exhaustion. Narrowing to the qualified/plural forms
-also closed a recall gap — the old bare-`token` pattern never matched the
+also closed a recall gap: the old bare-`token` pattern never matched the
 plural, so "ran out of tokens" fell through to the death-counter backstop
 instead of tripping the fast path.
 

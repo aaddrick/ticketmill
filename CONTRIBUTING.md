@@ -7,7 +7,7 @@ obvious from browsing the code, so they're collected below.
 
 ## Prerequisites
 
-Node >= 22 is required. This is documented, not enforced — there's no
+Node >= 22 is required. This is documented, not enforced. There's no
 `package.json`, so no `engines` field checks it for you. Make sure your local
 Node satisfies it before running the test suite.
 
@@ -49,12 +49,12 @@ line-by-line text scan, wired into `test_command` right after `node --check`.
 Pure-comment lines are skipped (the engine's own docs legitimately name these
 APIs), and a line carrying the literal `// sandbox-ok` marker is the only
 escape hatch. Use it sparingly and only when the line is genuinely not the
-forbidden construct — deliberately narrower than a pattern-based exception,
-so a false positive has to be spelled out per line rather than silently
-suppressing a whole rule.
+forbidden construct. That's deliberately narrower than a pattern-based
+exception, so a false positive has to be spelled out per line rather than
+silently suppressing a whole rule.
 
 ## Release discipline
 
 Every change updates `CHANGELOG.md` and bumps the version in
 `.claude-plugin/plugin.json`, via conventional commits. `.claude-plugin/marketplace.json`
-has no version field — never add one.
+has no version field. Never add one.
