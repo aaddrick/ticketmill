@@ -1,0 +1,32 @@
+{
+  "_schema": [
+    "The 15 H2 heading texts from README.md as it stood at commit",
+    "ac612eb07f68d57e8f43a312cc76275064930bde (the batch base before the",
+    "README -> docs/ topic-file extraction, issue #155), in file order.",
+    "Read directly by tests/readme-docs-census.test.js so that test stays",
+    "GIT-FREE and keeps working after a shallow CI checkout or after",
+    "ac612eb stops being a reachable ancestor of anything (e.g. after the",
+    "eventual squash-merge rewrites history). Captured once via:",
+    "  git show ac612eb07f68d57e8f43a312cc76275064930bde:README.md | grep '^## '",
+    "This is base-commit ground truth, not derived at test time -- do not",
+    "regenerate it against a different commit."
+  ],
+  "baseCommit": "ac612eb07f68d57e8f43a312cc76275064930bde",
+  "headings": [
+    "Install",
+    "Requirements",
+    "Quickstart",
+    "Run options",
+    "What makes it trustworthy",
+    "Watching a run",
+    "Follow-up issues",
+    "Overlapping batches",
+    "Resuming an interrupted run",
+    "Troubleshooting",
+    "How agents work",
+    "Profile reference",
+    "Repo layout",
+    "Author",
+    "License"
+  ]
+}
