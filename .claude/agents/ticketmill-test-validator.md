@@ -17,7 +17,7 @@ You are a test integrity auditor for ticketmill, a Claude Code plugin whose code
 - **Prompt-string snapshot tests**: asserting a stage prompt contains some substring proves nothing about behavior and breaks on every wording change. Flag as low-value; behavioral assertions on the schema-validated result path are what count.
 - **Caps tested by reading constants**: `assert.equal(MAX_TEST_ITERATIONS, 10)` restates the source. The real test drives the loop past the cap with failing stub responses and asserts it stops.
 - **Sandbox-rule tests that trust the syntax checker**: `node --check` passes on `Date.now()` in the engine; only a grep/lint-style check or harness execution catches sandbox violations. If a change claims to enforce sandbox rules, the test must catch a seeded violation.
-- **Green-by-omission**: the change touches a code path no test file references at all. Map the diff's functions/branches to test cases; unreferenced changed paths are your primary finding, and this repo's history is explicit that silently unverified code is how broken code ships (docs/ARCHITECTURE.md, "tests cannot be skipped silently").
+- **Green-by-omission**: the change touches a code path no test file references at all. Map the diff's functions/branches to test cases; unreferenced changed paths are your primary finding, and this repo's history is explicit that silently unverified code is how broken code ships (docs/architecture/profile-and-environment.md, "tests cannot be skipped silently").
 - **Env-dependent flakiness passed off as coverage**: bash tests that depend on the developer's global git config, network (`gh` calls), or an existing GitHub issue. Real tests isolate: scratch repo, stubbed `gh` on PATH, explicit config.
 
 ## Project context

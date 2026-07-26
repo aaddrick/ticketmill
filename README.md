@@ -20,29 +20,6 @@ claude plugin marketplace add aaddrick/ticketmill
 /plugin install ticketmill@ticketmill
 ```
 
-## Requirements
-
-- **Claude Code with the `Workflow` tool available.** The engine is a workflow
-  script; the `mill` skill hard-stops if the tool is missing rather than simulate
-  the pipeline inline (an imitation run has no journal, claims, breakers, or
-  resumability).
-- **`gh` (GitHub CLI), authenticated, with write access to the target repo.**
-  `gh auth status` must succeed and the token must be able to write to the repo:
-  the engine reads issues and creates labels, issue/PR comments, branches, and
-  pull requests. `mill-init` probes this during onboarding.
-- **`git`** with worktree support (any modern version). Each issue is implemented
-  in its own worktree branched from the batch branch.
-- **A target repo that is a git clone with a GitHub remote** (`gh repo view` must
-  resolve an `owner/name` slug).
-- **A per-repo profile at `.claude/ticketmill.json`**, written by
-  `/ticketmill:mill-init`. No profile, no run. The engine never guesses a
-  toolchain.
-- **A locally runnable toolchain.** The profile's `install_commands` and
-  `test_command` must work on the machine running the batch. `mill-init`'s doctor
-  pass proves this once in a scratch worktree before the profile is written.
-- Optional: **browser verification** (`profile.browser`) additionally needs a
-  servable UI and the Claude browser MCP tools available in the session.
-
 ## Quickstart
 
 ```text
@@ -59,35 +36,18 @@ First run in a repo? Ask for a dry run ("mill issue 701 against dev, dry run").
 It probes every issue and reports the routing plan (skip / review-only /
 implement) without changing anything.
 
-## Run options
+The rest of the manual lives in [docs/](docs/index.md):
 
-Every run is a `Workflow` call with an `args` object. The `mill` skill assembles
-it from your request; these are the knobs it can turn:
-
-| Arg | Meaning |
-|---|---|
-| `branch` | Required. The base branch the final batch PR targets (e.g. `dev`, `main`) |
-| `issues` | Explicit issue numbers, e.g. `[701, 702]`. Provide this or `labels` |
-| `labels` | Select issues by label instead of by number |
-| `limit` | Cap for label selection (default 50) |
-| `state` | Issue state for label selection (default `open`) |
-| `no_assignee` | With `labels`: select only issues nobody is assigned to |
-| `concurrency` | Issue pipelines running in parallel: 1-5, default 2 |
-| `dry_run` | Read-only preview: probes every issue and reports the routing plan |
-| `run_label` (alias `date`) | Tag for claims and report filenames. Pass today's date so reports don't collide |
-| `batch_branch` | Resume a prior run by reusing its `Batch_<timestamp>` branch |
-| `token_budget` | Halt the run BEFORE it overspends: an absolute OUTPUT-token count, or a relative `"Nx"` / `{multiple_of_median}` form. Run arg wins over the profile field of the same name (see the `mill` skill's `token_budget` section) |
-| `root`, `repo` | Auto-discovered from git and gh; pass explicitly if the bootstrap probe fails |
-
-`concurrency` is parallelism across issues within one run: each pipeline gets
-its own worktree (and its own port when browser verification is on), and browser
-stages serialize through a shared lock at any setting. For coordination across
-runs on different machines, see Overlapping batches below.
-
-If you state the same options every time, put them in a skill: a small project
-skill that invokes `/ticketmill:mill` with your standing preferences (say,
-always `no_assignee`, concurrency 3, and your team's label conventions) turns a
-paragraph of instructions into one command.
+- [Getting started](docs/getting-started.md): full install requirements and the
+  quickstart above, unabridged.
+- [Run options](docs/run-options.md): every `mill` argument, plus running
+  overlapping batches across machines.
+- [Running a batch](docs/running-a-batch.md): watching a run, follow-up
+  issues, and resuming after an interruption.
+- [Troubleshooting](docs/troubleshooting.md).
+- [How agents work](docs/agents.md): the role map and how staffing works.
+- [Profile reference](docs/profile.md): every `.claude/ticketmill.json` field.
+- [Skills](docs/skills.md): the four `/ticketmill:*` skills.
 
 ## What makes it trustworthy
 
@@ -107,8 +67,8 @@ incident retrospectives. The machinery it keeps:
   re-litigation churn, and iteration caps that carry unresolved findings forward
   loudly instead of dropping them.
 - **Cross-run claims.** Issues are claimed before work starts, so batches started
-  by different maintainers never double-process an issue (see Overlapping batches
-  below).
+  by different maintainers never double-process an issue (see
+  [Overlapping batches](docs/run-options.md#overlapping-batches)).
 - **Mechanical merge recovery, tested before it's trusted.** A PR that goes
   `CONFLICTING` after review gets one automatic rebase-and-retest attempt
   before the run gives up on it: rebase onto the batch branch, resolve
@@ -120,193 +80,13 @@ incident retrospectives. The machinery it keeps:
   (the usage-limit signature), stop the run with a resume plan instead of burning
   through the batch.
 - **Resumable everywhere.** An interrupted run loses nothing: every path back is
-  covered in Resuming an interrupted run below.
+  covered in [Resuming an interrupted run](docs/running-a-batch.md#resuming-an-interrupted-run).
 - **Scope guards.** Every agent prompt pins its GitHub writes to its own issue and
   stamps comments with a machine-checkable marker; contrarian gates delete
   misfiled comments from concurrent pipelines.
 - **Self-improving.** Each run distills durable learnings into
   `logs/ticketmill/process-retrospective.md` and injects them into the next run's
   planning, review, and test prompts.
-
-## Watching a run
-
-The run narrates itself in the places you already look:
-
-- **The issue trail.** Every stage posts a comment as it happens, and every
-  review/fix loop iteration posts its own, so the trail shows each round of a
-  negotiation rather than one "implemented" note at the end. A halt posts the
-  failed stage plus resume instructions. Each comment carries an
-  `<!-- ticketmill owner/repo#N -->` marker naming the issue it belongs to.
-- **The PRs.** The per-issue PR collects the spec and code review rounds. The
-  batch PR carries the Verification Gaps section: every check that did not run,
-  in front of the human who is about to merge.
-- **The logs dir** (`logs_dir`, default `logs/ticketmill`). Each run writes
-  `runs/<run_label>.json` (the machine-readable record: per-issue metrics, tokens,
-  and timelines, written deterministically by the mill skill so nothing is truncated)
-  and appends one line to `runs.jsonl` (the cross-run ledger). It also writes
-  `summary-<run_label>.md` (the human version) and appends to the running
-  `process-retrospective.md`. A read-only pass also back-annotates prior runs'
-  merged PRs with what actually happened to them (reverted, reopened, hotfixed, or
-  held up cleanly) and appends the result to `outcomes.jsonl`, so self-improvement
-  has an outcome signal alongside the process-friction one.
-- **Live.** While a run is going, `/workflows` in Claude Code shows the progress
-  tree: which issues are in flight and which stage each one is in.
-
-## Follow-up issues
-
-Besides comments and labels, the engine writes one more thing to your tracker:
-at each successful squash-merge, it files new issues for work the run saw and
-deliberately did not do.
-
-- Two sources feed them. The merge stage scans the PR and issue trails for
-  deferred-work phrases ("follow-up", "out of scope but", "technical debt",
-  "future improvement", "consider adding"). It also drains a ledger the
-  pipeline carries: reviewer suggestions that passed review without being
-  required, tasks that failed review and were left incomplete, and reviews
-  skipped because a reviewer died.
-- Each distinct actionable item becomes one issue that references the source PR
-  and issue, labeled bug, enhancement, or tech-debt. The merge agent checks for
-  existing duplicates first, so a resumed run does not re-file.
-- Only merged issues file follow-ups. A failed or halted issue gets a halt
-  comment instead, and the deferred work stays visible in its trail.
-- Created issue numbers come back in the per-issue results, so the run report
-  lists what got filed.
-
-## Overlapping batches
-
-Two maintainers can start batches on different machines with overlapping issue
-lists. Claims keep them from colliding:
-
-- Before any work starts, a run claims every issue it selected: a claim label
-  plus a `## Ticketmill Claimed` comment recording the batch branch, run tag,
-  host, and start time.
-- A run that finds a fresh foreign claim (under 12 hours old) on an issue skips
-  it and processes the rest of its batch. When two runs start at the same
-  moment, both post and then re-read: the earlier claim wins.
-- Claims from your own batch branch count as yours. That is what lets a resumed
-  run pick its issues back up instead of skipping them.
-- Claims release when an issue merges or halts, plus a sweep at report time. A
-  run that dies without releasing is covered by the 12-hour staleness window.
-- Claims are advisory and fail open: if the claim step itself dies, the run
-  proceeds. The worst case is two runs implementing the same issue in their own
-  batch branches, and the humans reviewing those two batch PRs resolve it.
-  Neither run writes to your base branch either way.
-
-## Resuming an interrupted run
-
-Runs die for boring reasons: the laptop loses power, the session hits a usage
-limit, the API has an outage. The engine treats all of them as expected weather.
-
-- **Session still alive.** Resume in place with
-  `Workflow({ scriptPath, resumeFromRunId: "wf_..." })`. The journal replays
-  every completed stage from cache and picks up at the first unfinished one.
-- **Session gone** (power loss, restart, new machine). Re-run with the same args
-  plus `batch_branch: "Batch_<timestamp>"` from the dead run. The preflight
-  probe reads live GitHub and git state and routes each issue: merged or closed
-  skips, an open per-issue PR goes straight to review and merge, and a partial
-  branch keeps implementing. Worktree setup is idempotent, and both the planner
-  and every implement prompt check existing commits before adding work.
-- **Lost the batch branch name with the session?** It survives in three places:
-  on the remote (`git branch -r` lists `Batch_<timestamp>`, pushed at run
-  start), in the run report under the logs dir if the run got that far, and in
-  the `## Ticketmill Claimed` comment on any issue the run claimed.
-- **Usage limits trip a breaker on purpose.** Three consecutive agent deaths is
-  the signature of a limit or an outage, so the run stops launching issues and
-  writes a resume plan instead of failing the batch one issue at a time.
-- **Your own interruption never blocks you.** A resumed run on the same batch
-  branch recognizes the dead run's claims as its own and continues; other
-  maintainers' runs see them as foreign until the 12-hour staleness window
-  clears them.
-- **Every halted issue tells you where it stopped.** The halt comment names the
-  failed stage and repeats the resume instructions.
-
-## Troubleshooting
-
-- **"Workflow tool unavailable" hard-stop.** The `mill` skill refuses to fake the
-  pipeline inline. See Requirements above for why an imitation run isn't safe.
-  Fix: enable the `Workflow` tool in Claude Code, then retry.
-- **Bootstrap probe failed.** The engine couldn't auto-discover your repo root or
-  `owner/name` slug from git/gh. Fix: pass `root` and `repo` explicitly, per the
-  Run options table above.
-- **Doctor pass fails during `mill-init`.** Your install commands or test suite
-  don't run cleanly in a scratch worktree, so `mill-init` refuses to write a
-  profile. Fix: get the toolchain working locally first, then re-run
-  `mill-init`. See Quickstart above.
-- **Lost the batch branch name.** It survives in three places: `git branch -r`
-  (pushed at run start), the run report under the logs dir, and the
-  `## Ticketmill Claimed` comment on any issue the run claimed. See Resuming an
-  interrupted run above.
-- **Stale browser lock after a hard kill.** A run that dies mid-browser-stage can
-  leave the host-global lock at `/tmp/ticketmill-browser-lock` held. You usually
-  don't need to do anything: the next run's poll steals it once it clears the
-  30-minute default (`stale_seconds`). Delete the lock file by hand if you want
-  it cleared sooner. Both the path and the staleness window are configurable via
-  `profile.browser.lock_path` and `profile.browser.stale_seconds`.
-- **A run skips your issue with no error.** Another batch claimed it less than
-  12 hours ago. Either wait out the staleness window and re-run, or read the
-  `## Ticketmill Claimed` comment on the issue to find the owning run's batch
-  branch and host.
-
-## How agents work
-
-Ticketmill thinks in roles. Your profile's `roles` map assigns each role to an
-agent in your repo's `.claude/agents/`. Every role also has a built-in fallback
-charter, so a role left `null` still runs on the generic charter. If the profile
-names an agent whose file is missing, the engine uses the fallback and lists the
-gap in the batch PR's Verification Gaps section.
-
-| Role (profile key) | What it does in the pipeline |
-|---|---|
-| `implementers` | The agents that write code: an array, ideally one per domain (e.g. backend, frontend). The planner assigns each task to the best fit |
-| `default_implementer` | The implementer used when no domain-specific one fits a task |
-| `task_reviewer` | After each task: verifies the implementation achieves the task goal against the actual diff |
-| `spec_reviewer` | At the PR gate: verifies the PR fulfills the *issue's* requirements and flags scope creep for removal |
-| `code_reviewer` | At the PR gate (parallel with spec review): correctness, security, error handling, codebase conventions |
-| `contrarian` | Devil's-advocate gate that stress-tests the approach and the task plan before any code is written |
-| `test_validator` | Audits tests for cheating: hollow assertions, mock abuse, missing edge cases, tests that pass without exercising the change |
-| `simplifier` | Quality loop: refines changed code for clarity and consistency without changing behavior (gated by `simplify_globs`) |
-| `docblock_writer` | Writes doc comments for changed code in the project's style (gated by `docblock_globs`) |
-| `doc_writer` | Writes technical design docs into `docs_dir` after review passes (skipped when `docs_dir` is `null`) |
-
-One mechanism, deliberately: a stage's subagent is instructed to read the mapped
-agent file and adopt its persona. The engine never depends on the session's agent
-registry, so a freshly generated agent works in the very next run, and behavior is
-identical before and after a session restart.
-
-Role staffing happens during onboarding. mill-init reads each agent in your
-repo's `.claude/agents/` and maps it to a role by what its description says it
-does. It never force-fits: a UX reviewer is not a code reviewer, and a role with
-no honest match stays `null`. The contrarian role fills automatically from a
-bundled template copied into your repo (mill-init prefers a
-`~/.claude/agents/contrarian.md` of your own if one exists). Every other gap
-gets an inline choice: keep the built-in charter, or have
-`/ticketmill:forge-agent` write a project agent grounded in domain research plus
-your actual codebase conventions. A forged agent updates the role map itself, so
-the profile needs no hand edits.
-
-## Profile reference
-
-See the annotated schema in the header of `workflows/ticketmill.js`. The
-load-bearing fields:
-
-| Field | Meaning |
-|---|---|
-| `test_command` | Required key. Command string, or explicit `null` (no test gate, surfaced on every batch PR) |
-| `test_globs` | Changed-file patterns that count as testable |
-| `install_commands`, `env_files` | Per-worktree provisioning (run/copied at issue setup) |
-| `verify_notes` | Environment preconditions injected into test/fix prompts (required services, seed data) |
-| `roles` | Role-to-agent map; `implementers` is the list the planner assigns tasks to |
-| `simplify_globs`, `docblock_globs`, `docs_dir` | Gate the simplify, docblock, and tech-docs stages; `null` skips |
-| `browser` | Opt-in live browser verification (serve command with `{port}`, UI globs, notes). Also accepts optional `lock_path` (default `/tmp/ticketmill-browser-lock`), `stale_seconds` (default `1800`), `poll_seconds` (default `15`), `port_span` (default `900`), and `artifact_dir` (default `/tmp/ticketmill-issue-{issue}`, `{issue}`-templated like `serve_command`'s `{port}`); **caveat:** the resolved `artifact_dir` is deleted with `rm -rf` on cleanup (both the per-issue browser-verify stage and the final batch cleanup), so it must be a dedicated scratch path (never a project directory, shared mount, or `$HOME`) |
-| `models` | Per-stage model/effort overrides. Valid stage keys are enumerated in the header schema comment (`workflows/ticketmill.js`), adjacent to the `M` map that is their source of truth |
-| `consolidation` | Default `true`. Set `false` to disable the Select-phase consolidation gate entirely (a resumed run still heals any group a prior run already committed to) |
-| `release` | Optional, default `null` (Report-phase release stage skipped entirely). Set `{ version_files: [...] }` to opt in to a once-per-batch CHANGELOG entry and version bump on the canonical version file(s), landed before the batch PR. Also accepts optional `changelog` (default `CHANGELOG.md`) and `bump` (`"major"\|"minor"\|"patch"` override; unset derives `feat` -> minor, else patch, from the batch's shipped commit types) |
-| `serialize_globs` | Optional, default `[]`. Patterns worth trusting as a lane-scheduling hint beyond predicted-file overlap alone: a shared schema, a magnet config, anything two issues could conflict on without their own predicted paths overlapping |
-| `warn_base_branches` | Optional, default `[]`. Base branch names that trigger a Select-phase warning when a batch targets one of them (PRs normally target the working branch, not a branch that auto-deploys on push). Unset/`[]` = no warning |
-| `claim_label` | GitHub label applied to an issue when a run claims it (cross-run coordination; see header schema) |
-| `engine_owned_globs` | Optional, default `[]`. Extends the built-in engine-owned path set (`.claude/ticketmill.json`, `.claude/agents/**`, `.claude/workflows/ticketmill.js`, `.claude/scripts/ticketmill/**`), read-only during a run |
-| `lockstep_installed_paths` | Optional, default `[]`. Engine-owned paths that are a deliberate installed copy of a source-of-truth file elsewhere in this repo, exempted from the post-implement hard-revert gate |
-| `logs_dir` | Directory for run summaries and retrospective learnings |
 
 ## Repo layout
 
@@ -318,7 +98,10 @@ skills/            mill (launch), mill-init (onboarding), forge-agent (agent gen
 templates/         agents/contrarian.md, copied into repos that lack one
 scripts/           setup-worktree.sh (worktree creation), lint-engine.js (sandbox/lockstep gate)
 tests/             the test suite gating every run
-docs/              ARCHITECTURE.md, diagrams/ (D2 sources + generated SVGs, see render.sh)
+docs/              index.md + topic guides (getting-started, run-options, profile,
+                   agents, skills, running-a-batch, troubleshooting), architecture/
+                   (design decisions, split by topic), diagrams/ (D2 sources +
+                   generated SVGs, see render.sh)
 .claude/           this repo's own ticketmill profile, workflows/, and agents/ (it self-hosts its mill runs)
 ```
 
@@ -327,8 +110,9 @@ why `mill-init` copies the engine into your repo's `.claude/workflows/` and the
 `mill` skill invokes it by `scriptPath`. A plain git clone of this repo works too;
 the plugin install just adds the namespaced skills. This repo runs `mill` on itself: it
 carries its own `.claude/ticketmill.json` profile plus a `.claude/workflows/ticketmill.js`
-lockstep-installed copy of `workflows/ticketmill.js` (see `lockstep_installed_paths` above)
-and `.claude/agents/*.md`, the forged agent personas that do the work.
+lockstep-installed copy of `workflows/ticketmill.js` (see `lockstep_installed_paths`
+in the [profile reference](docs/profile.md)) and `.claude/agents/*.md`, the forged
+agent personas that do the work.
 
 ## Author
 

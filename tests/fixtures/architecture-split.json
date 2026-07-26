@@ -1,0 +1,251 @@
+{
+  "_schema": [
+    "This fixture is the single shared manifest for splitting docs/ARCHITECTURE.md",
+    "(base, 1310 lines at commit ac612eb) into docs/architecture/*.md plus the",
+    "docs/index.md and docs/ARCHITECTURE.md-stub deliverables. It is read by both",
+    "split.mjs (generate) and unsplit.mjs (reverse round-trip), so it is the one",
+    "place that encodes 'byte-identical except link rewrites, heading promotion,",
+    "and added ledes'.",
+    "",
+    "LOCATOR RULE: every segment is located in the base file by `firstLine`",
+    "(the exact, verbatim base text at that 1-indexed line number) via an exact,",
+    "whole-line string match. `firstLine` is the ONLY locator. `lastLine` is a",
+    "redundant assertion only -- the base text at (firstLine's line number + lines",
+    "- 1) must equal `lastLine` -- and must NEVER be used to locate a segment,",
+    "because 13 of this file's 14 segment end lines are blank strings and would",
+    "collide against nearly every other blank line in the document. Line 1310",
+    "(the file's actual last line) is the one segment end line that is not blank.",
+    "",
+    "`firstLineOutput` is the exact generated-file string for that same line,",
+    "recorded literally rather than computed from `shift` at test time. For 12 of",
+    "the 14 segments this literal happens to equal the mechanical result of",
+    "removing `-shift` leading '#' characters from an ATX heading line (heading",
+    "PROMOTION: shift -1 turns '### X' into '## X', since a section that used to",
+    "be nested under the monolith's single H1 is now nested one level shallower",
+    "under its own file's H1). For exactly 2 segments -- pipeline.md's [7-94] and",
+    "failure-semantics.md's [1290-1310] -- the first line is a FOLD, not a shift",
+    "result: '## Pipeline' and '## Failure semantics' become the new file's own H1",
+    "('# Pipeline', '# Failure semantics') rather than being demoted by the",
+    "file's uniform shift. Arithmetically a -1 shift on a level-2 heading would",
+    "produce the same string, which is exactly why the fixture calls these out by",
+    "name in `folds` and records their `firstLineOutput` literally: the two are",
+    "conceptually different operations that happen to coincide numerically for",
+    "these two lines only.",
+    "",
+    "IMPORTANT: tests/fixtures/ is NOT discovered by a bare `node --test` (this",
+    "repo's test_command runs plain `node --test`, which auto-discovers",
+    "tests/*.test.js -- files directly under tests/ -- not arbitrary data under",
+    "tests/fixtures/). This JSON is inert data; the gate that reads it lives in",
+    "tests/architecture-split.test.js.",
+    "",
+    "`sha256` is intentionally empty at this stage (task 1, before any output file",
+    "exists): task 3 fills it in, one digest per generated output file, once",
+    "split.mjs has actually written docs/architecture/*.md, docs/index.md, and the",
+    "docs/ARCHITECTURE.md stub."
+  ],
+
+  "baseFile": "docs/ARCHITECTURE.md",
+  "baseFileLines": 1310,
+  "baseCommit": "ac612eb07f68d57e8f43a312cc76275064930bde",
+
+  "outputs": {
+    "docs/architecture/index.md": {
+      "segments": [
+        { "firstLine": "# Ticketmill Architecture", "firstLineOutput": "# Ticketmill Architecture", "lines": 6, "lastLine": "", "shift": 0 }
+      ]
+    },
+    "docs/architecture/pipeline.md": {
+      "segments": [
+        { "firstLine": "## Pipeline", "firstLineOutput": "# Pipeline", "lines": 88, "lastLine": "", "shift": -1 }
+      ]
+    },
+    "docs/architecture/agents-and-models.md": {
+      "segments": [
+        { "firstLine": "### One agent mechanism: persona-by-reference", "firstLineOutput": "## One agent mechanism: persona-by-reference", "lines": 15, "lastLine": "", "shift": -1 },
+        { "firstLine": "### Model policy", "firstLineOutput": "## Model policy", "lines": 32, "lastLine": "", "shift": -1 }
+      ]
+    },
+    "docs/architecture/profile-and-environment.md": {
+      "segments": [
+        { "firstLine": "### The profile is required, and tests cannot be skipped silently", "firstLineOutput": "## The profile is required, and tests cannot be skipped silently", "lines": 24, "lastLine": "", "shift": -1 }
+      ]
+    },
+    "docs/architecture/invocation-and-guardrails.md": {
+      "segments": [
+        { "firstLine": "### Invocation: scriptPath, with the engine copied into the target repo", "firstLineOutput": "## Invocation: scriptPath, with the engine copied into the target repo", "lines": 43, "lastLine": "", "shift": -1 },
+        { "firstLine": "### Engine-owned path guardrail: three regimes", "firstLineOutput": "## Engine-owned path guardrail: three regimes", "lines": 80, "lastLine": "", "shift": -1 }
+      ]
+    },
+    "docs/architecture/branching-and-merge.md": {
+      "segments": [
+        { "firstLine": "### Batch branch model", "firstLineOutput": "## Batch branch model", "lines": 180, "lastLine": "", "shift": -1 },
+        { "firstLine": "### Commit SHA integrity: read it, don't recall it", "firstLineOutput": "## Commit SHA integrity: read it, don't recall it", "lines": 49, "lastLine": "", "shift": -1 }
+      ]
+    },
+    "docs/architecture/metrics.md": {
+      "segments": [
+        { "firstLine": "### Friction & churn: a weighted per-run score, not a raw iteration count", "firstLineOutput": "## Friction & churn: a weighted per-run score, not a raw iteration count", "lines": 329, "lastLine": "", "shift": -1 }
+      ]
+    },
+    "docs/architecture/failure-semantics.md": {
+      "note": "Emission order != source order: the [1290-1310] segment (the short bullet list, folded into this file's H1) is emitted FIRST, then the [768-785] segment (the 'Incident-derived machinery' table, which precedes it in the base file) is appended SECOND as a supplementary section.",
+      "segments": [
+        { "firstLine": "## Failure semantics", "firstLineOutput": "# Failure semantics", "lines": 21, "lastLine": "  its members as independent issues.", "shift": -1 },
+        { "firstLine": "### Incident-derived machinery (preserved from the source engine)", "firstLineOutput": "## Incident-derived machinery (preserved from the source engine)", "lines": 18, "lastLine": "", "shift": -1 }
+      ]
+    },
+    "docs/architecture/cost-and-tokens.md": {
+      "segments": [
+        { "firstLine": "### Token tracking: instrumentation, never a gate", "firstLineOutput": "## Token tracking: instrumentation, never a gate", "lines": 228, "lastLine": "", "shift": -1 }
+      ]
+    },
+    "docs/architecture/scheduling.md": {
+      "segments": [
+        { "firstLine": "### Claims interop", "firstLineOutput": "## Claims interop", "lines": 195, "lastLine": "", "shift": -1 }
+      ]
+    }
+  },
+
+  "folds": [
+    { "line": 7, "from": "## Pipeline", "to": "# Pipeline", "file": "docs/architecture/pipeline.md", "reason": "Becomes pipeline.md's own H1 rather than a demoted subsection heading, so the file's overview picture/provenance paragraph/legend/five phase sections all land under one file-level title instead of a synthetic one." },
+    { "line": 1290, "from": "## Failure semantics", "to": "# Failure semantics", "file": "docs/architecture/failure-semantics.md", "reason": "Becomes failure-semantics.md's own H1 rather than a demoted subsection heading, matching the pipeline.md fold." }
+  ],
+
+  "rewrites": [
+    { "line": 10, "from": "diagrams/pipeline-overview-dark.svg", "to": "../diagrams/pipeline-overview-dark.svg" },
+    { "line": 11, "from": "diagrams/pipeline-overview-light.svg", "to": "../diagrams/pipeline-overview-light.svg" },
+    { "line": 14, "from": "](diagrams)", "to": "](../diagrams)" },
+    { "line": 34, "from": "diagrams/phase-select-dark.svg", "to": "../diagrams/phase-select-dark.svg" },
+    { "line": 35, "from": "diagrams/phase-select-light.svg", "to": "../diagrams/phase-select-light.svg" },
+    { "line": 55, "from": "diagrams/phase-plan-dark.svg", "to": "../diagrams/phase-plan-dark.svg" },
+    { "line": 56, "from": "diagrams/phase-plan-light.svg", "to": "../diagrams/phase-plan-light.svg" },
+    { "line": 66, "from": "diagrams/phase-build-dark.svg", "to": "../diagrams/phase-build-dark.svg" },
+    { "line": 67, "from": "diagrams/phase-build-light.svg", "to": "../diagrams/phase-build-light.svg" },
+    { "line": 76, "from": "diagrams/phase-ship-dark.svg", "to": "../diagrams/phase-ship-dark.svg" },
+    { "line": 77, "from": "diagrams/phase-ship-light.svg", "to": "../diagrams/phase-ship-light.svg" },
+    { "line": 87, "from": "diagrams/phase-report-dark.svg", "to": "../diagrams/phase-report-dark.svg" },
+    { "line": 88, "from": "diagrams/phase-report-light.svg", "to": "../diagrams/phase-report-light.svg" }
+  ],
+
+  "proseRefs": [
+    {
+      "line": 353,
+      "from": "`aggregateTokens` below",
+      "to": "`aggregateTokens` (cost-and-tokens.md)",
+      "reason": "'below' pointed at a later section of the monolith. After the split, aggregateTokens is defined in a separate file (cost-and-tokens.md) from this line's home (branching-and-merge.md), so a bare positional word would read false; naming the file keeps the cross-reference resolvable without a shared page to scroll."
+    },
+    {
+      "line": 409,
+      "from": "`aggregateTokens` and `aggregateMergeAutoResolve` above",
+      "to": "`aggregateTokens` (cost-and-tokens.md) and `aggregateMergeAutoResolve` (branching-and-merge.md)",
+      "reason": "'above' pointed at two earlier-defined helpers in the monolith. This line lands in metrics.md; aggregateTokens' definition moves to cost-and-tokens.md (a later file) and aggregateMergeAutoResolve's to branching-and-merge.md (an earlier file), so 'above' is wrong for one of the two and ambiguous for both once they're split apart."
+    },
+    {
+      "line": 489,
+      "from": "(see \"Sandbox lint\" above)",
+      "to": "(see \"Sandbox lint\" in invocation-and-guardrails.md)",
+      "reason": "'above' pointed at the Sandbox lint section a few hundred lines earlier in the monolith. This line lands in metrics.md; that section now lives in invocation-and-guardrails.md, a separate file, so the positional pointer would be silently wrong rather than merely stale."
+    },
+    {
+      "line": 1156,
+      "from": "`aggregateTokens()`'s per-issue breakdown",
+      "to": "`aggregateTokens()` (cost-and-tokens.md)'s per-issue breakdown",
+      "reason": "No directional word here, but this line lands in scheduling.md while aggregateTokens is defined in the separate cost-and-tokens.md file; the bare mention relied on being in the same scrollable document as its definition, which the split removes."
+    }
+  ],
+
+  "doNotTouch": [
+    {
+      "line": 15,
+      "text": "and render to the SVG pairs above via `docs/diagrams/render.sh`. Edit the `.d2`",
+      "reason": "Names docs/diagrams/render.sh as prose (a repo-relative script path mentioned in running text), not a markdown link target. It is not one of the 13 rewrite sites and must not be touched even though it sits one line below the `](diagrams)` link on line 14 that IS rewritten."
+    }
+  ],
+
+  "drops": [
+    {
+      "start": 95,
+      "end": 96,
+      "lines": ["## Design decisions", ""],
+      "reason": "Bare container heading with no prose of its own; its ten child subsections are distributed across seven of the ten output files, so the heading itself has nowhere single to land and is dropped rather than arbitrarily kept with one child."
+    }
+  ],
+
+  "reachabilityExempt": {
+    "rule": "Every .md file under docs/ must be reachable within two hops of docs/index.md (docs/index.md itself, or a file linked directly from it, or a file linked from one of those).",
+    "root": "docs/index.md sits on neither side of its own rule: it is the traversal's starting point, never a target that must itself be 'reached'.",
+    "exempt": [
+      {
+        "path": "docs/ARCHITECTURE.md",
+        "reason": "The reduced stub left at the old path is inbound-only by design: it exists so old links/bookmarks still resolve, and it points forward into docs/architecture/, but nothing under docs/ is meant to link back out to it."
+      },
+      {
+        "path": "docs/diagrams/CLAUDE.md",
+        "reason": "Byte-identical twin of docs/diagrams/AGENTS.md, kept only to satisfy the AGENTS.md/CLAUDE.md naming convention both agent runtimes look for. No page needs to link to both twins of the same content; linking one is sufficient."
+      },
+      {
+        "path": "docs/architecture/CLAUDE.md",
+        "reason": "Byte-identical twin of docs/architecture/AGENTS.md, same naming-convention pair as docs/diagrams/CLAUDE.md above. docs/architecture/index.md's file map links AGENTS.md only; linking one twin is sufficient."
+      }
+    ],
+    "exhaustiveness": "This list must be exhaustive: any other .md file under docs/ that the two-hop check finds unreachable from docs/index.md is a real gap and must fail the check, not be silently added here."
+  },
+
+  "intentionallyAdded": [
+    { "file": "docs/architecture/agents-and-models.md", "kind": "lede", "text": "Agent roles, the persona-by-reference mechanism, and model policy: how ticketmill decides which persona and which model handle a given stage.", "reason": "This file's first base line is a demoted ### heading, not a natural H1; a synthetic H1 title ('# Agents and models') plus this one-sentence lede is added above it so the file opens with orientation instead of dropping the reader mid-subsection." },
+    { "file": "docs/architecture/profile-and-environment.md", "kind": "lede", "text": "The .claude/ticketmill.json profile and the mill-init doctor pass: why the engine refuses to guess a repo's toolchain.", "reason": "Same as agents-and-models.md: this file's first base line is a demoted ### heading, so a synthetic H1 ('# Profile and environment') plus this lede is added above it." },
+    { "file": "docs/architecture/invocation-and-guardrails.md", "kind": "lede", "text": "How a run is invoked, where the engine's own files live, and the guardrails that keep an issue from touching engine-owned paths by accident.", "reason": "Synthetic H1 ('# Invocation and guardrails') plus this lede, added above the first demoted ### heading, same rationale as the other non-fold files." },
+    { "file": "docs/architecture/branching-and-merge.md", "kind": "lede", "text": "The batch-branch model, the Closes-lines bookkeeping, the release stage, and merge auto-resolve's one mechanical recovery attempt.", "reason": "Synthetic H1 ('# Branching and merge') plus this lede, added above the first demoted ### heading." },
+    { "file": "docs/architecture/metrics.md", "kind": "lede", "text": "Friction and churn, rework tax, gate yield, and outcome/revisit-risk grading: the run's self-reported signals of how hard it fought and whether that fight was worth it.", "reason": "Synthetic H1 ('# Metrics') plus this lede, added above the first demoted ### heading." },
+    { "file": "docs/architecture/cost-and-tokens.md", "kind": "lede", "text": "Token instrumentation, the cost estimator, and the token_budget guard: tracking spend as signal, never as a gate, except where a human explicitly asks it to be one.", "reason": "Synthetic H1 ('# Cost and tokens') plus this lede, added above the first demoted ### heading." },
+    { "file": "docs/architecture/scheduling.md", "kind": "lede", "text": "Claims interop, the consolidation gate, and lane scheduling: how the engine decides what to group and what to run concurrently.", "reason": "Synthetic H1 ('# Scheduling') plus this lede, added above the first demoted ### heading." },
+    { "file": "docs/architecture/index.md", "kind": "file-map", "reason": "A new list of links to all ten docs/architecture/*.md files, added after the reused base lines 1-6, so a reader landing on the architecture index can navigate to every split file. Not derived from any base text." },
+    { "file": "docs/index.md", "kind": "whole-file", "reason": "New doc-site root, not derived from base ARCHITECTURE.md text: links into docs/architecture/index.md and the docs/diagrams guides." },
+    { "file": "docs/ARCHITECTURE.md", "kind": "stub-body", "reason": "Reduced to a title, one sentence, a link to docs/architecture/index.md, and the same file map added to docs/architecture/index.md, replacing the ~1300 lines this split moves out." }
+  ],
+
+  "intentionallyDuplicated": [
+    {
+      "content": "the ten-file map (links to every docs/architecture/*.md file)",
+      "appearsIn": ["docs/architecture/index.md", "docs/ARCHITECTURE.md"],
+      "reason": "Both are legitimate entry points a reader can land on directly (a fresh docs/architecture/ browse, or an old bookmark to the pre-split path); each needs the full map on its own rather than forcing a hop through the other."
+    }
+  ],
+
+  "sha256": {
+    "_schema": [
+      "One digest per generated output file (docs/architecture/*.md, the ten keys",
+      "under `outputs` above), plus one `reconstructed` digest for the full",
+      "document. Both are computed the same GIT-FREE way tests/architecture-provenance.test.js",
+      "recomputes them: read each committed output file, locate every segment by",
+      "an exact whole-line search for its `firstLineOutput`, take `lines` lines",
+      "from there (padding back any trailing blank line writeLines() stripped at",
+      "generation time, then pinning the final line to `lastLine`), re-promote",
+      "headings by `-shift` (or restore the literal fold `from` text on a fold's",
+      "own first line), then either (a) join that one file's own segments with a",
+      "single blank line between them, in the file's own declared order -- this",
+      "is the per-file digest below, catching a hand-edit to THAT file's moved",
+      "prose -- or (b) place every segment (plus the two dropped lines) at its",
+      "fixed position in the base document's own SOURCE order (a hardcoded fact",
+      "about the frozen base commit, not re-derived from git) and reverse the 13",
+      "rewrites/4 proseRefs, then hash the whole 1310-line result -- this is",
+      "`reconstructed`, and it was verified once, non-committed, against",
+      "`git show ac612eb07f68d57e8f43a312cc76275064930bde:docs/ARCHITECTURE.md`",
+      "with an EMPTY diff (no allow-list entries were needed; the transform is",
+      "exact) before being baked in here as the durable proof. Both computations",
+      "are pure functions of committed files plus this fixture: no git call is",
+      "needed to reproduce either value again."
+    ],
+    "docs/architecture/index.md": "68c6923bc8a9a4b5241bf9812bf677de92f5ae1dab2e240bbc160a25f3bc7b64",
+    "docs/architecture/pipeline.md": "66ad12fb44b6270ae5f73aa685037dcb8fc98a12b0a53884444050d3623b8eae",
+    "docs/architecture/agents-and-models.md": "2d498bbeeca242c894c3e3637eb94c309411a3075b713a35ef608d74372b4fd3",
+    "docs/architecture/profile-and-environment.md": "bcb720e960444429262faab9c91dae92906ca4408c403e4fd7d173b810463770",
+    "docs/architecture/invocation-and-guardrails.md": "596b000d5658ed618da96a8c5075e9f8cd3a2bdffd951011d54fa5dd8bd4e24a",
+    "docs/architecture/branching-and-merge.md": "5a86474d3e0ec0fb6ab852699b36045f4590846a9014e0c7924b33ecc749ae64",
+    "docs/architecture/metrics.md": "6aaccef75bb08328c5a10cf49851a9c9bff13b26f9c344d4028961b852c4e298",
+    "docs/architecture/failure-semantics.md": "b64257331f921f5c1be29e4b0887824ca91b8b37d9b0aba82e83b84c1463833b",
+    "docs/architecture/cost-and-tokens.md": "ff1f12ebd21bfa87ac6a23a5ef40280d1a83de298bdd4091917b779347b8487f",
+    "docs/architecture/scheduling.md": "23c3b157ea7c055d938287ea31b1ff1fdbf3981846f80b5192f525d356749128",
+    "reconstructed": "a931cc9b23c9858e956e0c180d37a2bf1d9e4ae3d09d31600a5bf82a34b45c3b"
+  }
+}

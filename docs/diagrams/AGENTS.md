@@ -3,12 +3,18 @@
 Read this before editing anything in `docs/diagrams/`. Most of what follows is
 a lesson learned the expensive way: rendering something that looked fine
 locally and was unreadable, invisible, or mirrored once it landed in
-`docs/ARCHITECTURE.md`.
+`docs/architecture/pipeline.md`.
 
 > **Parity note:** `CLAUDE.md` and `AGENTS.md` in this directory are byte-identical
 > on purpose, so an agent finds the same guidance under whichever name its harness
 > looks for. If you change one, copy it over the other in the same commit:
 > `cp docs/diagrams/CLAUDE.md docs/diagrams/AGENTS.md`.
+
+> **Parity note:** every citation below points at
+> `docs/architecture/pipeline.md` alone, not `docs/architecture/index.md`. The
+> split that broke up `docs/ARCHITECTURE.md` (issue #154) carried the overview
+> picture and the legend table into `pipeline.md`'s own H1 section, so
+> `index.md` holds neither. One file, one hop.
 
 ## What lives here
 
@@ -50,10 +56,10 @@ tar -xzf d2.tar.gz          # binary lands at d2-v0.7.1/bin/d2
    "Verifying" below. Do not skip this; nearly every rule on this page exists
    because something passed a compile and failed a look.
 4. If you added or removed a diagram, update the `<picture>` blocks in
-   `docs/ARCHITECTURE.md` to match.
-5. If you changed what a class *means*, update the legend table in the
-   `## Pipeline` section of `docs/ARCHITECTURE.md`. The table and the theme
-   files are a contract; they drift silently.
+   `docs/architecture/pipeline.md` to match.
+5. If you changed what a class *means*, update the legend table in
+   `docs/architecture/pipeline.md`. The table and the theme files are a
+   contract; they drift silently.
 
 `render.sh` builds each diagram by **concatenating** a theme file and a body
 file into a temp file. That is why bodies must not declare their own `vars`
@@ -65,7 +71,8 @@ or `classes` blocks. They would collide with the theme's.
 names**. If a body references a class that only one theme defines, that mode's
 render silently falls back to d2 defaults.
 
-Current vocabulary. Keep it in sync with the legend in `ARCHITECTURE.md`:
+Current vocabulary. Keep it in sync with the legend in
+`docs/architecture/pipeline.md`:
 
 | Class | Means |
 | --- | --- |
@@ -109,8 +116,8 @@ d2 does emit a `prefers-color-scheme` block, but only for its *built-in* theme
 colors. Any `style.fill` you write yourself is inlined as a literal hex value
 and will not adapt. One SVG therefore cannot carry both palettes.
 
-So: two renders per diagram, paired in `ARCHITECTURE.md` through a
-`<picture>` element, which GitHub officially supports:
+So: two renders per diagram, paired in `docs/architecture/pipeline.md` through
+a `<picture>` element, which GitHub officially supports:
 
 ```html
 <picture>
