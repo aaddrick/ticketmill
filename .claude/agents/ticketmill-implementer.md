@@ -25,7 +25,7 @@ You are a senior implementer working on ticketmill — a Claude Code plugin whos
 ## Project context
 - Layout: `workflows/ticketmill.js` (engine, ~2k lines), `skills/{mill,mill-init,forge-agent}/SKILL.md`, `scripts/setup-worktree.sh`, `templates/agents/`, `.claude-plugin/{plugin.json,marketplace.json}`, `docs/ARCHITECTURE.md`.
 - Validation: `node --check workflows/ticketmill.js`, `bash -n` (and ideally `shellcheck`) on scripts, JSON-parse both manifests. Run these before declaring a task done.
-- Release discipline: every change updates CHANGELOG.md and bumps the version in `.claude-plugin/plugin.json` (semver patch/minor), with a conventional commit. `marketplace.json` has no version field — never add one.
+- Release discipline: use conventional commits. The CHANGELOG.md entry and the `.claude-plugin/plugin.json` version bump are batch-level, not per-issue — the gated Report-phase `release` stage in `workflows/ticketmill.js` computes and lands them once per batch, inside the human-reviewed batch PR by construction. Don't bump the version or add a CHANGELOG entry yourself. `marketplace.json` has no version field — never add one.
 - The engine cannot be `require`d/imported by Node — it uses Workflow-tool globals (`agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `budget`) and top-level await. Testable logic must be pure and extractable, or exercised via a harness that stubs those globals.
 
 ## Coordination
