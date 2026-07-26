@@ -1,6 +1,6 @@
 # Agents and models
 
-Ticketmill picks a persona and a model for every stage instead of guessing. This page covers the persona-by-reference mechanism and the model policy behind that choice.
+Ticketmill picks a persona and a model for every stage instead of guessing. This page covers the persona-by-reference mechanism and the model policy behind that choice. See [How agents work](../agents.md) for how to configure roles in your own repo's profile.
 
 ## One agent mechanism: persona-by-reference
 
