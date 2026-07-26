@@ -1,0 +1,49 @@
+# Ticketmill pipeline, top level. Detail for each phase lives in phase-*.d2.
+# Render with ./render.sh — do not hand-edit the generated SVGs.
+# Plain-text labels only: |md| blocks render via foreignObject, which does not
+# survive being loaded through an <img> tag on every renderer.
+
+direction: down
+
+sel: "SELECT\n\nprofile · roles · batch branch\nissue list · preflight · claims" {
+  class: stage
+}
+
+pool: "WORKER POOL\n\nconcurrency 1–5\nlane-serial groups · circuit breakers" {
+  class: gate
+}
+
+issue: "PER ISSUE" {
+  class: phase
+
+  plan: "Plan\n\nresearch → evaluate → plan tasks\ntwo contrarian gates" {
+    class: stage
+  }
+
+  build: "Build\n\nimplement ⇄ task review → quality\ntest loop → browser verify" {
+    class: stage
+  }
+
+  ship: "Ship\n\ndocblocks → PR → spec + code review\ntech docs → squash-merge" {
+    class: stage
+  }
+
+  plan -> build: { class: flow }
+  build -> ship: { class: flow }
+}
+
+rep: "REPORT\n\nrelease claims · gated version bump\nbatch PR · run report · retrospective" {
+  class: stage
+}
+
+gate: "HUMAN MERGE GATE\n\nbatch PR into BASE — never auto-merged" {
+  class: human
+}
+
+sel -> pool: { class: flow }
+pool -> issue.plan: "fan out" {
+  class: flow
+  style.stroke-width: 3
+}
+issue.ship -> rep: { class: flow }
+rep -> gate: { class: flow }

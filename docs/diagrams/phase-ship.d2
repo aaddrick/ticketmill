@@ -1,0 +1,35 @@
+# Ship phase, per issue. The per-issue PR merges into the batch branch,
+# never into BASE.
+
+direction: right
+
+db: "Docblocks\ngated" { class: optional }
+pr: "PR into\nbatch branch" { class: stage }
+
+rv: "Review loop" {
+  class: phase
+
+  spec: "Spec review" { class: gate }
+  code: "Code review" { class: gate }
+}
+
+fix: "Fix findings\ncapped" { class: stage }
+bw2: "Browser\nre-check" { class: optional }
+tdoc: "Tech docs\ngated" { class: optional }
+mar: "Merge\nauto-resolve\nCONFLICTING only" { class: gate }
+mg: "Squash-merge\n+ follow-ups" { class: terminal }
+
+db -> pr: { class: flow }
+pr -> rv.spec: "in parallel" { class: flow }
+pr -> rv.code: { class: flow }
+
+rv.spec -> fix: { class: loop }
+rv.code -> fix: { class: loop }
+fix -> pr: "re-review" { class: loop }
+
+# Edge leaves the container, not one reviewer: the gate is both approving in
+# the same iteration.
+rv -> bw2: "both\napprove" { class: flow }
+bw2 -> tdoc: { class: flow }
+tdoc -> mar: { class: flow }
+mar -> mg: { class: flow }

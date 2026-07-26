@@ -1,0 +1,21 @@
+# Plan phase, per issue. Two contrarian gates, both iteration-capped.
+# Keep this to six ranks — see the note in phase-select.d2 about width.
+
+direction: right
+
+wt: "Setup worktree\ninstalls + env" { class: stage }
+res: "Research" { class: stage }
+ev: "Evaluate\napproach" { class: stage }
+ca: "Contrarian\napproach gate" { class: gate }
+pl: "Plan tasks" { class: stage }
+cp: "Contrarian\nplan gate" { class: gate }
+
+wt -> res: { class: flow }
+res -> ev: { class: flow }
+ev -> ca: "proposal" { class: flow }
+ca -> ev: "challenge\ncapped" { class: loop }
+ca -> pl: "approved" { class: flow }
+pl -> cp: "plan" { class: flow }
+cp -> pl: "challenge\ncapped" { class: loop }
+cp -> "To Build": "approved" { class: flow }
+"To Build".class: terminal

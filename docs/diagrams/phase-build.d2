@@ -1,0 +1,29 @@
+# Build phase, per issue. The test loop halts the issue on error rather than
+# skipping verification.
+
+direction: right
+
+# The container repeats once per planned task. That repetition is stated in
+# the container label rather than drawn as a quality -> implement edge: the
+# third edge closes a 3-cycle, and the layout engine then orders the whole
+# group right-to-left because no node is an unambiguous entry point.
+tasks: "PER TASK — repeats for every planned task" {
+  class: phase
+
+  im: "Implement\ntask" { class: stage }
+  tr: "Task review" { class: gate }
+  ql: "Quality loop\nsimplify pass" { class: stage }
+
+  im -> tr: { class: flow }
+  tr -> im: "findings\ncapped" { class: loop }
+  tr -> ql: "pass" { class: flow }
+}
+
+tl: "Test loop\nhalts on error" { class: gate }
+bw: "Browser verify\nopt-in, locked" { class: optional }
+out: "To Ship" { class: terminal }
+
+tasks.ql -> tl: "all tasks\ndone" { class: flow }
+tl -> tl: "fix" { class: loop }
+tl -> bw: { class: flow }
+bw -> out: { class: flow }

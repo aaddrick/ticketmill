@@ -1,0 +1,19 @@
+# Report phase: runs once per batch, after every issue has settled.
+
+direction: right
+
+rl: "Release\nheld claims" { class: stage }
+rvb: "Release stage\ngated: CHANGELOG\n+ version bump" { class: optional }
+bp: "Batch PR into BASE\nnever auto-merged\ncarries Verification Gaps" { class: human }
+ro: "Run report\nJSON + markdown" { class: stage }
+rt: "Retrospective" { class: stage }
+next: "next\nrun" {
+  shape: circle
+  class: optional
+}
+
+rl -> rvb: { class: flow }
+rvb -> bp: { class: flow }
+bp -> ro: { class: flow }
+ro -> rt: { class: flow }
+rt -> next: "learnings feed\nthe next run" { class: loop }

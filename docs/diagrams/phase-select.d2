@@ -1,0 +1,39 @@
+# Select phase: everything that happens once, before the worker pool starts.
+#
+# Rank count is the thing to watch when editing. Every sequential stage adds a
+# fixed ~70px of inter-rank spacing on top of its own width, so an eight-stage
+# row renders ~2300px wide and GitHub scales it down until the text is
+# unreadable. Merge adjacent bookkeeping stages rather than adding ranks, and
+# keep label lines short — box width tracks the longest line.
+
+direction: right
+
+prof: "Load profile\n+ resolve roles" { class: stage }
+branch: "Create batch\nbranch from BASE" { class: stage }
+list: "Resolve\nissue list" { class: stage }
+
+probe: "Preflight\nprobe" {
+  class: gate
+  shape: diamond
+}
+
+routes: "Resume point" {
+  class: phase
+
+  skip: "skip\nPR already\nmerged" { class: terminal }
+  review: "review\nresume at\nreview loop" { class: optional }
+  impl: "implement\nfresh start" { class: stage }
+}
+
+claim: "Claim issues\nlabel + comment\nadvisory only" { class: stage }
+
+prof -> branch: { class: flow }
+branch -> list: { class: flow }
+list -> probe: { class: flow }
+
+probe -> routes.skip: { class: flow }
+probe -> routes.review: { class: flow }
+probe -> routes.impl: { class: flow }
+
+routes.review -> claim: { class: flow }
+routes.impl -> claim: { class: flow }

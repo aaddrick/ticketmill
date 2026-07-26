@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.36 (2026-07-26)
+
+Documentation only. No engine, skill, or profile behavior changes.
+
+The pipeline diagram in `docs/ARCHITECTURE.md` was one mermaid flowchart
+holding roughly thirty nodes across five nested subgraphs. Mermaid's dagre
+renderer handles chained subgraphs with per-subgraph `direction` overrides
+badly, and the result was dense enough that nobody read it.
+
+- `docs/diagrams/` (new): the pipeline redrawn as six [D2](https://d2lang.com)
+  diagrams — one overview plus one per phase (Select, Plan, Build, Ship,
+  Report). Each renders to a committed light/dark SVG pair, paired in the doc
+  through a `<picture>` element so it follows the reader's GitHub theme. Two
+  themes rather than one because d2 inlines custom fills instead of emitting
+  them into its `prefers-color-scheme` block, so a single SVG cannot carry
+  both palettes.
+- `docs/diagrams/render.sh` (new): regenerates every SVG. The `.d2` sources
+  are the source of truth; the SVGs are generated and committed so reading the
+  docs needs no toolchain.
+- `docs/diagrams/CLAUDE.md`, `docs/diagrams/AGENTS.md` (new): byte-identical
+  guidance for anyone editing these files — theme contract, the width budget
+  that keeps text legible in GitHub's ~1012px column, and the layout
+  constraints found the hard way (nested container `direction` is ignored by
+  both bundled engines; `|md|` labels render as `foreignObject` and do not
+  survive an `<img>` embed).
+- `docs/ARCHITECTURE.md`: `## Pipeline` now carries the overview, a legend for
+  the shared shape and color vocabulary, and a per-phase section.
+- `.claude/agents/ticketmill-code-reviewer.md`: the docs-drift rule named "the
+  mermaid-diagrammed flow"; it now points at the D2 sources and requires
+  `render.sh` to be re-run in the same commit as a stage-order change.
+- `README.md`: repo layout line mentions `docs/diagrams/`.
+
 ## 0.1.35 (2026-07-25)
 
 Fifteen milled issues, batched as maintenance and hardening across the

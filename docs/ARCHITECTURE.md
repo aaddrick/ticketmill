@@ -6,57 +6,83 @@ plain JavaScript; every unit of actual work is a schema-validated subagent call.
 
 ## Pipeline
 
-```mermaid
-flowchart TD
-    subgraph SEL["Select"]
-        direction LR
-        P["Load profile<br/>.claude/ticketmill.json"] --> D["Resolve roles vs<br/>.claude/agents roster"] --> B["Create batch branch<br/>Batch_ts from BASE"] --> I["Resolve issue list<br/>numbers or labels"] --> F["Preflight probe<br/>skip / review / implement"] --> C["Claim issues<br/>label + comment, advisory"]
-    end
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/pipeline-overview-dark.svg">
+  <img alt="Ticketmill pipeline overview" src="diagrams/pipeline-overview-light.svg">
+</picture>
 
-    SEL --> POOL["Worker pool<br/>concurrency 1-5<br/>lane-serial groups<br/>circuit breakers"]
-    POOL --> PLAN
+Diagram sources live in [`docs/diagrams`](diagrams) as [D2](https://d2lang.com)
+and render to the SVG pairs above via `docs/diagrams/render.sh`. Edit the `.d2`
+files and re-run that script; the SVGs are generated and should not be
+hand-edited.
 
-    subgraph PLAN["Per issue: plan"]
-        direction LR
-        S["Setup worktree<br/>installs + env files"] --> R["Research"] --> E["Evaluate<br/>approach"]
-        E -->|proposal| CA["Contrarian<br/>approach gate"]
-        CA -->|"challenge, capped"| E
-        CA -->|approved| PL["Plan tasks"]
-        PL -->|plan| CP["Contrarian<br/>plan gate"]
-        CP -->|"challenge, capped"| PL
-    end
+Shape and color carry meaning across every diagram below:
 
-    PLAN --> BUILD
+| | Meaning |
+| --- | --- |
+| Plain box | An ordinary stage: one schema-validated subagent call |
+| Amber box | A gate or a capped loop — somewhere the run can iterate or stall |
+| Dashed box | An optional stage, gated on profile config, skipped by default |
+| Green box | A terminal state for that phase |
+| Blue box | The one place a human is required |
+| Dashed amber edge | A backward edge: rework, re-review, or a retry |
 
-    subgraph BUILD["Per issue: build"]
-        direction LR
-        IM["Implement<br/>task"] --> TR["Task review"]
-        TR -->|"findings, capped"| IM
-        TR -->|pass| QL["Quality loop<br/>simplify pass"]
-        QL -->|"next task"| IM
-        QL -->|"all tasks done"| TL["Test loop<br/>run + validate, halts on error"]
-        TL -->|fix| TL
-        TL --> BW["Browser verify<br/>opt-in, locked"]
-    end
+### Select
 
-    BUILD --> SHIP
+Runs once, before any worker starts.
 
-    subgraph SHIP["Per issue: ship"]
-        direction LR
-        DB["Docblocks<br/>gated"] --> PR["PR into<br/>batch branch"] --> RV["Spec + code review<br/>in parallel"]
-        RV -->|"fix findings, capped"| RV
-        RV -->|approved| BW2["Browser<br/>re-check"] --> TDOC["Tech docs<br/>gated"] --> MAR["Merge auto-resolve<br/>CONFLICTING only, rebase + forced tests"] --> MG["Squash-merge<br/>+ follow-up issues"]
-    end
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/phase-select-dark.svg">
+  <img alt="Select phase: profile, roles, batch branch, issue list, preflight, claims" src="diagrams/phase-select-light.svg">
+</picture>
 
-    SHIP --> REP
+The preflight probe decides where each issue re-enters the pipeline, which is
+what makes a healing or resumed run cheap: an issue whose PR already merged
+into this batch branch costs one probe instead of a full pass.
 
-    subgraph REP["Report"]
-        direction LR
-        RL["Release<br/>held claims"] --> RVB["Release stage<br/>gated: CHANGELOG + version bump"] --> BP["Batch PR to BASE<br/>never auto-merged<br/>Verification Gaps"] --> RO["Run report<br/>JSON + markdown"] --> RT["Retrospective<br/>process-retrospective.md"]
-    end
+### Plan
 
-    REP -.->|"learnings feed the next run"| NEXT(("next run"))
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/phase-plan-dark.svg">
+  <img alt="Plan phase: research, evaluate, plan, two contrarian gates" src="diagrams/phase-plan-light.svg">
+</picture>
+
+Both contrarian gates are iteration-capped. Hitting a cap with findings still
+open is never silent — it accumulates into `VERIFY_SKIPS` and surfaces in the
+batch PR's Verification Gaps section.
+
+### Build
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/phase-build-dark.svg">
+  <img alt="Build phase: implement, task review, quality loop, test loop, browser verify" src="diagrams/phase-build-light.svg">
+</picture>
+
+The test loop halts the issue on error rather than skipping verification. That
+behavior is the reason `test_command` must be present in the profile as an
+explicit key.
+
+### Ship
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/phase-ship-dark.svg">
+  <img alt="Ship phase: docblocks, PR, spec and code review, merge auto-resolve, squash-merge" src="diagrams/phase-ship-light.svg">
+</picture>
+
+The per-issue PR merges into the batch branch, never into BASE. Merge
+auto-resolve gets one mechanical recovery attempt on a `CONFLICTING` PR before
+the issue escalates to `needs_human`.
+
+### Report
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/phase-report-dark.svg">
+  <img alt="Report phase: release claims, gated version bump, batch PR, run report, retrospective" src="diagrams/phase-report-light.svg">
+</picture>
+
+The batch PR is the one artifact a human is guaranteed to read, so it carries
+the Verification Gaps section, the merge auto-resolution tally, and the
+friction and churn rollup.
 
 ## Design decisions
 

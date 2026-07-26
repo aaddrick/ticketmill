@@ -318,7 +318,7 @@ skills/            mill (launch), mill-init (onboarding), forge-agent (agent gen
 templates/         agents/contrarian.md, copied into repos that lack one
 scripts/           setup-worktree.sh (worktree creation), lint-engine.js (sandbox/lockstep gate)
 tests/             the test suite gating every run
-docs/              ARCHITECTURE.md
+docs/              ARCHITECTURE.md, diagrams/ (D2 sources + generated SVGs, see render.sh)
 .claude/           this repo's own ticketmill profile, workflows/, and agents/ — it self-hosts its mill runs
 ```
 
