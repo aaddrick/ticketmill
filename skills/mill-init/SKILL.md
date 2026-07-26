@@ -66,7 +66,10 @@ Field rules:
   retries), `port_span` (default `900`, the modulus `port_base` is spread over per
   issue number), and `artifact_dir` (default `/tmp/ticketmill-issue-{issue}`,
   `{issue}`-templated like `serve_command`'s `{port}`, where browser-verify
-  screenshots/artifacts are written).
+  screenshots/artifacts are written). **Caution:** this resolved path is deleted
+  with `rm -rf` on cleanup (both the per-issue browser-verify stage and the final
+  batch cleanup) — it must be a dedicated scratch directory, never a project
+  directory, shared mount, or `$HOME`.
 - `lockstep_installed_paths`: only needed when the repo being onboarded keeps an
   installed copy of an engine-owned file in lockstep with a source-of-truth file
   elsewhere in the same repo, kept in sync by the repo's own tooling. List those

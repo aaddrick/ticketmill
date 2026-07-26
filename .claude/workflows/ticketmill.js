@@ -131,6 +131,10 @@ export const meta = {
 //     // All five of port_span/lock_path/stale_seconds/poll_seconds/artifact_dir are
 //     // optional and default to the values shown above; artifact_dir substitutes
 //     // {issue} if present (like serve_command's {port}), else appends -<issue>.
+//     // CAUTION: the resolved artifact_dir is deleted with `rm -rf` on cleanup
+//     // (both the browser-verify cleanup stage and the final reviewAndMerge
+//     // cleanup) - it must be a dedicated scratch path, never a project dir,
+//     // shared mount, or $HOME.
 //     "models": { "plan": { "model": "opus", "effort": "high" } }, // OPTIONAL per-stage
 //                                        // model/effort overrides, keyed by stage name.
 //                                        // Valid keys (25): probe, setup, research,
