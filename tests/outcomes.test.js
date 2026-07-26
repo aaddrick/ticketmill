@@ -809,3 +809,124 @@ test('deriveNegativeOutcomeEvents: a later_batch_fix ledger line is emitted (it 
   assert.strictEqual(out.length, 1)
   assert.strictEqual(out[0].grade, 'later_batch_fix')
 })
+
+// ---- task 3 wiring: schema, prompt lockstep, post-hoc consumption, revisit-risk
+// fail-open (issue #104) ----
+//
+// The pure core (task 2) is unit-tested directly above. What's left to guard here
+// is the WIRING around it: OUTCOMES_SCHEMA carries the raw fields
+// computeLaterBatchFix/isPlannedFollowup need, the two hard-coded prompt grade
+// lists stay in lockstep with OUTCOME_TERMINAL_GRADES/OUTCOME_NEGATIVE_GRADES
+// (rather than a second hand-typed copy silently drifting), and
+// revisitRiskPromise's explicit later_batch_fix -> files=[] fail-open branch
+// actually prevents a spurious flag end-to-end. outcomeGradePromise/
+// revisitRiskPromise themselves are agent() calls below the harness split (see
+// tests/harness.js), so — same style as tests/learnings-injection.test.js — the
+// prompt-text assertions below are source-inspection guards, not runtime probes.
+
+test('OUTCOMES_SCHEMA.observations.items carries later_fix_pr/batch_pr_merge_sha/churned_regions/later_fix_body as raw, nullable fields', function () {
+  const context = harness.boot()
+  const schema = plain(harness.readGlobal(context, 'OUTCOMES_SCHEMA'))
+  const props = schema.properties.observations.items.properties
+  assert.deepStrictEqual(props.later_fix_pr.type, ['integer', 'null'])
+  assert.deepStrictEqual(props.batch_pr_merge_sha.type, ['string', 'null'])
+  assert.deepStrictEqual(props.later_fix_body.type, ['string', 'null'])
+  assert.strictEqual(props.churned_regions.type, 'array')
+  // None of the four are in the schema's required list — every one must be able
+  // to arrive null/empty/absent on a partially-resolved observation (step 2.e's
+  // "never drop a target silently" contract) without failing schema validation.
+  assert.strictEqual(schema.properties.observations.items.required.indexOf('later_fix_pr'), -1)
+  assert.strictEqual(schema.properties.observations.items.required.indexOf('batch_pr_merge_sha'), -1)
+  assert.strictEqual(schema.properties.observations.items.required.indexOf('churned_regions'), -1)
+  assert.strictEqual(schema.properties.observations.items.required.indexOf('later_fix_body'), -1)
+})
+
+test('outcomeGradePromise: the target-selection terminal-drop list is interpolated from OUTCOME_TERMINAL_GRADES, not a second hand-typed copy (lockstep)', function () {
+  const src = harness.readEngineSource()
+  const terminal = ['reverted', 'reopened', 'hotfix', 'later_batch_fix', 'closed_unmerged', 'abandoned']
+  assert.ok(src.indexOf("OUTCOME_TERMINAL_GRADES.join(' / ')") !== -1,
+    'expected the outcome-grade prompt to interpolate OUTCOME_TERMINAL_GRADES.join(...) rather than list grades by hand')
+  // The interpolated string itself, so a later addition to the constant is
+  // guaranteed to show up here too without a second edit site.
+  assert.strictEqual(terminal.join(' / '), 'reverted / reopened / hotfix / later_batch_fix / closed_unmerged / abandoned')
+})
+
+test('revisitRiskPromise: the negative-grade target-selection list is interpolated from OUTCOME_NEGATIVE_GRADES, not a second hand-typed copy (lockstep)', function () {
+  const src = harness.readEngineSource()
+  assert.ok(src.indexOf("OUTCOME_NEGATIVE_GRADES.join(' / ')") !== -1,
+    'expected the revisit-risk prompt to interpolate OUTCOME_NEGATIVE_GRADES.join(...) rather than list grades by hand')
+})
+
+test('outcomeGradePromise source: resolves later_batch_fix raw signals (later_fix_pr/batch_pr_merge_sha/churned_regions) from the batch PR\'s own timeline, not the issue timeline', function () {
+  const src = harness.readEngineSource()
+  const idx = src.indexOf("const outcomeGradePromise = agent([")
+  assert.notStrictEqual(idx, -1, 'expected to find the outcomeGradePromise agent() call in the engine source')
+  const slice = src.slice(idx, src.indexOf('.join(\'\\n\'), { label: \'outcome-grade\'', idx))
+  assert.match(slice, /later_batch_fix raw signal/)
+  assert.match(slice, /THIS batch PR/)
+  assert.match(slice, /own timeline/)
+  assert.match(slice, /git blame/)
+  assert.match(slice, /isPlannedFollowup/)
+  assert.match(slice, /churned_regions = \[\]/)
+})
+
+test('gradeFromObservation post-hoc consumption: the constructed observation threads later_fix_pr/batch_pr_merge_sha/churned_regions/later_fix_body through from the raw agent observation', function () {
+  const src = harness.readEngineSource()
+  const idx = src.indexOf('const g = gradeFromObservation({')
+  assert.notStrictEqual(idx, -1, 'expected to find the post-hoc gradeFromObservation call site')
+  const slice = src.slice(idx, idx + 1400)
+  assert.match(slice, /later_fix_pr: o\.later_fix_pr/)
+  assert.match(slice, /batch_pr_merge_sha: o\.batch_pr_merge_sha/)
+  assert.match(slice, /churned_regions: Array\.isArray\(o\.churned_regions\)/)
+  assert.match(slice, /later_fix_body: o\.later_fix_body/)
+})
+
+test('gradeFromObservation post-hoc consumption: an observation carrying a real later_batch_fix signal (as OUTCOMES_SCHEMA would return it) actually grades later_batch_fix end-to-end', function () {
+  const context = harness.boot()
+  // Simulates exactly the object literal the post-hoc consumption block builds
+  // from a raw outcomeGradeR.observations[] entry (o.later_fix_pr, o.batch_pr_merge_sha,
+  // o.churned_regions, o.later_fix_body threaded straight through).
+  const o = {
+    live_merge_state: 'merged', merged_at: daysAgoIso(10), revert_found: false, reopen_found: false,
+    hotfix_ref: null, issue_state: 'closed',
+    later_fix_pr: 999, batch_pr_merge_sha: 'deadbeef', later_fix_body: 'Fixes a regression from the earlier batch.',
+    churned_regions: [{ file: 'workflows/ticketmill.js', blamed_shas: ['deadbeef'] }],
+  }
+  const observation = {
+    pr_state: o.live_merge_state, merged_at: o.merged_at, reverted: !!o.revert_found, reopened: !!o.reopen_found,
+    hotfix_pr: o.hotfix_ref, issue_state: o.issue_state, abandoned: context.deriveAbandoned(o.issue_state, o.live_merge_state),
+    later_fix_pr: o.later_fix_pr != null ? o.later_fix_pr : null,
+    batch_pr_merge_sha: o.batch_pr_merge_sha != null ? o.batch_pr_merge_sha : null,
+    churned_regions: Array.isArray(o.churned_regions) ? o.churned_regions : [],
+    later_fix_body: o.later_fix_body != null ? o.later_fix_body : null,
+  }
+  const g = context.gradeFromObservation(observation, NOW, { min_age_days: 7 })
+  assert.strictEqual(g.grade, 'later_batch_fix')
+})
+
+test('revisitRiskPromise source: has an explicit later_batch_fix -> files = [] fail-open branch, not a silent fall-through', function () {
+  const src = harness.readEngineSource()
+  const idx = src.indexOf("const revisitRiskPromise = agent([")
+  assert.notStrictEqual(idx, -1, 'expected to find the revisitRiskPromise agent() call in the engine source')
+  const slice = src.slice(idx, src.indexOf(".join('\\n'), { label: 'revisit-risk'", idx))
+  assert.match(slice, /later_batch_fix \(issue #104\)/)
+  assert.match(slice, /files = \[\] always/)
+})
+
+test('computeRevisitRisk: a later_batch_fix event with files:[] (revisit-risk\'s fail-open branch) yields no revisit flag, even with an otherwise-matching predicted_files', function () {
+  const context = harness.boot()
+  const preflights = [{ issue: 104, predicted_files: ['workflows/ticketmill.js'] }]
+  // Mirrors attachRevisitFiles' guaranteed files:[] output for a later_batch_fix
+  // key (deriveNegativeOutcomeEvents admits it via OUTCOME_NEGATIVE_GRADES, but
+  // the revisit-risk prompt's explicit fail-open branch never resolves a file list
+  // for it) — even though predicted_files names the exact file the grade's own
+  // signals.churned_regions touched, files:[] must never let it flag.
+  const events = [{
+    issue: 200, batch_pr: 40, grade: 'later_batch_fix',
+    decided_at: daysAgoIso(3), merged_at: daysAgoIso(20),
+    files: [],
+  }]
+  const out = plain(context.computeRevisitRisk(preflights, { events: events, refix_chains: [], now: NOW }))
+  assert.strictEqual(out[0].revisit_risk.flagged, false)
+  assert.deepStrictEqual(out[0].revisit_risk.reasons, [])
+})

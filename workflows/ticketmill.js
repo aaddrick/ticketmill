@@ -787,6 +787,35 @@ const OUTCOMES_SCHEMA = {
           // reopen_found/hotfix_ref — threaded through so the post-hoc pass can
           // derive `abandoned` (deriveAbandoned above) instead of discarding it.
           issue_state: { enum: ['open', 'closed', 'unknown'] },
+          // later_fix_pr/batch_pr_merge_sha/churned_regions/later_fix_body (issue
+          // #104): RAW inputs to computeLaterBatchFix/isPlannedFollowup only —
+          // this agent never decides later_batch_fix itself (same PIN as every
+          // other field on this schema). later_fix_pr is the number of the first
+          // later, DISTINCT, merged PR that cross-references THIS batch PR's own
+          // timeline and survives the prompt's cheap planning-edge pre-filter
+          // (null if none). later_fix_body is that PR's raw body text verbatim
+          // (null if later_fix_pr is null) — the sole input to the post-hoc
+          // isPlannedFollowup exclusion; deliberately absent from
+          // pickOutcomeSignals' compact `signals` (prose, not a compact signal).
+          // batch_pr_merge_sha is THIS batch PR's own squash-merge commit SHA
+          // (null if unresolved/unmerged). churned_regions is an array of
+          // { file, blamed_shas } — one entry per hunk in later_fix_pr's diff,
+          // each resolved via a read-only `git blame` of the PRE-IMAGE lines it
+          // replaced, blamed_shas holding every distinct commit SHA those lines
+          // attribute to (empty array if later_fix_pr is null or unresolved).
+          later_fix_pr: { type: ['integer', 'null'] },
+          batch_pr_merge_sha: { type: ['string', 'null'] },
+          later_fix_body: { type: ['string', 'null'] },
+          churned_regions: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                file: { type: 'string' },
+                blamed_shas: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
         },
       },
     },
@@ -837,7 +866,11 @@ const REVISIT_RISK_SCHEMA = {
           // via `gh pr view <signals.hotfix_pr> --json files`; reverted via a
           // best-effort live revert-commit diff (else []); reopened is always
           // [] (no recoverable locus without a squashed diff — an
-          // approach-challenge-i2 minor left deliberately open). An empty
+          // approach-challenge-i2 minor left deliberately open). later_batch_fix
+          // (issue #104) is ALSO always [] — a deliberate, documented fail-open:
+          // its evidence (churned_regions) lives in a later PR's own coordinate
+          // space, not a diff this pass can walk to a file list; revisit-risk
+          // coverage for it is a follow-up, not silently dropped. An empty
           // array is non-flagging, never an error.
           files: { type: 'array', items: { type: 'string' } },
         },
@@ -6534,8 +6567,10 @@ const learnPromise = agent([
 // core above the TICKETMILL-TEST-HARNESS-SPLIT marker.
 const outcomeGradePromise = agent([
   'READ-ONLY outcome-grading pass over ' + REPO + '\'s ticketmill run history under ' + LOGS + '.',
-  'NO repo mutations of any kind: no git fetch, no local file writes, no gh command that changes state —',
-  'only cat and gh READ commands (gh pr view, gh issue view, gh search, gh pr list) below.',
+  'NO repo mutations of any kind: no git fetch, no checkout/reset, no local file writes, no gh command that changes',
+  'state — only cat, gh READ commands (gh pr view, gh issue view, gh search, gh pr list), and read-only local git',
+  'object-database inspection (git blame, git show — never fetch/checkout/reset) below. This repo is already a full,',
+  'non-shallow clone, so a later merge commit\'s SHA and its parent resolve locally without a git fetch.',
   '',
   '0. now: run `date -u +%Y-%m-%dT%H:%M:%SZ` and return it verbatim as `now`.',
   '',
@@ -6557,9 +6592,8 @@ const outcomeGradePromise = agent([
   '      raw lines VERBATIM, one array entry per line, as prior_ledger_lines — do not parse, reshape, or',
   '      interpret them for the RETURNED array; the caller does that. For target SELECTION only (not for what',
   '      you return), parse each line yourself: per {run_tag, batch_pr, issue} key, using the LAST line that',
-  '      key appears on (later lines override earlier ones), if its grade is one of reverted / reopened / hotfix /',
-  '      closed_unmerged / abandoned, that target is TERMINAL — drop it from the candidate list, it can never be',
-  '      re-graded.',
+  '      key appears on (later lines override earlier ones), if its grade is one of ' + OUTCOME_TERMINAL_GRADES.join(' / ') + ',',
+  '      that target is TERMINAL — drop it from the candidate list, it can never be re-graded.',
   '   e. From the surviving candidates, sort oldest run_tag first (grade the longest-unobserved history first) and',
   '      keep at most ' + OUTCOME_GRADING.sample_cap + '. Set sample_cap_hit = true if more candidates existed than',
   '      that cap, else false.',
@@ -6585,6 +6619,32 @@ const outcomeGradePromise = agent([
   '   e. On any gh command failure for a target, still return an entry for it with whatever fields you resolved',
   '      and the rest null/false/"unknown" (issue_state: "unknown") — never drop a target silently; the caller must',
   '      see every target it asked about, even a partially-resolved one.',
+  '   f. later_batch_fix raw signal (issue #104) — evidence stronger than bare changed_files overlap. This step',
+  '      NEVER decides the later_batch_fix grade itself (that is computeLaterBatchFix\'s job, post-hoc); it only',
+  '      resolves the raw fields that decision is made from.',
+  '      i. From THIS batch PR\'s own timeline (gh pr view <batch_pr> --repo ' + REPO + ' --json timelineItems — a',
+  '         DIFFERENT read from step c\'s issue timeline), scan for CrossReferencedEvent entries whose source is a',
+  '         DIFFERENT, MERGED pull request that cross-references THIS BATCH PR itself (not the issue). Sort',
+  '         surviving candidates oldest-merged-first.',
+  '      ii. Walk candidates oldest-first. For each, gh pr view <candidate> --repo ' + REPO + ' --json body,mergedAt',
+  '         and apply a CHEAP pre-filter only, to avoid spending a git blame call on an obviously unrelated',
+  '         candidate — this is target selection, NOT the final exclusion (the engine\'s isPlannedFollowup re-derives',
+  '         that post-hoc from the later_fix_body you return): if the body reads as announcing a pre-planned',
+  '         continuation of prior work ("follow-up from", "follow up from", "depends on", "deferred from" —',
+  '         case-insensitive), skip it and try the next candidate. Stop at the first candidate that survives this',
+  '         pre-filter (call it the survivor), or when none do.',
+  '      iii. If a survivor exists: later_fix_pr = its number, later_fix_body = its raw body text verbatim. Resolve',
+  '         batch_pr_merge_sha = THIS batch PR\'s own squash-merge commit SHA (gh pr view <batch_pr> --repo ' + REPO + ' ',
+  '         --json mergeCommit, the .mergeCommit.oid field — null if the PR never merged or the field is absent).',
+  '      iv. If a survivor exists AND batch_pr_merge_sha resolved: for each hunk changed by the survivor\'s merge',
+  '         commit (gh api repos/' + REPO + '/commits/<survivor mergeCommit sha> --jq \'.files[] | {filename, patch}\'',
+  '         to see which line ranges it touched, or an equivalent read-only `git show <sha> -- <file>` on this local',
+  '         clone), resolve the PRE-IMAGE lines it replaced via a read-only `git blame <survivor mergeCommit sha>^ -L',
+  '         <start>,<end> -- <file>` and collect one { file, blamed_shas } entry per hunk, blamed_shas holding every',
+  '         DISTINCT commit SHA that `git blame` attributes those pre-image lines to. Local clone only — never `git',
+  '         fetch`; if the survivor\'s commits are not locally resolvable, or any command fails, churned_regions = [].',
+  '      v. If no survivor exists, or any step above fails: later_fix_pr = null, batch_pr_merge_sha = null,',
+  '         later_fix_body = null, churned_regions = [] — fail open, never fabricate a PR number, SHA, or region.',
   '',
   'Return observations (array, one entry per target — even partially-resolved ones), prior_ledger_lines (the raw',
   'outcomes.jsonl lines, verbatim, unparsed), sample_cap_hit, and now (from step 0).',
@@ -6620,7 +6680,8 @@ const revisitRiskPromise = agent([
   '      parse each line yourself: {run_tag, batch_pr, issue, grade, signals, decided_at} (schema_version 1). Group',
   '      by {run_tag, batch_pr, issue} and, per key, keep ONLY the LAST line (the ledger is append-only; later lines',
   '      override earlier ones for the same key). Keep only keys whose current (last-line-wins) grade is one of',
-  '      reverted / reopened / hotfix (pending/clean/closed_unmerged/abandoned are not evidence of a regression).',
+  '      ' + OUTCOME_NEGATIVE_GRADES.join(' / ') + ' (pending/clean/closed_unmerged/abandoned are not evidence of a',
+  '      regression).',
   '   c. Drop any survivor whose age is already outside the ' + REVISIT_RISK.window_days + '-day window: age in whole',
   '      days from its own decided_at field (fall back to signals.merged_at ONLY if decided_at is missing) to `now`',
   '      from step 0. This is a target-selection optimization only, to keep this pass\'s gh-call budget cheap — if in',
@@ -6637,6 +6698,12 @@ const revisitRiskPromise = agent([
   '        if the revert itself was a PR, gh pr view <that PR> --json files). If no revert commit/PR is clearly',
   '        identifiable, or any command fails, files = [].',
   '      - reopened: files = [] always (no recoverable regression locus without a squashed diff to compare).',
+  '      - later_batch_fix (issue #104): files = [] always. Its evidence (churned_regions, a per-hunk blame-forward',
+  '        resolution the outcome-grading pass already performed in the LATER PR\'s own coordinate space) is not a',
+  '        diff this pass can walk to a file list, and translating it back would reintroduce exactly the',
+  '        coincidental-file-overlap risk later_batch_fix was designed to avoid. Explicit fail-open, not a silent',
+  '        gap — revisit-risk coverage for this grade is a documented follow-up (see decision-chain notes), and',
+  '        files:[] is guaranteed to never spuriously flag a predicted_files match (computeRevisitRisk).',
   '   e. Return one entry per surviving key: {issue, batch_pr, files} — grade/decided_at/merged_at are NOT part of',
   '      the returned entry; the caller re-derives those itself from prior_ledger_lines (step a).',
   '',
@@ -6791,6 +6858,15 @@ if (outcomeGradeR) {
       hotfix_pr: o.hotfix_ref,
       issue_state: o.issue_state,
       abandoned: deriveAbandoned(o.issue_state, o.live_merge_state),
+      // later_fix_pr/batch_pr_merge_sha/churned_regions/later_fix_body (issue #104):
+      // computeLaterBatchFix/isPlannedFollowup's raw inputs, threaded straight
+      // through from the observation — same fail-open defaulting as every other
+      // field above, so a malformed/absent field degrades to computeLaterBatchFix's
+      // own "false" default rather than throwing.
+      later_fix_pr: o.later_fix_pr != null ? o.later_fix_pr : null,
+      batch_pr_merge_sha: o.batch_pr_merge_sha != null ? o.batch_pr_merge_sha : null,
+      churned_regions: Array.isArray(o.churned_regions) ? o.churned_regions : [],
+      later_fix_body: o.later_fix_body != null ? o.later_fix_body : null,
     }, outcomeGradeR.now)
     return buildOutcomeLine({ run_tag: o.run_tag, batch_pr: o.batch_pr, issue: o.issue, grade: g.grade, signals: g.signals, decided_at: outcomeGradeR.now })
   })
