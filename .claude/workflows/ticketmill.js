@@ -1823,15 +1823,14 @@ const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotch
 const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> log -1 --format=%H — it prints the ' +
   'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
   'or recall a SHA from memory.'
-// collectPostedCommit (issue #79, Layer 2): COMMIT_SHA_ASK above is advisory
-// only — it tells the agent how to get the real SHA, but the `commit` field it
-// returns is still unverified free text. This collects every non-null commit a
+// collectPostedCommit (issue #79, Layer 2): collects every non-null commit a
 // stage reports into ctx.postedCommits so probeCommitShas() (below, co-located
 // with probeChangedFiles()) can later confirm each one actually exists in the
 // worktree, once, near merge — instead of trusting each of the 8 call sites on
-// its own. Guards a null stage result (call sites already degrade on that
-// themselves) and a stage that reported no commit (review/validate stages, or
-// a fix stage that made no changes).
+// its own; see probeCommitShas() for why COMMIT_SHA_ASK alone isn't enough.
+// Guards a null stage result (call sites already degrade on that themselves)
+// and a stage that reported no commit (review/validate stages, or a fix stage
+// that made no changes).
 function collectPostedCommit(ctx, stageName, r) {
   if (!r || !r.commit) return
   ctx.postedCommits.push({ stage: stageName, commit: r.commit })
