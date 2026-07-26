@@ -50,6 +50,18 @@ function sha256(text) {
   return crypto.createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
+// Shared by the rewrites and proseRefs reversal passes below: each entry's
+// `to` text on `working[entry.line - 1]` is replaced back with its `from`
+// text, in place.
+function applyReverseReplacement(working, entries, label) {
+  for (const entry of entries) {
+    const text = working[entry.line - 1]
+    const idx = text.indexOf(entry.to)
+    assert.ok(idx !== -1, 'reverse-' + label + ' at line ' + entry.line + ': ' + JSON.stringify(entry.to) + ' not found in reconstructed text')
+    working[entry.line - 1] = text.slice(0, idx) + entry.from + text.slice(idx + entry.to.length)
+  }
+}
+
 // The base document's own line order, as a fixed structural fact about the
 // frozen base commit (ac612eb07f68d57e8f43a312cc76275064930bde). This is NOT
 // re-derived from git at test time -- that is exactly what makes this test
@@ -174,18 +186,8 @@ test('whole-document provenance: every segment plus both dropped lines, reassemb
     }
   }
 
-  for (const rewrite of fixture.rewrites) {
-    const text = working[rewrite.line - 1]
-    const idx = text.indexOf(rewrite.to)
-    assert.ok(idx !== -1, 'reverse-rewrite at line ' + rewrite.line + ': ' + JSON.stringify(rewrite.to) + ' not found in reconstructed text')
-    working[rewrite.line - 1] = text.slice(0, idx) + rewrite.from + text.slice(idx + rewrite.to.length)
-  }
-  for (const proseRef of fixture.proseRefs) {
-    const text = working[proseRef.line - 1]
-    const idx = text.indexOf(proseRef.to)
-    assert.ok(idx !== -1, 'reverse-proseRef at line ' + proseRef.line + ': ' + JSON.stringify(proseRef.to) + ' not found in reconstructed text')
-    working[proseRef.line - 1] = text.slice(0, idx) + proseRef.from + text.slice(idx + proseRef.to.length)
-  }
+  applyReverseReplacement(working, fixture.rewrites, 'rewrite')
+  applyReverseReplacement(working, fixture.proseRefs, 'proseRef')
 
   assert.strictEqual(working.length, fixture.baseFileLines,
     'reconstructed line count ' + working.length + ' != fixture.baseFileLines ' + fixture.baseFileLines)
