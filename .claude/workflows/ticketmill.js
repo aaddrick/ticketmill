@@ -782,6 +782,11 @@ const OUTCOMES_SCHEMA = {
           reopen_found: { type: 'boolean' },
           hotfix_ref: { type: ['integer', 'null'] },
           merged_at: { type: ['string', 'null'] },
+          // issue_state (issue #103): the `state` field off the SAME `gh issue
+          // view --json state,timelineItems` read step 2c already runs for
+          // reopen_found/hotfix_ref — threaded through so the post-hoc pass can
+          // derive `abandoned` (deriveAbandoned above) instead of discarding it.
+          issue_state: { enum: ['open', 'closed', 'unknown'] },
         },
       },
     },
@@ -5988,6 +5993,20 @@ function gradeFromObservation(observation, now, cfg) {
   return { grade: 'pending', signals: signals }
 }
 
+// deriveAbandoned (issue #103): the deterministic decision behind
+// gradeFromObservation's `abandoned` precedence branch above — closes the
+// upstream wiring gap left by #92/PR#102, where nothing ever populated
+// `abandoned`/`issue_state` on the observation gradeFromObservation receives.
+// Positive whitelist guard (issue_state==='closed' AND live_merge_state is one
+// of 'open'/'closed'/'none') on purpose: 'merged' is deliberately excluded so a
+// merged batch PR never yields abandoned (closed_unmerged/clean already own
+// that outcome), and 'unknown' is deliberately excluded so a transient `gh pr
+// view` read failure never yields a terminal grade off an unresolved signal.
+// Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+function deriveAbandoned(issue_state, live_merge_state) {
+  return issue_state === 'closed' && ['open', 'closed', 'none'].indexOf(live_merge_state) !== -1
+}
+
 // buildOutcomeLine (issue #92): the compact single-object JSONL shape appended to
 // <logs_dir>/outcomes.jsonl, one line per {run_tag, batch_pr, issue} — mirrors
 // buildLedgerLine's "flat, small, one-object-per-line" contract. schema_version
@@ -6472,14 +6491,15 @@ const outcomeGradePromise = agent([
   '      this specific PR (not merely mentioning its number in passing).',
   '   c. reopen_found: gh issue view <issue> --repo ' + REPO + ' --json state,timelineItems — scan timelineItems',
   '      for a ReopenedEvent that occurs AFTER the ClosedEvent this run produced (issue reopened following the',
-  '      batch PR merge, not reopened-then-reclosed earlier in its history). true only on a clear match.',
+  '      batch PR merge, not reopened-then-reclosed earlier in its history). true only on a clear match. Also',
+  '      return issue_state = that SAME read\'s `state` field, lowercased ("open" or "closed").',
   '   d. hotfix_ref: from that SAME timelineItems read, look for a CrossReferencedEvent whose source is a',
   '      DIFFERENT, later-merged PR that references this issue AND whose title/body language indicates it fixes a',
   '      problem from the original change (e.g. "fix"/"hotfix"/"regression" — not a routine follow-up feature).',
   '      hotfix_ref = that PR\'s number, else null.',
   '   e. On any gh command failure for a target, still return an entry for it with whatever fields you resolved',
-  '      and the rest null/false/"unknown" — never drop a target silently; the caller must see every target it',
-  '      asked about, even a partially-resolved one.',
+  '      and the rest null/false/"unknown" (issue_state: "unknown") — never drop a target silently; the caller must',
+  '      see every target it asked about, even a partially-resolved one.',
   '',
   'Return observations (array, one entry per target — even partially-resolved ones), prior_ledger_lines (the raw',
   'outcomes.jsonl lines, verbatim, unparsed), sample_cap_hit, and now (from step 0).',
@@ -6684,6 +6704,8 @@ if (outcomeGradeR) {
       reverted: !!o.revert_found,
       reopened: !!o.reopen_found,
       hotfix_pr: o.hotfix_ref,
+      issue_state: o.issue_state,
+      abandoned: deriveAbandoned(o.issue_state, o.live_merge_state),
     }, outcomeGradeR.now)
     return buildOutcomeLine({ run_tag: o.run_tag, batch_pr: o.batch_pr, issue: o.issue, grade: g.grade, signals: g.signals, decided_at: outcomeGradeR.now })
   })

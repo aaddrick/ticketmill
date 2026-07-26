@@ -474,6 +474,21 @@ PR has stood for `min_age_days` (default 7, profile-overridable via
 escape hatch for targets that will never see a merge and so can never
 earn `clean` any other way.
 
+**`abandoned` needed its own wiring (issue #103).** The precedence list
+above already named `abandoned`, but nothing ever populated it: #92/PR#102
+left the field unset on every observation, so that branch was dead code.
+The fix threads `issue_state` off the same `gh issue view --json
+state,timelineItems` read step 2c already runs for `reopen_found` and
+`hotfix_ref`. No extra `gh` call needed. `deriveAbandoned(issue_state,
+live_merge_state)` then decides the field: true only when the issue is
+closed AND the batch PR's live state is `open`, `closed`, or `none`.
+`merged` is excluded on purpose, since a merged PR that later goes bad
+already has `closed_unmerged` and `clean` to describe it. `unknown` is
+excluded too, so a transient `gh pr view` read failure can never produce
+a terminal grade off a signal that never resolved. A failed `gh issue
+view` read reports `issue_state: "unknown"`, same fallback contract as
+the other fields in that step.
+
 **`diffOutcomeGrades`** is the only thing allowed to decide what gets
 appended. It compares this pass's freshly graded lines against
 `prior_ledger_lines` (both sides read last-line-wins, since the ledger is
