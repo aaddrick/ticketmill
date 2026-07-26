@@ -3,18 +3,23 @@
 // Gate for the docs/ARCHITECTURE.md -> docs/architecture/*.md split (issue #154).
 //
 // tests/fixtures/architecture-split.json is the shared manifest split.mjs
-// (generate, a later task) and unsplit.mjs (reverse round-trip, a later task)
-// will both read. This file is the mechanical gate on that manifest ALONE,
-// run before either script or any output file exists (task 1): it proves the
-// manifest's segments plus drops exactly cover the base file's 1310 lines with
-// no gap and no overlap, that every segment's `firstLine` locator is globally
-// unique in the base file (so it can never latch onto the wrong occurrence),
-// and that every segment's bounds are internally consistent.
+// (generate, task 2, scratchpad-only) and unsplit.mjs (reverse round-trip, a
+// later task) both read. This file is the mechanical gate on that manifest:
+// it proves the manifest's segments plus drops exactly cover the base
+// commit's 1310 lines with no gap and no overlap, that every segment's
+// `firstLine` locator is globally unique (so it can never latch onto the
+// wrong occurrence), and that every segment's bounds are internally
+// consistent.
 //
-// Deliberately NOT covered here (later tasks, once split.mjs exists and has
-// run): the actual generated docs/architecture/*.md content, the fold/rewrite/
-// proseRef substitutions, the true-inverse round-trip diff, and the sha256
-// digests (the fixture's `sha256` field is intentionally `{}` until then).
+// The base text is read from `fixture.baseCommit` via `git show`, NOT from
+// the live docs/ARCHITECTURE.md -- task 2 reduces that path to a stub, so
+// pinning to the base commit is what keeps this gate meaningful (and green)
+// both before and after the split runs, rather than only during task 1's
+// narrow pre-generation window.
+//
+// Deliberately NOT covered here (a later task, once sha256 is filled in): the
+// true-inverse round-trip diff and the sha256 digests (the fixture's
+// `sha256` field is intentionally `{}` until then).
 //
 // tests/fixtures/ is NOT auto-discovered by bare `node --test` (only
 // tests/*.test.js is) -- this file is the actual test; the JSON is inert data.
@@ -23,20 +28,24 @@ const fs = require('node:fs')
 const path = require('node:path')
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const { execFileSync } = require('node:child_process')
 
 const ROOT = path.join(__dirname, '..')
-const BASE_FILE = path.join(ROOT, 'docs', 'ARCHITECTURE.md')
 const FIXTURE_FILE = path.join(__dirname, 'fixtures', 'architecture-split.json')
 
 function loadFixture() {
   return JSON.parse(fs.readFileSync(FIXTURE_FILE, 'utf8'))
 }
 
-// Base file lines, 1-indexed (baseLines[1] === line 1). Split on '\n': the
-// file ends with a trailing newline, so the split's own trailing '' element
-// is dropped rather than treated as a phantom line 1311.
+// Base file lines, 1-indexed (baseLines[1] === line 1), read from the base
+// commit the fixture itself names rather than the live working tree, since
+// docs/ARCHITECTURE.md is reduced to a stub by the split this fixture drives.
 function loadBaseLines() {
-  const raw = fs.readFileSync(BASE_FILE, 'utf8')
+  const fixture = loadFixture()
+  const raw = execFileSync('git', ['show', fixture.baseCommit + ':' + fixture.baseFile], {
+    cwd: ROOT,
+    encoding: 'utf8'
+  })
   const parts = raw.split('\n')
   if (parts[parts.length - 1] === '') parts.pop()
   const lines = [undefined] // index 0 unused, lines are 1-indexed
@@ -74,17 +83,18 @@ test('fixture is valid JSON with the required top-level shape', function () {
   }
 })
 
-test('gate: no split output file exists yet (task 1 runs before generation)', function () {
+test('gate: every split output file now exists on disk (task 2 has run)', function () {
   const fixture = loadFixture()
   for (const file of Object.keys(fixture.outputs)) {
-    assert.strictEqual(fs.existsSync(path.join(ROOT, file)), false,
-      file + ' already exists on disk, but task 1 must gate the fixture BEFORE any output file is generated')
+    assert.strictEqual(fs.existsSync(path.join(ROOT, file)), true,
+      file + ' is missing on disk; split.mjs must generate all ten docs/architecture/*.md files')
   }
-  assert.strictEqual(fs.existsSync(path.join(ROOT, 'docs', 'index.md')), false)
-  // docs/ARCHITECTURE.md itself must still be the full base file at this stage,
-  // not yet reduced to its stub.
-  assert.strictEqual(fs.statSync(BASE_FILE).size > 30000, true,
-    'docs/ARCHITECTURE.md looks already reduced; task 1 must run before the stub is written')
+  assert.strictEqual(fs.existsSync(path.join(ROOT, 'docs', 'index.md')), true)
+  // docs/ARCHITECTURE.md itself must now be the reduced stub, not the ~1300-line
+  // monolith the base commit still carries.
+  const stubSize = fs.statSync(path.join(ROOT, 'docs', 'ARCHITECTURE.md')).size
+  assert.strictEqual(stubSize < 30000, true,
+    'docs/ARCHITECTURE.md still looks like the full monolith; task 2 must reduce it to a stub')
 })
 
 test('sha256 is intentionally empty until task 3', function () {
