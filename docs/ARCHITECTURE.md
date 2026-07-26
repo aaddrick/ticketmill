@@ -462,10 +462,11 @@ marker, unit-tested directly in `tests/outcomes.test.js` without ever
 shelling out.
 
 **`gradeFromObservation`** applies a fixed precedence: `reverted` >
-`reopened` > `hotfix` > `closed_unmerged` > `abandoned` > `clean` >
-`pending`. The aging is deliberately asymmetric. A bad outcome is real
-the moment it's observed and grades immediately, at any age. A clean
-grade waits: `merged, no negative signal` only becomes `clean` once the
+`reopened` > `hotfix` > `later_batch_fix` > `closed_unmerged` >
+`abandoned` > `clean` > `pending`. The aging is deliberately asymmetric.
+A bad outcome is real the moment it's observed and grades immediately,
+at any age. A clean grade waits: `merged, no negative signal` only
+becomes `clean` once the
 PR has stood for `min_age_days` (default 7, profile-overridable via
 `outcome_grading.min_age_days`, mirroring the
 `profile.contrarian_max_iterations` guard). Before that it grades
@@ -494,9 +495,9 @@ appended. It compares this pass's freshly graded lines against
 `prior_ledger_lines` (both sides read last-line-wins, since the ledger is
 append-only) and keeps only lines that are new or whose grade changed,
 skipping any key whose prior grade is already terminal
-(`reverted`/`reopened`/`hotfix`/`closed_unmerged`/`abandoned` —
-`OUTCOME_TERMINAL_GRADES`) so settled history never gets bloated or
-second-guessed by a possibly-flaky re-read. `summarizeOutcomeCoverage`
+(`reverted`/`reopened`/`hotfix`/`later_batch_fix`/`closed_unmerged`/
+`abandoned` — `OUTCOME_TERMINAL_GRADES`) so settled history never gets
+bloated or second-guessed by a possibly-flaky re-read. `summarizeOutcomeCoverage`
 rolls the pass into `graded_count`/`negative_count`/`pending_count`/
 `sample_cap_hit`, so a later tier can read one small object instead of
 re-walking the ledger.
@@ -513,6 +514,57 @@ artifact, and target selection is bounded by
 pass stays cheap and history catches up over many runs instead of trying
 to grade everything at once.
 
+**`later_batch_fix` reopens a signal a plan review rejected once already
+(issue #104).** An early design for #92 tried to catch "this batch
+caused a later fix" by intersecting `changed_files` across two diffs,
+the batch PR's and a later PR's. Plan review killed it: in a
+monolith-shaped repo where nearly every issue touches
+`workflows/ticketmill.js`, file overlap is guaranteed and proves
+nothing. `later_batch_fix` asks a stronger question instead. Did the
+later fix PR's own `git blame` on the pre-image lines it just replaced
+name THIS batch PR's own squash-merge commit as the SHA that introduced
+them. That's a line-level, blame-forward resolution done entirely in
+the later PR's own coordinate space, never a synthesized intersection
+across two unrelated diffs.
+
+**`computeLaterBatchFix(observation)`** fires iff `batch_pr_merge_sha`
+is a non-empty string and appears in the union of every
+`churned_regions[].blamed_shas` entry. `churned_regions` is an array of
+`{file, blamed_shas}`, one entry per hunk in the later fix PR's diff,
+each already resolved live by the outcome-grade agent stage: a
+read-only `git blame <commit>^ -L <range> -- <file>` on this repo's own
+non-shallow local clone, never a `git fetch`. Anything malformed or
+absent (no SHA, no regions, a region missing `blamed_shas`) fails open
+to `false`, the same ethos as `ageInDays`/`deriveAbandoned`.
+
+**`isPlannedFollowup(bodyText)` keeps a pre-planned continuation out of
+the grade.** A later PR whose own body reads as a scheduled next step
+("follow-up from", "follow up from", "depends on", "deferred from" —
+case-insensitive) isn't repairing a defect. It's doing work that was
+always going to happen. Validated against real history: #103's body
+("Follow-up from #92...") is excluded, while reactive language like
+"regression introduced by" stays eligible. `gradeFromObservation` only
+assigns `later_batch_fix` when `computeLaterBatchFix` fires AND
+`isPlannedFollowup` doesn't.
+
+**It sits below `hotfix`, above the terminal escapes.** A same-issue
+cross-reference (`hotfix`) is a more direct claim than a blame-forward
+resolution against a different PR, so it still wins when both are
+true. A real later fix landing is strictly more informative than
+`closed_unmerged`/`abandoned`, so `later_batch_fix` outranks both. It
+joined `OUTCOME_TERMINAL_GRADES` (a blame-forward resolution never
+un-happens) and `OUTCOME_NEGATIVE_GRADES` (it's the same "this shipped
+a defect" claim as revert/reopen/hotfix, just resolved a different
+way).
+
+**Revisit risk doesn't cover it yet, on purpose.** `later_batch_fix`'s
+evidence, `churned_regions`, lives in the later PR's own coordinate
+space, not a diff the revisit-risk pass can walk to a file list.
+Translating it back would reintroduce the coincidental-overlap risk
+the mechanism exists to avoid. `attachRevisitFiles` returns `files: []`
+for it, always: an explicit fail-open, not a silent gap. Real coverage
+is a follow-up.
+
 ### Revisit risk: flagging a preflight from recent negative outcomes
 
 Outcome grading records whether a merged issue held up. Revisit risk reads
@@ -526,9 +578,12 @@ area with more care.
 still can't shell out, so a `revisit-risk` agent stage does the live
 reads. It cats `outcomes.jsonl` for `prior_ledger_lines` (raw, unparsed
 lines, the same contract as `OUTCOMES_SCHEMA`'s field of the same name),
-then for any ledger key already graded reverted, reopened, or hotfix
-within a target-selection window, resolves that regression's `files` with
-a live `gh` read. It fires alongside `learnPromise` and
+then for any ledger key already graded with a member of
+`OUTCOME_NEGATIVE_GRADES` (reverted, reopened, hotfix, or
+`later_batch_fix` as of issue #104) within a target-selection window,
+resolves that regression's `files` with a live `gh` read.
+`later_batch_fix` always resolves to `files: []` (see above); the other
+three grades resolve a real file list. It fires alongside `learnPromise` and
 `outcomeGradePromise`, in the same `STAGE_TOKENS.preflight` bracket, and
 it is strictly read-only. `computeRevisitRisk`, above the
 `TICKETMILL-TEST-HARNESS-SPLIT` marker, is the only place that decides a
