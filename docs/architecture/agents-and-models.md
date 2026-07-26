@@ -1,6 +1,6 @@
 # Agents and models
 
-Agent roles, the persona-by-reference mechanism, and model policy: how ticketmill decides which persona and which model handle a given stage.
+Ticketmill picks a persona and a model for every stage instead of guessing. This page covers the persona-by-reference mechanism and the model policy behind that choice.
 
 ## One agent mechanism: persona-by-reference
 

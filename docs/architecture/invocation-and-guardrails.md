@@ -1,6 +1,6 @@
 # Invocation and guardrails
 
-How a run is invoked, where the engine's own files live, and the guardrails that keep an issue from touching engine-owned paths by accident.
+Every run gets invoked the same way, and the engine's own files live in a fixed place. This page covers both, plus the guardrail that keeps an issue from touching engine-owned paths by accident.
 
 ## Invocation: scriptPath, with the engine copied into the target repo
 

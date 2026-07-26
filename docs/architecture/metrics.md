@@ -1,6 +1,6 @@
 # Metrics
 
-Friction and churn, rework tax, gate yield, and outcome/revisit-risk grading: the run's self-reported signals of how hard it fought and whether that fight was worth it.
+The run grades itself on the way out: friction and churn, rework tax, gate yield, and outcome/revisit-risk. Together they say how hard the run fought and whether that fight paid off.
 
 ## Friction & churn: a weighted per-run score, not a raw iteration count
 

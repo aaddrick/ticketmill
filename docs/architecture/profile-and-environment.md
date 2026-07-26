@@ -1,6 +1,6 @@
 # Profile and environment
 
-The .claude/ticketmill.json profile and the mill-init doctor pass: why the engine refuses to guess a repo's toolchain.
+The engine won't guess a repo's toolchain. It reads the `.claude/ticketmill.json` profile instead, and mill-init's doctor pass is what keeps that profile honest.
 
 ## The profile is required, and tests cannot be skipped silently
 

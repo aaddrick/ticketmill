@@ -1,6 +1,6 @@
 # Branching and merge
 
-The batch-branch model, the Closes-lines bookkeeping, the release stage, and merge auto-resolve's one mechanical recovery attempt.
+Every batch runs on one branch, closes its issues by number, and lands through a release stage. This page also covers merge auto-resolve's one mechanical recovery attempt.
 
 ## Batch branch model
 

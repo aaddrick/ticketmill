@@ -1,6 +1,6 @@
 # Cost and tokens
 
-Token instrumentation, the cost estimator, and the token_budget guard: tracking spend as signal, never as a gate, except where a human explicitly asks it to be one.
+Ticketmill tracks spend as a signal, never as a gate, unless a human explicitly asks it to be one. This page covers the token instrumentation, the cost estimator, and the token_budget guard that make that tracking possible.
 
 ## Token tracking: instrumentation, never a gate
 

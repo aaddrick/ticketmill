@@ -2,10 +2,9 @@
 
 Read this before editing anything under `docs/architecture/`. These ten files
 used to be one file, `docs/ARCHITECTURE.md`, split into topic-sized pages by
-issue #154. The split is provable, not just described: a committed test
-reconstructs the original document from these files and checks it byte for
-byte against a digest recorded when the split happened. That provability is
-the one rule everything else here follows from.
+issue #154. The split is provable: a committed test reconstructs the original
+document from these files and checks it byte for byte against a digest
+recorded when the split happened.
 
 > **Parity note:** `CLAUDE.md` and `AGENTS.md` in this directory are byte-identical
 > on purpose, so an agent finds the same guidance under whichever name its harness
@@ -53,9 +52,9 @@ two ways:
 
 Either way, the fix is the same: **revert the edit to the moved prose, and
 open a follow-up issue for the wording change you wanted.** Do not edit the
-test's expected digest to make it pass. The test isn't wrong; it's telling
-you the provenance proof no longer holds, and that proof is the reason this
-split was safe to do in the first place.
+test's expected digest to make it pass. A red result here means the
+provenance proof no longer holds, the same proof that made this split safe
+to ship.
 
 ## What lives here
 
@@ -86,9 +85,9 @@ when the split happened. It has no opinion on new material:
    you write it. Add it wherever it reads best; there's nothing to keep in
    sync.
 2. If you genuinely need to reshuffle moved prose across files (not just add
-   to it), that's a second split-style change, not a docs edit: it needs its
-   own fixture update and its own one-time provenance re-proof, the same way
-   issue #154 built this one. Don't hand-edit the fixture's `sha256` values
+   to it), treat it as a second split-style change: it needs its own fixture
+   update and its own one-time provenance re-proof, the same way issue #154
+   built this one. Don't hand-edit the fixture's `sha256` values
    to match a reshuffle; regenerate them the way the fixture's own
    `sha256._schema` note describes.
 3. Either way, keep `index.md`'s file map current. It's authored text, so

@@ -1,6 +1,6 @@
 # Scheduling
 
-Claims interop, the consolidation gate, and lane scheduling: how the engine decides what to group and what to run concurrently.
+The engine has to decide what to group and what to run at the same time. This page covers claims interop, the consolidation gate, and lane scheduling, the three mechanisms behind that decision.
 
 ## Claims interop
 
