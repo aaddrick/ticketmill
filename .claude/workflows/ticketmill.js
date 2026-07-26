@@ -2817,7 +2817,7 @@ function withBrowser(fn) {
   BW_QUEUE = run.then(function () {}, function () {}) // keep the chain alive past failures
   return run
 }
-function bwPort(issue) { return ((BROWSER && BROWSER.port_base) || 8100) + (issue % ((BROWSER && BROWSER.port_span) || 900)) }
+function bwPort(issue) { const span = parseInt((BROWSER && BROWSER.port_span), 10); return ((BROWSER && BROWSER.port_base) || 8100) + (issue % (span >= 1 ? span : 900)) }
 function serveCmd(issue) {
   return String((BROWSER && BROWSER.serve_command) || '').replace(/\{port\}/g, String(bwPort(issue)))
 }
