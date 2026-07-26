@@ -540,6 +540,17 @@ const DIFF_PROBE_SCHEMA = {
     added_files: { type: 'array', items: { type: 'string' } },
   },
 }
+// COMMIT_PROBE_SCHEMA (issue #79, Layer 2 — post-hoc validation of agent-posted
+// commit SHAs): probeCommitShas()'s own read-only existence check. The agent
+// runs `git cat-file -e <sha>^{commit}` per collected SHA and reports back
+// which ones did NOT resolve — the engine (not agent judgment) then decides
+// what counts as a fabrication incident.
+const COMMIT_PROBE_SCHEMA = {
+  type: 'object', required: ['unresolved_shas'],
+  properties: {
+    unresolved_shas: { type: 'array', items: { type: 'string' } },
+  },
+}
 const CLAIM_SCHEMA = {
   type: 'object', required: ['issue', 'claimed'],
   properties: { issue: { type: 'integer' }, claimed: { type: 'boolean' }, reason: { type: 'string' } },
@@ -1812,6 +1823,19 @@ const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotch
 const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> log -1 --format=%H — it prints the ' +
   'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
   'or recall a SHA from memory.'
+// collectPostedCommit (issue #79, Layer 2): COMMIT_SHA_ASK above is advisory
+// only — it tells the agent how to get the real SHA, but the `commit` field it
+// returns is still unverified free text. This collects every non-null commit a
+// stage reports into ctx.postedCommits so probeCommitShas() (below, co-located
+// with probeChangedFiles()) can later confirm each one actually exists in the
+// worktree, once, near merge — instead of trusting each of the 8 call sites on
+// its own. Guards a null stage result (call sites already degrade on that
+// themselves) and a stage that reported no commit (review/validate stages, or
+// a fix stage that made no changes).
+function collectPostedCommit(ctx, stageName, r) {
+  if (!r || !r.commit) return
+  ctx.postedCommits.push({ stage: stageName, commit: r.commit })
+}
 function collectNotes(ctx, from, r) {
   const arr = (r && r.notes_for_downstream) || []
   for (const n of arr) {
@@ -2747,6 +2771,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       ].join('\n'), stageOpts('simplify'), IMPL_SCHEMA)
       if (!simp || simp.status === 'error') { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': simplify degraded'); break }
       collectNotes(ctx, 'simplify', simp)
+      collectPostedCommit(ctx, 'simplify-' + prefix + '-i' + iter, simp)
     } else if (iter === 1) {
       log('#' + ctx.issue + ' quality ' + prefix + ': simplify skipped (no in-scope files in change)')
     }
@@ -2792,6 +2817,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!fix || fix.status === 'error') { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': fix degraded'); break }
     collectNotes(ctx, 'quality-fix', fix)
+    collectPostedCommit(ctx, 'quality-fix-' + prefix + '-i' + iter, fix)
     tallyTouches(ctx, fix.files_changed)
     if (!runSimplify && (fix.files_changed || []).some(inScope)) runSimplify = true
   }
@@ -2980,6 +3006,7 @@ async function runBrowserCheck(ctx, where) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!fix || fix.status === 'error') return { ok: false, error: 'browser-fix stage failed (' + where + ')' }
     collectNotes(ctx, 'browser-fix', fix)
+    collectPostedCommit(ctx, 'browser-fix-' + where + '-i' + iter, fix)
     tallyTouches(ctx, fix.files_changed)
   }
   return { ok: false, error: 'browser verification still failing after ' + MAX_BROWSER_ITERATIONS + ' iterations (' + where + ')' }
@@ -3048,6 +3075,47 @@ async function probeChangedFiles(ctx) {
   }
   ctx.changed_files = probe.changed_files || []
   ctx.added_files = probe.added_files || []
+}
+
+// probeCommitShas (issue #79, Layer 2 — post-hoc validation of agent-posted
+// commit SHAs): follow-up to #47/PR #78's COMMIT_SHA_ASK (Layer 1, advisory
+// only — it tells the agent HOW to get the real SHA, but the `commit` field a
+// stage returns is still unverified free text). Co-located with
+// probeChangedFiles() immediately above (same read-only-dispatch shape, same
+// call site in reviewAndMerge(), run once near merge) but checks
+// ctx.postedCommits — every non-null `commit` collectPostedCommit() gathered
+// at the 8 COMMIT_SHA_ASK sites — instead of the working diff. Early-returns
+// with NO dispatch when nothing was posted (the common case: many stages never
+// report a commit). One read-only haiku probe for the whole issue, not eight
+// per-site round-trips. On a missing SHA: flagged via VERIFY_SKIPS (surfaces
+// in the batch PR's Verification Gaps section) and ctx.deferred (fabrication-
+// incident framing naming the posting stage) — never halts. On probe death:
+// degrade-recorded via ctx.deferred, never blocks — mirrors probeChangedFiles.
+async function probeCommitShas(ctx) {
+  if (!ctx.postedCommits.length) return
+  const shas = []
+  for (const p of ctx.postedCommits) { if (shas.indexOf(p.commit) === -1) shas.push(p.commit) }
+  const probe = await stage(ctx, 'commit-sha-probe', [
+    'READ-ONLY probe for issue #' + ctx.issue + ': confirm each commit SHA below actually exists in worktree ' + ctx.worktree + '.',
+    'For EACH sha in the list, run exactly (substituting the sha):',
+    'git -C ' + ctx.worktree + ' cat-file -e <sha>^{commit}',
+    'SHAs to check:',
+    shas.map(function (s) { return '- ' + s }).join('\n'),
+    'Return unresolved_shas: the SHAs from the list above whose cat-file check FAILED (non-zero exit, i.e. the SHA does',
+    'NOT exist as a commit in this worktree). Empty array if every SHA resolved.',
+  ].join('\n'), stageOpts('probe'), COMMIT_PROBE_SCHEMA)
+  if (!probe) {
+    log('#' + ctx.issue + ' commit-sha probe died — degrading (recorded), not blocking the issue')
+    ctx.deferred.push('Commit-SHA probe: could not validate ' + shas.length + ' posted commit SHA(s) for issue #' + ctx.issue + ' — verify manually before merge.')
+    return
+  }
+  const unresolved = probe.unresolved_shas || []
+  for (const sha of unresolved) {
+    const posting = ctx.postedCommits.find(function (p) { return p.commit === sha })
+    const fromStage = posting ? posting.stage : 'unknown stage'
+    VERIFY_SKIPS.push('#' + ctx.issue + ': stage "' + fromStage + '" posted commit SHA ' + sha + ' that does NOT exist in the worktree — possible fabricated SHA, verify manually before merge')
+    ctx.deferred.push('Fabrication incident: stage "' + fromStage + '" for issue #' + ctx.issue + ' claimed commit ' + sha + ', but the post-hoc probe could not find it in the worktree — treat this stage\'s reported commit as unverified and check manually before trusting it.')
+  }
 }
 async function runEngineOwnedGate(ctx) {
   if (!ENGINE_OWNED.length) return { ok: true }
@@ -3220,6 +3288,7 @@ async function runTestLoop(ctx, forced) {
       ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
       if (!fix || fix.status === 'error') return { ok: false, error: 'test-fix stage failed — halting test loop' }
       collectNotes(ctx, 'test-fix', fix)
+      collectPostedCommit(ctx, 'test-fix-i' + iter, fix)
       tallyTouches(ctx, fix.files_changed)
       continue
     }
@@ -3264,6 +3333,7 @@ async function runTestLoop(ctx, forced) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!qfix || qfix.status === 'error') return { ok: false, error: 'test-quality-fix stage failed — halting test loop' }
     collectNotes(ctx, 'test-quality-fix', qfix)
+    collectPostedCommit(ctx, 'test-quality-fix-i' + iter, qfix)
     tallyTouches(ctx, qfix.files_changed)
     ctx.metrics.test_quality_fix_rounds++
   }
@@ -4223,6 +4293,7 @@ async function implementIssue(ctx) {
     if (!impl) { failedTasks.push(task.id); log('#' + ctx.issue + ' task ' + task.id + ': implement died — task failed'); continue }
     if (impl.status !== 'success') { failedTasks.push(task.id); log('#' + ctx.issue + ' task ' + task.id + ': implement error — task failed'); continue }
     collectNotes(ctx, 'task-' + task.id, impl)
+    collectPostedCommit(ctx, 'task-' + task.id + '-implement', impl)
 
     let approved = false
     let lastComments = ''
@@ -4274,6 +4345,7 @@ async function implementIssue(ctx) {
       ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
       if (!fx || fx.status === 'error') break
       collectNotes(ctx, 'task-' + task.id + '-fix', fx)
+      collectPostedCommit(ctx, 'task-' + task.id + '-fix-a' + attempt, fx)
     }
 
     if (!approved) {
@@ -4453,6 +4525,7 @@ async function reviewAndMerge(ctx) {
     if (!fix || fix.status === 'error') return fail(ctx, 'needs_human', 'pr-fix', 'PR fix stage failed — PR #' + ctx.pr + ' left open for human review')
     pushDecision(ctx, 'PR Review Fix (i' + iter + ')', fix.summary || 'fixes applied')
     collectNotes(ctx, 'pr-fix', fix)
+    collectPostedCommit(ctx, 'pr-fix-i' + iter, fix)
     tallyTouches(ctx, fix.files_changed)
 
     const q = await runQualityLoop(ctx, 'pr-fix-i' + iter, 'post-review fixes for PR #' + ctx.pr, fix.files_changed)
@@ -4497,6 +4570,13 @@ async function reviewAndMerge(ctx) {
   // gates the merge: probeChangedFiles() degrades to a recorded deferred note
   // on a dead probe rather than failing the issue. ----
   await probeChangedFiles(ctx)
+
+  // ---- COMMIT-SHA PROBE (issue #79, Layer 2) — post-hoc validation of every
+  // commit SHA an agent posted during this issue (ctx.postedCommits), right
+  // after the changed-files probe and before the worktree teardown below.
+  // Never gates the merge: probeCommitShas() degrades to a recorded deferred
+  // note on a dead probe, and flags (never halts) on an unresolved SHA. ----
+  await probeCommitShas(ctx)
 
   // ---- MERGE (preflight, squash merge, complete comment, follow-ups, cleanup) ----
   const deferredBlock = ctx.deferred.length ? ctx.deferred.map(function (d) { return '- ' + d }).join('\n') : ''
@@ -4600,6 +4680,7 @@ async function processIssue(pre) {
     added_files: null,
     touch_counts: {},   // per-file re-touch tally across fix-stage files_changed (tallyTouches(), issue #87 task 2)
     gate_findings: {},  // per-gate finding tally/disposition (recordGateOutcome(), issue #87 task 3)
+    postedCommits: [],  // {stage, commit} per COMMIT_SHA_ASK site that reported a commit (collectPostedCommit(), issue #79) — validated post-hoc by probeCommitShas()
   }
   if (pre.resume_point === 'skip') {
     log('#' + ctx.issue + ' skipped: ' + pre.reason)
