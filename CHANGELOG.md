@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.39 (2026-07-26)
+
+Fixes a drift that had been live since v0.1.9 and closes the gap that let it
+happen.
+
+`scripts/setup-worktree.sh` is copied into every onboarded repo as
+`.claude/scripts/ticketmill/setup-worktree.sh`, but only the engine pair was
+ever byte-compared, so the copy in this repo sat 29 releases behind its
+source. It was missing two fixes:
+
+- An empty-slug guard. An issue title with no alphanumeric characters produced
+  an empty slug and a branch named `issue-<N>-`.
+- A `>/dev/null 2>&1` redirect on `git branch`. This is the one that matters:
+  the script's contract with the engine is JSON-on-stdout, so a bare
+  `git branch` writing to stdout corrupts the parse.
+
+- `scripts/lint-engine.js`: the hardcoded single engine pair became a
+  `LOCKSTEP_PAIRS` list, byte-compared in check mode and written source over
+  copy by `--fix`. `--fix` now also creates a missing copy's parent directory
+  and carries the source's mode across, since a setup script that loses its
+  executable bit is broken in a way a byte-compare cannot see.
+- `.claude/ticketmill.json`: the setup-script pair joins
+  `lockstep_installed_paths` and `serialize_globs`, and the LOCKSTEP-EDIT
+  verify_note now describes every copied pair rather than just the engine.
+- `tests/sandbox-lint.test.js`: four new tests covering the second pair
+  (drift detected, `--fix` repairs it and restores the executable bit, `--fix`
+  creates a missing copy, check mode fails loudly on a missing copy). The
+  existing sandbox builders seed both pairs so their scratch repo matches the
+  real shape. Suite goes 571 to 575. Verified by mutation: dropping the pair
+  from `LOCKSTEP_PAIRS` fails exactly those four and no others.
+- `docs/ARCHITECTURE.md`: the lockstep section covers pairs in general and
+  records why the setup script joined them.
+
 ## 0.1.38 (2026-07-26)
 
 Documentation only. Fixes the last bad diagram from 0.1.37 and puts every

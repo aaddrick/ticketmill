@@ -143,12 +143,22 @@ unavailable and explicitly forbids simulating the pipeline inline: an imitation
 run has no journal, no claims, no breakers, and no resumability, which is worse
 than not running.
 
-Because the engine now exists as two files that must stay byte-identical
-(`workflows/ticketmill.js`, the source, and `.claude/workflows/ticketmill.js`,
-the copy mill-init drops into target repos), `scripts/lint-engine.js` byte-compares
-them on every test run and fails loud on drift. Edit only the source, then run
-`node scripts/lint-engine.js --fix` in the same commit to copy it verbatim
-over the `.claude` copy; the two are never meant to diverge.
+Because mill-init copies files verbatim into target repos, each copied file
+exists twice and the two must stay byte-identical. `scripts/lint-engine.js`
+byte-compares every such pair on each test run and fails loud on drift. Edit
+only the source, then run `node scripts/lint-engine.js --fix` in the same
+commit to write it verbatim over the installed copy. The pairs are the engine
+(`workflows/ticketmill.js`) and the worktree setup script
+(`scripts/setup-worktree.sh`).
+
+The setup script was added to that check after it drifted unnoticed for 29
+releases. It had picked up an empty-slug guard and a redirect that keeps `git
+branch` off stdout, and neither reached the installed copy, because the
+byte-compare only ever covered the engine. The stdout redirect is the reason
+this matters beyond tidiness: the script's contract with the engine is
+JSON-on-stdout, so anything else written there corrupts the parse. `--fix`
+also copies the source's mode, since a setup script that loses its executable
+bit is broken in a way a byte-compare cannot see.
 
 ### Sandbox lint: catching rules `node --check` can't see
 
