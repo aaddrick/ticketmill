@@ -228,6 +228,7 @@ function makeCtx(overrides) {
       added_files: null,
       touch_counts: {},
       gate_findings: {},
+      postedCommits: [],
     },
     o,
     { metrics: Object.assign(freshMetrics(), o.metrics) },

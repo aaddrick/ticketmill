@@ -663,7 +663,7 @@ otherwise-green issue.
 | Browser lock (mkdir + owner + stale-steal) | Concurrent agents hijacked each other's browser tabs |
 | Degrade windows + circuit breakers | Distinguish one flaky stage from a systemic failure worth stopping for |
 | `isBudgetExhaustedError` noun+verb match | A bare keyword sweep on "budget"/"ceiling" matched a target repo's own domain errors, misreporting an ordinary agent death as token exhaustion and halting every remaining issue |
-| `COMMIT_SHA_ASK` guard | Twice, an agent typed a fabricated or shortened commit SHA into a posted comment instead of reading the real one, requiring a fixup edit |
+| `COMMIT_SHA_ASK` guard (Layer 1: advisory prompt) + `probeCommitShas` (Layer 2: post-hoc existence check) | Twice, an agent typed a fabricated or shortened commit SHA into a posted comment instead of reading the real one, requiring a fixup edit |
 | `VERIFY_SKIPS` entry on a contrarian cap-out | An approach or plan gate's cap-out reached only `ctx.unresolved`, never the batch PR's Verification Gaps section, so a caveat worth a human's attention could ship and merge unseen |
 | Report-phase release stage (`releaseEnabled`, `deriveReleaseVersion`) | A batch of real engine changes (PR #56) merged with the CHANGELOG and version file left stale, because the pipeline had always assumed some later stage bumped them and no stage ever did |
 
@@ -683,6 +683,38 @@ later stage had to post a fixup comment with the correct value.
 simplify, quality fix, browser fix, test fix, test quality fix, task
 implementation, task review fix, and PR review fix. Sharing one constant
 keeps the wording in sync across all of them if it changes later.
+
+#### Layer 2: post-hoc validation of the posted SHA (issue #79)
+
+`COMMIT_SHA_ASK` is advisory only — it tells an agent how to get the real
+SHA, but the `commit` field a stage returns is still unverified free text.
+Nothing stopped a stage from posting a fabricated or stale SHA anyway.
+`collectPostedCommit(ctx, stageName, r)` is called at all eight
+`COMMIT_SHA_ASK` sites and appends every non-null `commit` a stage reports
+to `ctx.postedCommits` (guarding a null stage result and a stage that
+reported no commit at all, e.g. a fix stage that made no changes).
+
+`probeCommitShas(ctx)` then validates that list once per issue, from
+`reviewAndMerge()`, immediately before `runMergeAutoResolve()`. Same
+read-only-dispatch shape as `probeChangedFiles()` immediately above it in
+`workflows/ticketmill.js`: it early-returns with **no dispatch** when
+`ctx.postedCommits` is empty (the common case — most stages never report a
+commit), otherwise it dispatches a single read-only haiku probe that runs
+`git -C <worktree> cat-file -e <sha>^{commit}` for every distinct SHA
+collected and reports back which ones did not resolve. The probe runs
+before merge-auto-resolve deliberately: a rebase there legitimately
+rewrites every commit's SHA, and validating pre-rebase — while every posted
+SHA still resolves in the worktree — means there is nothing left to
+re-validate afterward.
+
+The check is advisory-flag, never-halt, same as the engine-owned gate and
+`probeChangedFiles()`: a missing SHA pushes a `VERIFY_SKIPS` entry (so it
+surfaces in the batch PR's Verification Gaps section) and a `ctx.deferred`
+note naming the posting stage, but never blocks the issue. A dead probe
+(the agent call dies through every retry) degrades to a recorded
+`ctx.deferred` note instead — same fail-open posture as every other
+degrade-safe probe in this engine. One dispatch validates every SHA posted
+during the issue, not eight per-site round-trips.
 
 ### Model policy
 
