@@ -1,15 +1,45 @@
 # Changelog
 
+## 0.1.38 (2026-07-26)
+
+Documentation only. Fixes the last bad diagram from 0.1.37 and puts every
+line of prose from the diagram work through the voice process.
+
+`phase-select.d2` left the grid. It is the one branching diagram in the set,
+and a grid handles a fan-out badly: only one branch target can share a column
+with the probe, so the other two edges come out as diagonals however the cells
+are arranged. Wrapping the three outcomes in a container to dodge that only
+moved the distortion, because a container is a single grid cell and a grid row
+or column takes the size of its largest member. Side by side, the container
+stretched the Preflight probe into a wide empty band. Stacked as a nested grid,
+it stretched the Claim issues box into a tall one instead and pushed the
+diagram to 636px. On dagre the fan renders as an actual decision tree, every
+box sized to its own content, at 1177x423.
+
+The rule is now chains in a grid, branches on the layout engine, and
+`docs/diagrams/{CLAUDE,AGENTS}.md` says so.
+
+Prose: the `## Pipeline` section of `docs/ARCHITECTURE.md`, the two guidance
+files, and the 0.1.36 and 0.1.37 changelog entries all went through
+`aaddrick-voice` with the removing-ai-tells checklist, gatekeeper-reviewed.
+Every em dash and en dash is gone from that text, replaced contextually rather
+than swapped one for one. Two proposed edits were rejected: "cap-outs are never
+silent" stays, since it is this repo's own phrase and a section heading further
+down the same file, and `test_command` "must" be present rather than "has to
+be", because that is a hard requirement. Pre-existing prose in `README.md` and
+the agent charters was left alone, as the process scopes each pass to newly
+written text.
+
 ## 0.1.37 (2026-07-26)
 
 Documentation only. Layout pass over the diagrams added in 0.1.36.
 
-Three problems with the first cut, all of them a consequence of d2 emitting a
-root `<svg>` with a `viewBox` and no width or height — the image scales to
-whatever container holds it, so natural size *is* display size:
+Three problems with the first cut, all of them from d2 emitting a root `<svg>`
+with a `viewBox` and no width or height. The image scales to whatever container
+holds it, so natural size *is* display size:
 
 - The overview was 389x1495. Scaled up to GitHub's ~1012px column it rendered
-  roughly 1012x3900 — a wall of enormous boxes.
+  roughly 1012x3900: a wall of enormous boxes.
 - The phase diagrams were single rows up to 2310px wide, scaled *down* far
   enough that 14px text landed at ~6px.
 - `tl -> tl: "fix"` and friends were bare self-loops that never said where the
@@ -21,7 +51,7 @@ went from 389-2310 wide to 734-1213 wide and under 550 tall, so each renders
 near 1:1 in the docs column.
 
 - `docs/diagrams/*.d2`: rewritten as `grid-rows`/`grid-columns` layouts. Grid
-  is the only wrap mechanism available — d2 does not expose ELK's
+  is the only wrap mechanism available: d2 does not expose ELK's
   `wrapping.strategy` (its ELK config is a fixed typed struct) and a
   `direction` set on a container is ignored by both bundled engines.
 - Loops now name their work. `phase-build.d2` gained an explicit **Fix failing
@@ -36,7 +66,7 @@ near 1:1 in the docs column.
   three resume points are now spelled out in `docs/ARCHITECTURE.md` prose
   instead.
 - `docs/diagrams/{CLAUDE,AGENTS}.md`: layout guidance rewritten for the grid
-  model — the diagonal rule, boustrophedon ordering, load-bearing spacer cells,
+  model: the diagonal rule, boustrophedon ordering, load-bearing spacer cells,
   shared column widths, and the two-sided size budget.
 
 ## 0.1.36 (2026-07-26)
@@ -49,8 +79,8 @@ renderer handles chained subgraphs with per-subgraph `direction` overrides
 badly, and the result was dense enough that nobody read it.
 
 - `docs/diagrams/` (new): the pipeline redrawn as six [D2](https://d2lang.com)
-  diagrams — one overview plus one per phase (Select, Plan, Build, Ship,
-  Report). Each renders to a committed light/dark SVG pair, paired in the doc
+  diagrams: one overview plus one per phase (Select, Plan, Build, Ship,
+  Report). Each renders to a committed light/dark SVG pair, wired into the doc
   through a `<picture>` element so it follows the reader's GitHub theme. Two
   themes rather than one because d2 inlines custom fills instead of emitting
   them into its `prefers-color-scheme` block, so a single SVG cannot carry
@@ -59,7 +89,7 @@ badly, and the result was dense enough that nobody read it.
   are the source of truth; the SVGs are generated and committed so reading the
   docs needs no toolchain.
 - `docs/diagrams/CLAUDE.md`, `docs/diagrams/AGENTS.md` (new): byte-identical
-  guidance for anyone editing these files — theme contract, the width budget
+  guidance for anyone editing these files: theme contract, the width budget
   that keeps text legible in GitHub's ~1012px column, and the layout
   constraints found the hard way (nested container `direction` is ignored by
   both bundled engines; `|md|` labels render as `foreignObject` and do not

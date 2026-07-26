@@ -1,7 +1,7 @@
 # Working on the pipeline diagrams
 
 Read this before editing anything in `docs/diagrams/`. Most of what follows is
-a lesson learned the expensive way — by rendering something that looked fine
+a lesson learned the expensive way: rendering something that looked fine
 locally and was unreadable, invisible, or mirrored once it landed in
 `docs/ARCHITECTURE.md`.
 
@@ -45,7 +45,7 @@ tar -xzf d2.tar.gz          # binary lands at d2-v0.7.1/bin/d2
 
 1. Edit the `.d2` body (or a theme file).
 2. Run `./render.sh`. It writes **both** the light and dark SVG for every
-   diagram — always commit the pair.
+   diagram. Always commit the pair.
 3. Eyeball the result at the width it will actually be viewed at. See
    "Verifying" below. Do not skip this; nearly every rule on this page exists
    because something passed a compile and failed a look.
@@ -57,20 +57,20 @@ tar -xzf d2.tar.gz          # binary lands at d2-v0.7.1/bin/d2
 
 `render.sh` builds each diagram by **concatenating** a theme file and a body
 file into a temp file. That is why bodies must not declare their own `vars`
-or `classes` blocks — they would collide with the theme's.
+or `classes` blocks. They would collide with the theme's.
 
 ## Theme contract
 
 `theme-light.d2` and `theme-dark.d2` must define **exactly the same class
-names**. A body references a class that only one theme defines and that mode's
+names**. If a body references a class that only one theme defines, that mode's
 render silently falls back to d2 defaults.
 
-Current vocabulary — keep it in sync with the legend in `ARCHITECTURE.md`:
+Current vocabulary. Keep it in sync with the legend in `ARCHITECTURE.md`:
 
 | Class | Means |
 | --- | --- |
 | `stage` | An ordinary stage: one schema-validated subagent call |
-| `gate` | A gate or capped loop — somewhere the run can iterate or stall |
+| `gate` | A gate or capped loop: somewhere the run can iterate or stall |
 | `optional` | Gated on profile config, skipped by default (dashed border) |
 | `terminal` | A terminal state for that phase |
 | `human` | The one place a human is required |
@@ -83,7 +83,7 @@ Current vocabulary — keep it in sync with the legend in `ARCHITECTURE.md`:
 ### d2 comments are `#`, not `//`
 
 `//` is not a comment. d2 parses those lines as shape declarations, and you get
-a bogus node plus a confusing parse error somewhere else in the file — often
+a bogus node plus a confusing parse error somewhere else in the file, often
 pointing at a line that is fine. A `*` inside such a line is read as a glob
 operator, which is how this first surfaced.
 
@@ -91,7 +91,7 @@ operator, which is how this first surfaced.
 
 Markdown blocks render into `<svg:foreignObject>`. That is HTML inside an SVG,
 and support for it collapses the moment the SVG is loaded through an `<img>`
-tag — which is exactly how GitHub embeds these. It also ignored the line breaks
+tag, which is exactly how GitHub embeds these. It also ignored the line breaks
 we wrote and let text overflow its box.
 
 Use plain quoted labels with `\n` instead. They render as native `<text>`
@@ -109,7 +109,7 @@ d2 does emit a `prefers-color-scheme` block, but only for its *built-in* theme
 colors. Any `style.fill` you write yourself is inlined as a literal hex value
 and will not adapt. One SVG therefore cannot carry both palettes.
 
-Hence: two renders per diagram, paired in `ARCHITECTURE.md` through a
+So: two renders per diagram, paired in `ARCHITECTURE.md` through a
 `<picture>` element, which GitHub officially supports:
 
 ```html
@@ -126,16 +126,19 @@ opaque white background rect, which renders as a white slab behind the dark
 diagram on GitHub's dark theme, and makes dark container titles unreadable.
 Do not remove it.
 
-### Every diagram is a grid snake, not an engine layout
+### Five of the six are grid snakes; select is the exception
 
-All six diagrams set `grid-rows` / `grid-columns`. A grid diagram bypasses the
-layout engine entirely — the `layout-engine: dagre` in the theme files is a
-leftover default that grid overrides, and it only matters if you ever add a
-non-grid diagram.
+Every diagram except `phase-select.d2` sets `grid-rows` / `grid-columns`. A
+grid diagram bypasses the layout engine entirely, so the `layout-engine: dagre`
+in the theme files applies to select alone.
+
+The split is between **chains** and **branches**. A chain wraps cleanly in a
+grid. A fan-out does not (see the diagonal rule below), so select stays on
+dagre, which draws it as a proper decision tree.
 
 Reading order is **boustrophedon**: row 1 left-to-right, the flow drops straight
 down the last column, row 2 reads back right-to-left. That is what keeps the
-wrap edge orthogonal — a naive left-to-right wrap sends a diagonal all the way
+wrap edge orthogonal. A naive left-to-right wrap sends a diagonal all the way
 back across the image.
 
 Cells fill **row-major over declaration order**, and declaration order is the
@@ -157,15 +160,16 @@ when its two cells are *neighbours* sharing a row or a column:
 So place nodes to suit the edges, not the reading order, and check every new
 edge against this rule. There is no engine to rescue a bad placement.
 
-Two consequences worth knowing before you fight them:
+Two consequences to know before you fight them:
 
 - **A fan-out cannot be drawn orthogonally as sibling cells.** Only one target
-  can share a column with its source. `phase-select.d2` solves its three-way
-  branch by putting the outcomes in a *container* used as one grid cell;
-  containers lay their children out side by side.
+  can share a column with its source, so every other branch edge is a diagonal.
+  Containers do not rescue this either (see "Column width is shared"). A
+  branching diagram belongs on the layout engine, not in a grid. That is why
+  `phase-select.d2` is not a grid.
 - **Neither engine can wrap a chain for you.** d2 does not expose ELK's
   [`wrapping.strategy`](https://eclipse.dev/elk/reference/options/org-eclipse-elk-layered-wrapping-strategy.html)
-  — its ELK config is a fixed typed struct — and a `direction` set on a
+  (its ELK config is a fixed typed struct), and a `direction` set on a
   container is ignored by both dagre and ELK. Grid is the only wrap mechanism.
   Do not spend time re-testing these.
 
@@ -188,7 +192,7 @@ an explicit **Fix findings** node, each joined to its gate by a `<->`
 connector.
 
 Where the rework is just re-running the stage before it, a bidirectional
-connector is enough — that is the contrarian gates in `phase-plan.d2`. The
+connector is enough. That is the contrarian gates in `phase-plan.d2`. The
 per-task repetition in `phase-build.d2` rides in the quality-loop label (`↺ next
 task`) because drawing it would span two cells and cut through the task-review
 box.
@@ -203,9 +207,12 @@ column. Deleting one reflows the entire grid. Renumber rather than remove.
 A grid column takes the width of its widest cell, so one verbose box stretches
 everything above and below it. This bit twice:
 
-- `phase-select.d2`'s outcome container stretched the Preflight probe into a
-  wide empty band. Fixed by cutting the outcome labels to one word each and
-  giving the probe a second line of real text.
+- `phase-select.d2`'s three outcomes, wrapped in a container to keep the fan
+  orthogonal, stretched the Preflight probe into a wide empty band. Stacking
+  them as a nested grid inside that container only moved the distortion: the
+  Claim issues box became a tall one instead, and the diagram grew to 636px.
+  The distortion cannot be styled away, because the container *is* one cell.
+  Select left the grid entirely.
 - `phase-ship.d2` originally wrapped spec and code review in a container, which
   stretched Fix findings and Squash-merge into oversized boxes. Fixed by
   collapsing the two symmetric peers into a single cell.
@@ -222,11 +229,11 @@ That cuts both ways:
 - Too wide and it scales down, shrinking the text with it. The pre-grid
   `phase-select` was 2310px, scaled to 0.44, and rendered 14px text at ~6px.
 - Too narrow and it scales **up**. The pre-grid overview was 389×1495 and blew
-  up to roughly 1012×3900 — a wall of enormous boxes.
+  up to roughly 1012×3900: a wall of enormous boxes.
 
 Aim for a natural width close to 1012px so the diagram renders near 1:1, and
-keep the height under about 550px. Current range is 734–1213 × 305–489. Check
-after every edit:
+keep the height under about 550px. Current widths run 734 to 1213, heights 305
+to 489. Check after every edit:
 
 ```bash
 for f in *-light.svg; do
@@ -234,7 +241,7 @@ for f in *-light.svg; do
 done
 ```
 
-Raising the font size does not buy legibility — box widths grow with the text,
+Raising the font size does not buy legibility. Box widths grow with the text,
 so the ratio barely moves.
 
 ### An edge must not overstate which thing gated it
@@ -245,7 +252,7 @@ boxes in a container with the approval edge leaving `rv.code`, which read as
 code review alone gating the merge.
 
 When an edge represents a joint condition, source it from whatever represents
-the whole condition — the merged cell, or the container if you need one.
+the whole condition: the merged cell, or the container if you need one.
 
 ## Verifying
 
@@ -263,10 +270,10 @@ google-chrome --headless --disable-gpu --screenshot=/tmp/preview.png \
 ```
 
 Swap the background to `#0d1117` and the `-light` suffix to `-dark` to check
-dark mode. Both must be checked — they are separate files and a theme edit can
-break one while leaving the other correct.
+dark mode. Check both. They are separate files, and a theme edit can break one
+while leaving the other correct.
 
-Note that `inkscape` and `rsvg-convert` will *not* show you what GitHub shows;
+`inkscape` and `rsvg-convert` will *not* show you what GitHub shows;
 they warn `unknown type: svg:foreignObject` and skip content. Use a browser.
 
 ## Repo conventions that apply here
@@ -278,4 +285,4 @@ they warn `unknown type: svg:foreignObject` and skip content. Use a browser.
   **and** the committed SVGs in the same commit, or the docs ship a stale
   picture of the pipeline. `ticketmill-code-reviewer` flags this.
 - The generated SVGs are intentionally committed. Contributors and CI do not
-  need d2 installed to read the docs — only to change them.
+  need d2 installed to read the docs, only to change them.

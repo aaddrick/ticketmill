@@ -1,53 +1,45 @@
-# Select phase: everything that happens once, before the pool starts.
+# Select phase: everything that happens once, before the worker pool starts.
 #
-# GRID SNAKE. Reading order is boustrophedon: row 1 left-to-right, then the
-# flow drops straight down the LAST column and the next row reads back
-# right-to-left.
+# THE ONE NON-GRID DIAGRAM. Every other diagram here is a grid snake; this one
+# runs on the layout engine (dagre, from the theme) because it is a branch, not
+# a chain, and the grid model handles a fan-out badly:
 #
-# Why a grid and not a layout engine: neither bundled engine can wrap a long
-# chain into rows. d2 does not expose ELK's `wrapping.strategy`, and a
-# `direction` set on a container is ignored by both dagre and ELK. Grid
-# placement is the only way to fold a chain, and it fills row-major over the
-# declaration order below.
+#   - Only one branch target can share a column with the probe, so the other
+#     two edges come out as diagonals however the cells are arranged.
+#   - Wrapping the three outcomes in a container to dodge that makes the
+#     container a single grid cell, and a grid row or column takes the size of
+#     its largest member. Side by side, the container stretched the Preflight
+#     probe into a wide empty band; stacked as a nested grid, it stretched the
+#     Claim issues box into a tall one instead. The distortion moves, it does
+#     not go away.
 #
-# THE DIAGONAL RULE: grid connections are center-to-center straight segments
-# with no path-finding. An edge is orthogonal only if its two cells share a row
-# or a column, and only if they are neighbours -- an edge spanning two cells in
-# a row draws straight THROUGH the cell between them. Everything else is a
-# diagonal. Place nodes so every edge joins neighbours.
-#
-# Grid columns share a width, so one wide cell widens its whole column.
-#
-# Spacer cells (`sp*`) are invisible padding that push the wrap into the right
-# column. They are load-bearing -- deleting one reflows the entire grid.
+# Dagre draws the fan as an actual decision tree and sizes every box to its own
+# content. Keep the labels short anyway: this renders at 1134px against a
+# ~1012px docs column, and each extra rank costs ~70px of fixed spacing.
 
-grid-rows: 2
-grid-columns: 3
-horizontal-gap: 100
-vertical-gap: 70
+direction: right
 
-# row 1, left to right
 prof: "Load profile\n+ resolve roles" { class: stage }
-prep: "Create batch branch\n+ resolve issue list" { class: stage }
-probe: "Preflight probe\nreads GitHub state per issue" { class: gate }
-# row 2, right to left
-sp1: "" { style.opacity: 0 }
-claim: "Claim issues\nlabel + comment\nadvisory only" { class: stage }
-# A container as a grid cell: its children lay out side by side, which is what
-# a three-way branch needs -- a fan-out cannot be drawn orthogonally as three
-# sibling cells, since only one of them can share a column with the probe.
-#
-# Keep these labels to one short word. A grid column takes the width of its
-# widest cell, so every character here also stretches the Preflight probe box
-# sitting above it. The three outcomes are spelled out in ARCHITECTURE.md.
-routes: "Resume point" {
-  class: phase
-  skip: "skip" { class: terminal }
-  review: "review" { class: optional }
-  impl: "implement" { class: stage }
+prep: "Create batch branch\n+ issue list" { class: stage }
+
+probe: "Preflight\nprobe" {
+  class: gate
+  shape: diamond
 }
+
+skip: "skip\nalready merged" { class: terminal }
+review: "review\nresume at\nreview loop" { class: optional }
+impl: "implement\nfresh start" { class: stage }
+
+claim: "Claim issues\nadvisory only" { class: stage }
 
 prof -> prep: { class: flow }
 prep -> probe: { class: flow }
-probe -> routes: { class: flow }
-routes -> claim: "review + implement\nonly" { class: flow }
+
+probe -> skip: { class: flow }
+probe -> review: { class: flow }
+probe -> impl: { class: flow }
+
+# skip never claims: the work is already merged.
+review -> claim: { class: flow }
+impl -> claim: { class: flow }
