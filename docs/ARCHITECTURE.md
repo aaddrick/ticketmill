@@ -38,7 +38,17 @@ Runs once, before any worker starts.
 
 The preflight probe decides where each issue re-enters the pipeline, which is
 what makes a healing or resumed run cheap: an issue whose PR already merged
-into this batch branch costs one probe instead of a full pass.
+into this batch branch costs one probe instead of a full pass. The three
+resume points are:
+
+- **skip** — a related PR already merged into this batch branch. The issue is
+  done; it still counts toward the batch PR's `Closes` lines.
+- **review** — a PR is open. The issue resumes at the review loop rather than
+  re-implementing work that already exists.
+- **implement** — nothing exists yet; the issue runs the full pipeline.
+
+Only `review` and `implement` claim the issue. Claims are advisory: a label
+plus a comment, not a lock.
 
 ### Plan
 

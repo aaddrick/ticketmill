@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.37 (2026-07-26)
+
+Documentation only. Layout pass over the diagrams added in 0.1.36.
+
+Three problems with the first cut, all of them a consequence of d2 emitting a
+root `<svg>` with a `viewBox` and no width or height — the image scales to
+whatever container holds it, so natural size *is* display size:
+
+- The overview was 389x1495. Scaled up to GitHub's ~1012px column it rendered
+  roughly 1012x3900 — a wall of enormous boxes.
+- The phase diagrams were single rows up to 2310px wide, scaled *down* far
+  enough that 14px text landed at ~6px.
+- `tl -> tl: "fix"` and friends were bare self-loops that never said where the
+  run picks back up.
+
+All six diagrams are now wrapped grid snakes: row 1 left to right, down the
+last column, row 2 back right to left. Every edge is orthogonal. Natural sizes
+went from 389-2310 wide to 734-1213 wide and under 550 tall, so each renders
+near 1:1 in the docs column.
+
+- `docs/diagrams/*.d2`: rewritten as `grid-rows`/`grid-columns` layouts. Grid
+  is the only wrap mechanism available — d2 does not expose ELK's
+  `wrapping.strategy` (its ELK config is a fixed typed struct) and a
+  `direction` set on a container is ignored by both bundled engines.
+- Loops now name their work. `phase-build.d2` gained an explicit **Fix failing
+  tests** stage and `phase-ship.d2` an explicit **Fix findings** stage, each
+  joined to its gate by a bidirectional connector rather than a self-loop.
+  Two-cycles use one `<->` connector because grid draws both directions of a
+  cycle on the same line, which stacks the labels.
+- `phase-ship.d2`: the spec/code review container collapsed into a single
+  cell. A grid column takes the width of its widest member, so the container
+  was stretching Fix findings and Squash-merge into oversized boxes.
+- `phase-select.d2`: outcome labels cut to one word for the same reason; the
+  three resume points are now spelled out in `docs/ARCHITECTURE.md` prose
+  instead.
+- `docs/diagrams/{CLAUDE,AGENTS}.md`: layout guidance rewritten for the grid
+  model — the diagonal rule, boustrophedon ordering, load-bearing spacer cells,
+  shared column widths, and the two-sided size budget.
+
 ## 0.1.36 (2026-07-26)
 
 Documentation only. No engine, skill, or profile behavior changes.

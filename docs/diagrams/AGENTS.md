@@ -15,7 +15,7 @@ locally and was unreadable, invisible, or mirrored once it landed in
 | File | Role |
 | --- | --- |
 | `theme-light.d2`, `theme-dark.d2` | Palette + class definitions. No nodes, no edges. |
-| `pipeline-overview.d2` | The hero diagram: five phases end to end. |
+| `pipeline-overview.d2` | The hero diagram: the whole run, end to end. |
 | `phase-{select,plan,build,ship,report}.d2` | One diagram per phase. |
 | `render.sh` | Regenerates every SVG. The only supported way to produce them. |
 | `*-light.svg`, `*-dark.svg` | **Generated.** Never hand-edit. |
@@ -126,77 +126,126 @@ opaque white background rect, which renders as a white slab behind the dark
 diagram on GitHub's dark theme, and makes dark container titles unreadable.
 Do not remove it.
 
-### Layout engine is dagre, deliberately
+### Every diagram is a grid snake, not an engine layout
 
-Set once, in the theme files. ELK was tried and rejected: given two
-structurally identical stage/gate pairs (the approach gate and the plan gate in
-`phase-plan.d2`), its cycle-breaker resolved them in opposite directions, so one
-pair read left-to-right and the other read right-to-left in the same diagram.
-Reordering the edge declarations moved the problem instead of fixing it. Dagre
-lays both out consistently and draws the back-edges as clean symmetric curves.
+All six diagrams set `grid-rows` / `grid-columns`. A grid diagram bypasses the
+layout engine entirely — the `layout-engine: dagre` in the theme files is a
+leftover default that grid overrides, and it only matters if you ever add a
+non-grid diagram.
 
-Dagre exposes only `--dagre-nodesep` and `--dagre-edgesep`. There is no
-rank-separation knob, so you cannot tighten a diagram horizontally by
-configuration — see the width budget below.
+Reading order is **boustrophedon**: row 1 left-to-right, the flow drops straight
+down the last column, row 2 reads back right-to-left. That is what keeps the
+wrap edge orthogonal — a naive left-to-right wrap sends a diagonal all the way
+back across the image.
 
-### Nested container `direction` does not work
+Cells fill **row-major over declaration order**, and declaration order is the
+only thing that controls placement. Declare `grid-rows` *before* `grid-columns`;
+reversed, d2 packs the cells column-major instead.
 
-In d2 v0.7.1 a `direction` set on a container is ignored by **both** dagre and
-ELK; only the root direction applies. Verified with a minimal three-node case.
+### THE DIAGONAL RULE
 
-This rules out the wrapped "snake" layout (invisible row containers to fold a
-long chain into two rows). Do not spend time on it. If you need to reduce
-width, reduce rank count.
+Grid connections are center-to-center straight segments with **no path-finding**
+([d2 docs](https://d2lang.com/tour/grid-diagrams/)). An edge is orthogonal only
+when its two cells are *neighbours* sharing a row or a column:
 
-### Avoid 3-cycles inside a container
+- same row, adjacent columns → horizontal
+- same column, adjacent rows → vertical
+- anything else → a diagonal
+- an edge spanning two cells in a row draws straight **through** the cell
+  between them (fine if that cell is an invisible spacer, ugly if it is a box)
 
-`phase-build.d2` originally drew `implement -> task review -> quality -> implement`.
-That third edge closes a cycle in which no node is an unambiguous entry point,
-and dagre responded by laying the entire group out right-to-left.
+So place nodes to suit the edges, not the reading order, and check every new
+edge against this rule. There is no engine to rescue a bad placement.
 
-The fix was to drop the closing edge and state the repetition in the container
-label instead: `"PER TASK — repeats for every planned task"`. A two-node cycle
-(`task review -> implement`, the capped findings loop) is fine and renders as a
-tidy back-edge.
+Two consequences worth knowing before you fight them:
 
-### Width budget: rank count is the only real lever
+- **A fan-out cannot be drawn orthogonally as sibling cells.** Only one target
+  can share a column with its source. `phase-select.d2` solves its three-way
+  branch by putting the outcomes in a *container* used as one grid cell;
+  containers lay their children out side by side.
+- **Neither engine can wrap a chain for you.** d2 does not expose ELK's
+  [`wrapping.strategy`](https://eclipse.dev/elk/reference/options/org-eclipse-elk-layered-wrapping-strategy.html)
+  — its ELK config is a fixed typed struct — and a `direction` set on a
+  container is ignored by both dagre and ELK. Grid is the only wrap mechanism.
+  Do not spend time re-testing these.
 
-GitHub's markdown column is roughly **1012px**. d2's SVGs are responsive, so a
-wider diagram is scaled down and its text shrinks with it.
+### Two-cycles get one bidirectional connector
 
-Each sequential stage adds ~70px of fixed inter-rank spacing *on top of* its own
-box width. An eight-stage row renders ~2300px wide, scales to 0.44, and turns
-14px text into ~6px. Unreadable.
+Grid draws both directions of a 2-cycle on the same center-to-center line, so
+writing `a -> b` and `b -> a` stacks two labels on top of each other. Use a
+single `a <-> b` with a combined label instead.
 
-Raising the font size does not help: box widths grow with the text, so the ratio
-barely moves. The levers that actually work, in order:
+Keep those labels short and multi-line. The label is centered on the connector,
+so a label wider than the gap hides the very edge it describes. Widen
+`horizontal-gap` or shorten the text.
 
-1. **Merge adjacent bookkeeping stages.** "Load profile" + "Resolve roles"
-   became one node. Fewer ranks, and it reads better.
-2. **Shorten label lines.** Box width tracks the *longest line*, so three short
-   lines beat two long ones.
-3. **Drop redundant terminal nodes** where the next diagram already shows them.
+### Loops name the work, not just the arrow
 
-Keep phase diagrams at **six or fewer ranks** and **under ~1750px** natural
-width. `phase-ship.d2` at ~1725px is the current widest — treat that as the
-ceiling, not a target. Check after every edit:
+A self-loop like `tl -> tl: "fix"` says nothing about where the run picks back
+up. Where the rework is a genuinely distinct stage, give it a cell:
+`phase-build.d2` has an explicit **Fix failing tests** node and `phase-ship.d2`
+an explicit **Fix findings** node, each joined to its gate by a `<->`
+connector.
+
+Where the rework is just re-running the stage before it, a bidirectional
+connector is enough — that is the contrarian gates in `phase-plan.d2`. The
+per-task repetition in `phase-build.d2` rides in the quality-loop label (`↺ next
+task`) because drawing it would span two cells and cut through the task-review
+box.
+
+### Spacer cells are load-bearing
+
+`sp1: "" { style.opacity: 0 }` cells pad a row so the wrap lands in the right
+column. Deleting one reflows the entire grid. Renumber rather than remove.
+
+### Column width is shared
+
+A grid column takes the width of its widest cell, so one verbose box stretches
+everything above and below it. This bit twice:
+
+- `phase-select.d2`'s outcome container stretched the Preflight probe into a
+  wide empty band. Fixed by cutting the outcome labels to one word each and
+  giving the probe a second line of real text.
+- `phase-ship.d2` originally wrapped spec and code review in a container, which
+  stretched Fix findings and Squash-merge into oversized boxes. Fixed by
+  collapsing the two symmetric peers into a single cell.
+
+Reach for a container only when you actually need a fan-out. Otherwise say it
+in text.
+
+### Size budget: the SVG is responsive, so natural width is display width
+
+d2's root `<svg>` carries a `viewBox` and **no** width or height, so it scales
+to whatever container holds it. GitHub's markdown column is roughly **1012px**.
+That cuts both ways:
+
+- Too wide and it scales down, shrinking the text with it. The pre-grid
+  `phase-select` was 2310px, scaled to 0.44, and rendered 14px text at ~6px.
+- Too narrow and it scales **up**. The pre-grid overview was 389×1495 and blew
+  up to roughly 1012×3900 — a wall of enormous boxes.
+
+Aim for a natural width close to 1012px so the diagram renders near 1:1, and
+keep the height under about 550px. Current range is 734–1213 × 305–489. Check
+after every edit:
 
 ```bash
 for f in *-light.svg; do
-  printf "%-30s " "$f"; grep -o 'width="[0-9]*" height="[0-9]*"' "$f" | head -1
+  printf "%-30s " "$f"; grep -o 'viewBox="[^"]*"' "$f" | head -1
 done
 ```
 
-The overview is the exception: it is vertical (`direction: down`) and narrow
-(~389px), so GitHub scales it *up* and it renders large and crisp. Do not
-convert it to `direction: right` — that measured 3511px wide.
+Raising the font size does not buy legibility — box widths grow with the text,
+so the ratio barely moves.
 
-### Edge semantics: container vs child
+### An edge must not overstate which thing gated it
 
-`rv -> bw2` in `phase-ship.d2` leaves the *container*, not one reviewer, because
-the gate is spec **and** code review both approving in the same iteration.
-Drawing it from `rv.code` implied code review alone gated the merge. When an
-edge represents a joint condition, source it from the container.
+Spec and code review in `phase-ship.d2` are one cell because the gate is both
+of them approving in the same iteration. An earlier version drew them as two
+boxes in a container with the approval edge leaving `rv.code`, which read as
+code review alone gating the merge.
+
+When an edge represents a joint condition, source it from whatever represents
+the whole condition — the merged cell, or the container if you need one.
 
 ## Verifying
 

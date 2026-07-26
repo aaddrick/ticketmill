@@ -1,39 +1,53 @@
-# Select phase: everything that happens once, before the worker pool starts.
+# Select phase: everything that happens once, before the pool starts.
 #
-# Rank count is the thing to watch when editing. Every sequential stage adds a
-# fixed ~70px of inter-rank spacing on top of its own width, so an eight-stage
-# row renders ~2300px wide and GitHub scales it down until the text is
-# unreadable. Merge adjacent bookkeeping stages rather than adding ranks, and
-# keep label lines short — box width tracks the longest line.
+# GRID SNAKE. Reading order is boustrophedon: row 1 left-to-right, then the
+# flow drops straight down the LAST column and the next row reads back
+# right-to-left.
+#
+# Why a grid and not a layout engine: neither bundled engine can wrap a long
+# chain into rows. d2 does not expose ELK's `wrapping.strategy`, and a
+# `direction` set on a container is ignored by both dagre and ELK. Grid
+# placement is the only way to fold a chain, and it fills row-major over the
+# declaration order below.
+#
+# THE DIAGONAL RULE: grid connections are center-to-center straight segments
+# with no path-finding. An edge is orthogonal only if its two cells share a row
+# or a column, and only if they are neighbours -- an edge spanning two cells in
+# a row draws straight THROUGH the cell between them. Everything else is a
+# diagonal. Place nodes so every edge joins neighbours.
+#
+# Grid columns share a width, so one wide cell widens its whole column.
+#
+# Spacer cells (`sp*`) are invisible padding that push the wrap into the right
+# column. They are load-bearing -- deleting one reflows the entire grid.
 
-direction: right
+grid-rows: 2
+grid-columns: 3
+horizontal-gap: 100
+vertical-gap: 70
 
+# row 1, left to right
 prof: "Load profile\n+ resolve roles" { class: stage }
-branch: "Create batch\nbranch from BASE" { class: stage }
-list: "Resolve\nissue list" { class: stage }
-
-probe: "Preflight\nprobe" {
-  class: gate
-  shape: diamond
-}
-
+prep: "Create batch branch\n+ resolve issue list" { class: stage }
+probe: "Preflight probe\nreads GitHub state per issue" { class: gate }
+# row 2, right to left
+sp1: "" { style.opacity: 0 }
+claim: "Claim issues\nlabel + comment\nadvisory only" { class: stage }
+# A container as a grid cell: its children lay out side by side, which is what
+# a three-way branch needs -- a fan-out cannot be drawn orthogonally as three
+# sibling cells, since only one of them can share a column with the probe.
+#
+# Keep these labels to one short word. A grid column takes the width of its
+# widest cell, so every character here also stretches the Preflight probe box
+# sitting above it. The three outcomes are spelled out in ARCHITECTURE.md.
 routes: "Resume point" {
   class: phase
-
-  skip: "skip\nPR already\nmerged" { class: terminal }
-  review: "review\nresume at\nreview loop" { class: optional }
-  impl: "implement\nfresh start" { class: stage }
+  skip: "skip" { class: terminal }
+  review: "review" { class: optional }
+  impl: "implement" { class: stage }
 }
 
-claim: "Claim issues\nlabel + comment\nadvisory only" { class: stage }
-
-prof -> branch: { class: flow }
-branch -> list: { class: flow }
-list -> probe: { class: flow }
-
-probe -> routes.skip: { class: flow }
-probe -> routes.review: { class: flow }
-probe -> routes.impl: { class: flow }
-
-routes.review -> claim: { class: flow }
-routes.impl -> claim: { class: flow }
+prof -> prep: { class: flow }
+prep -> probe: { class: flow }
+probe -> routes: { class: flow }
+routes -> claim: "review + implement\nonly" { class: flow }

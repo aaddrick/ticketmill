@@ -1,34 +1,53 @@
-# Ship phase, per issue. The per-issue PR merges into the batch branch,
-# never into BASE.
+# Ship phase, per issue. The PR merges into the batch branch, never BASE.
+#
+# GRID SNAKE. Reading order is boustrophedon: row 1 left-to-right, then the
+# flow drops straight down the LAST column and the next row reads back
+# right-to-left.
+#
+# Why a grid and not a layout engine: neither bundled engine can wrap a long
+# chain into rows. d2 does not expose ELK's `wrapping.strategy`, and a
+# `direction` set on a container is ignored by both dagre and ELK. Grid
+# placement is the only way to fold a chain, and it fills row-major over the
+# declaration order below.
+#
+# THE DIAGONAL RULE: grid connections are center-to-center straight segments
+# with no path-finding. An edge is orthogonal only if its two cells share a row
+# or a column, and only if they are neighbours -- an edge spanning two cells in
+# a row draws straight THROUGH the cell between them. Everything else is a
+# diagonal. Place nodes so every edge joins neighbours.
+#
+# Grid columns share a width, so one wide cell widens its whole column.
+#
+# Spacer cells (`sp*`) are invisible padding that push the wrap into the right
+# column. They are load-bearing -- deleting one reflows the entire grid.
 
-direction: right
+grid-rows: 3
+grid-columns: 4
+horizontal-gap: 110
+vertical-gap: 70
 
+# row 1
 db: "Docblocks\ngated" { class: optional }
 pr: "PR into\nbatch branch" { class: stage }
-
-rv: "Review loop" {
-  class: phase
-
-  spec: "Spec review" { class: gate }
-  code: "Code review" { class: gate }
-}
-
-fix: "Fix findings\ncapped" { class: stage }
+# Spec and code review are one cell, not a container of two. As a container it
+# widened this grid column and stretched every other cell in it. They are
+# symmetric peers running in the same iteration, so the text carries it.
+rv: "Spec + code review\nin parallel\nboth must approve" { class: gate }
 bw2: "Browser\nre-check" { class: optional }
+# row 2
+sp1: "" { style.opacity: 0 }
+sp2: "" { style.opacity: 0 }
+fix: "Fix findings\nre-review the PR\ncapped" { class: stage }
 tdoc: "Tech docs\ngated" { class: optional }
-mar: "Merge\nauto-resolve\nCONFLICTING only" { class: gate }
+# row 3
+sp3: "" { style.opacity: 0 }
+sp4: "" { style.opacity: 0 }
 mg: "Squash-merge\n+ follow-ups" { class: terminal }
+mar: "Merge auto-resolve\nCONFLICTING only\nrebase + forced tests" { class: gate }
 
 db -> pr: { class: flow }
-pr -> rv.spec: "in parallel" { class: flow }
-pr -> rv.code: { class: flow }
-
-rv.spec -> fix: { class: loop }
-rv.code -> fix: { class: loop }
-fix -> pr: "re-review" { class: loop }
-
-# Edge leaves the container, not one reviewer: the gate is both approving in
-# the same iteration.
+pr -> rv: "spec + code\nin parallel" { class: flow }
+rv <-> fix: "⇄ findings" { class: loop }
 rv -> bw2: "both\napprove" { class: flow }
 bw2 -> tdoc: { class: flow }
 tdoc -> mar: { class: flow }

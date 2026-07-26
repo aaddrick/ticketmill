@@ -1,29 +1,50 @@
-# Build phase, per issue. The test loop halts the issue on error rather than
-# skipping verification.
+# Build phase, per issue. Test loop halts the issue on error.
+#
+# GRID SNAKE. Reading order is boustrophedon: row 1 left-to-right, then the
+# flow drops straight down the LAST column and the next row reads back
+# right-to-left.
+#
+# Why a grid and not a layout engine: neither bundled engine can wrap a long
+# chain into rows. d2 does not expose ELK's `wrapping.strategy`, and a
+# `direction` set on a container is ignored by both dagre and ELK. Grid
+# placement is the only way to fold a chain, and it fills row-major over the
+# declaration order below.
+#
+# THE DIAGONAL RULE: grid connections are center-to-center straight segments
+# with no path-finding. An edge is orthogonal only if its two cells share a row
+# or a column, and only if they are neighbours -- an edge spanning two cells in
+# a row draws straight THROUGH the cell between them. Everything else is a
+# diagonal. Place nodes so every edge joins neighbours.
+#
+# Grid columns share a width, so one wide cell widens its whole column.
+#
+# Spacer cells (`sp*`) are invisible padding that push the wrap into the right
+# column. They are load-bearing -- deleting one reflows the entire grid.
 
-direction: right
+grid-rows: 2
+grid-columns: 5
+horizontal-gap: 120
+vertical-gap: 70
 
-# The container repeats once per planned task. That repetition is stated in
-# the container label rather than drawn as a quality -> implement edge: the
-# third edge closes a 3-cycle, and the layout engine then orders the whole
-# group right-to-left because no node is an unambiguous entry point.
-tasks: "PER TASK — repeats for every planned task" {
-  class: phase
-
-  im: "Implement\ntask" { class: stage }
-  tr: "Task review" { class: gate }
-  ql: "Quality loop\nsimplify pass" { class: stage }
-
-  im -> tr: { class: flow }
-  tr -> im: "findings\ncapped" { class: loop }
-  tr -> ql: "pass" { class: flow }
-}
-
-tl: "Test loop\nhalts on error" { class: gate }
-bw: "Browser verify\nopt-in, locked" { class: optional }
+# row 1, left to right. The first three cells repeat once per planned task.
+# That repetition rides in the quality-loop label rather than a quality ->
+# implement edge, which would span two cells and draw a line straight through
+# the task-review box.
+im: "Implement\ntask" { class: stage }
+tr: "Task review" { class: gate }
+ql: "Quality loop\nsimplify pass\n↺ next task" { class: stage }
+tl: "Test loop\nrun suite" { class: gate }
+tf: "Fix failing\ntests" { class: stage }
+# row 2
+sp1: "" { style.opacity: 0 }
+sp2: "" { style.opacity: 0 }
 out: "To Ship" { class: terminal }
+bw: "Browser verify\nopt-in, locked" { class: optional }
+sp3: "" { style.opacity: 0 }
 
-tasks.ql -> tl: "all tasks\ndone" { class: flow }
-tl -> tl: "fix" { class: loop }
-tl -> bw: { class: flow }
+im <-> tr: "⇄ findings\ncapped" { class: loop }
+tr -> ql: "pass" { class: flow }
+ql -> tl: "all tasks\ndone" { class: flow }
+tl <-> tf: "⇄ on failure" { class: loop }
+tl -> bw: "green" { class: flow }
 bw -> out: { class: flow }
