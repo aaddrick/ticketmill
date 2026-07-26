@@ -108,15 +108,10 @@ test('buildRunRecord scales cleanly past the old 30000-char slice with no trunca
 // actually demonstrates the full array/timeline survived, not just its shape.
 test('buildRunRecord retains a real pr, populated follow_ups, and a non-empty timeline for every by_issue entry at 18-issue scale (#85)', function () {
   const context = harness.boot()
-  const results = fixtureResults(18).map(function (r) {
-    return Object.assign({}, r, {
-      follow_ups: ['file a follow-up for #' + r.issue],
-      timeline: [
-        'approach: sound',
-        'plan: sound',
-        'merged PR #' + r.pr,
-      ],
-    })
+  const results = fixtureResults(18)
+  results.forEach(function (r) {
+    r.follow_ups = ['file a follow-up for #' + r.issue]
+    r.timeline = ['approach: sound', 'plan: sound', 'merged PR #' + r.pr]
   })
   const record = makeRecord(context, results)
 
