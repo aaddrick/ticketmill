@@ -232,14 +232,19 @@ That surfaces as an ordinary git conflict at the human merge gate. Manual
 version bumps carried the same exposure already; this stage doesn't add a
 new failure mode.
 
-**Adopting this repo's own profile is a follow-up, not part of this
-change.** `.claude/ticketmill.json` is engine-owned and out of this issue's
-scope, so `profile.release` here stays unset for now. Two agent charters
-still describe per-issue release discipline (`.claude/agents/
-ticketmill-implementer.md` and `ticketmill-code-reviewer.md`, both
-engine-owned) and will need realignment once this repo's own profile turns
-the stage on: an implementer should stop bumping per-issue, and the code
-reviewer should stop flagging a per-issue PR for a missing bump.
+**This repo's own profile now opts in.** Issue #83 named
+`.claude/ticketmill.json` as explicitly in scope, and the change landed the
+`release` object: `version_files: [".claude-plugin/plugin.json"]`,
+`changelog: "CHANGELOG.md"`, `bump: null`. `profile.release` is read once
+at engine startup, so the batch that adds the field still runs on the old,
+unset profile. The stage takes effect starting with the next self-mill
+run, not the run that turned it on. The two agent charters
+(`.claude/agents/ticketmill-implementer.md` and
+`ticketmill-code-reviewer.md`, both engine-owned) have been realigned to
+match: the implementer no longer bumps the version or adds a CHANGELOG
+entry per-issue, and the code reviewer no longer flags a per-issue PR for
+a missing bump — both describe that release discipline as batch-level,
+owned by the gated Report-phase `release` stage.
 
 ### Merge auto-resolve: one mechanical recovery attempt before needs_human
 
@@ -457,10 +462,11 @@ marker, unit-tested directly in `tests/outcomes.test.js` without ever
 shelling out.
 
 **`gradeFromObservation`** applies a fixed precedence: `reverted` >
-`reopened` > `hotfix` > `closed_unmerged` > `abandoned` > `clean` >
-`pending`. The aging is deliberately asymmetric. A bad outcome is real
-the moment it's observed and grades immediately, at any age. A clean
-grade waits: `merged, no negative signal` only becomes `clean` once the
+`reopened` > `hotfix` > `later_batch_fix` > `closed_unmerged` >
+`abandoned` > `clean` > `pending`. The aging is deliberately asymmetric.
+A bad outcome is real the moment it's observed and grades immediately,
+at any age. A clean grade waits: `merged, no negative signal` only
+becomes `clean` once the
 PR has stood for `min_age_days` (default 7, profile-overridable via
 `outcome_grading.min_age_days`, mirroring the
 `profile.contrarian_max_iterations` guard). Before that it grades
@@ -469,14 +475,29 @@ PR has stood for `min_age_days` (default 7, profile-overridable via
 escape hatch for targets that will never see a merge and so can never
 earn `clean` any other way.
 
+**`abandoned` needed its own wiring (issue #103).** The precedence list
+above already named `abandoned`, but nothing ever populated it: #92/PR#102
+left the field unset on every observation, so that branch was dead code.
+The fix threads `issue_state` off the same `gh issue view --json
+state,timelineItems` read step 2c already runs for `reopen_found` and
+`hotfix_ref`. No extra `gh` call needed. `deriveAbandoned(issue_state,
+live_merge_state)` then decides the field: true only when the issue is
+closed AND the batch PR's live state is `open`, `closed`, or `none`.
+`merged` is excluded on purpose, since a merged PR that later goes bad
+already has `closed_unmerged` and `clean` to describe it. `unknown` is
+excluded too, so a transient `gh pr view` read failure can never produce
+a terminal grade off a signal that never resolved. A failed `gh issue
+view` read reports `issue_state: "unknown"`, same fallback contract as
+the other fields in that step.
+
 **`diffOutcomeGrades`** is the only thing allowed to decide what gets
 appended. It compares this pass's freshly graded lines against
 `prior_ledger_lines` (both sides read last-line-wins, since the ledger is
 append-only) and keeps only lines that are new or whose grade changed,
 skipping any key whose prior grade is already terminal
-(`reverted`/`reopened`/`hotfix`/`closed_unmerged`/`abandoned` —
-`OUTCOME_TERMINAL_GRADES`) so settled history never gets bloated or
-second-guessed by a possibly-flaky re-read. `summarizeOutcomeCoverage`
+(`reverted`/`reopened`/`hotfix`/`later_batch_fix`/`closed_unmerged`/
+`abandoned` — `OUTCOME_TERMINAL_GRADES`) so settled history never gets
+bloated or second-guessed by a possibly-flaky re-read. `summarizeOutcomeCoverage`
 rolls the pass into `graded_count`/`negative_count`/`pending_count`/
 `sample_cap_hit`, so a later tier can read one small object instead of
 re-walking the ledger.
@@ -493,6 +514,57 @@ artifact, and target selection is bounded by
 pass stays cheap and history catches up over many runs instead of trying
 to grade everything at once.
 
+**`later_batch_fix` reopens a signal a plan review rejected once already
+(issue #104).** An early design for #92 tried to catch "this batch
+caused a later fix" by intersecting `changed_files` across two diffs,
+the batch PR's and a later PR's. Plan review killed it: in a
+monolith-shaped repo where nearly every issue touches
+`workflows/ticketmill.js`, file overlap is guaranteed and proves
+nothing. `later_batch_fix` asks a stronger question instead. Did the
+later fix PR's own `git blame` on the pre-image lines it just replaced
+name THIS batch PR's own squash-merge commit as the SHA that introduced
+them. That's a line-level, blame-forward resolution done entirely in
+the later PR's own coordinate space, never a synthesized intersection
+across two unrelated diffs.
+
+**`computeLaterBatchFix(observation)`** fires iff `batch_pr_merge_sha`
+is a non-empty string and appears in the union of every
+`churned_regions[].blamed_shas` entry. `churned_regions` is an array of
+`{file, blamed_shas}`, one entry per hunk in the later fix PR's diff,
+each already resolved live by the outcome-grade agent stage: a
+read-only `git blame <commit>^ -L <range> -- <file>` on this repo's own
+non-shallow local clone, never a `git fetch`. Anything malformed or
+absent (no SHA, no regions, a region missing `blamed_shas`) fails open
+to `false`, the same ethos as `ageInDays`/`deriveAbandoned`.
+
+**`isPlannedFollowup(bodyText)` keeps a pre-planned continuation out of
+the grade.** A later PR whose own body reads as a scheduled next step
+("follow-up from", "follow up from", "depends on", "deferred from" —
+case-insensitive) isn't repairing a defect. It's doing work that was
+always going to happen. Validated against real history: #103's body
+("Follow-up from #92...") is excluded, while reactive language like
+"regression introduced by" stays eligible. `gradeFromObservation` only
+assigns `later_batch_fix` when `computeLaterBatchFix` fires AND
+`isPlannedFollowup` doesn't.
+
+**It sits below `hotfix`, above the terminal escapes.** A same-issue
+cross-reference (`hotfix`) is a more direct claim than a blame-forward
+resolution against a different PR, so it still wins when both are
+true. A real later fix landing is strictly more informative than
+`closed_unmerged`/`abandoned`, so `later_batch_fix` outranks both. It
+joined `OUTCOME_TERMINAL_GRADES` (a blame-forward resolution never
+un-happens) and `OUTCOME_NEGATIVE_GRADES` (it's the same "this shipped
+a defect" claim as revert/reopen/hotfix, just resolved a different
+way).
+
+**Revisit risk doesn't cover it yet, on purpose.** `later_batch_fix`'s
+evidence, `churned_regions`, lives in the later PR's own coordinate
+space, not a diff the revisit-risk pass can walk to a file list.
+Translating it back would reintroduce the coincidental-overlap risk
+the mechanism exists to avoid. `attachRevisitFiles` returns `files: []`
+for it, always: an explicit fail-open, not a silent gap. Real coverage
+is a follow-up.
+
 ### Revisit risk: flagging a preflight from recent negative outcomes
 
 Outcome grading records whether a merged issue held up. Revisit risk reads
@@ -506,9 +578,12 @@ area with more care.
 still can't shell out, so a `revisit-risk` agent stage does the live
 reads. It cats `outcomes.jsonl` for `prior_ledger_lines` (raw, unparsed
 lines, the same contract as `OUTCOMES_SCHEMA`'s field of the same name),
-then for any ledger key already graded reverted, reopened, or hotfix
-within a target-selection window, resolves that regression's `files` with
-a live `gh` read. It fires alongside `learnPromise` and
+then for any ledger key already graded with a member of
+`OUTCOME_NEGATIVE_GRADES` (reverted, reopened, hotfix, or
+`later_batch_fix` as of issue #104) within a target-selection window,
+resolves that regression's `files` with a live `gh` read.
+`later_batch_fix` always resolves to `files: []` (see above); the other
+three grades resolve a real file list. It fires alongside `learnPromise` and
 `outcomeGradePromise`, in the same `STAGE_TOKENS.preflight` bracket, and
 it is strictly read-only. `computeRevisitRisk`, above the
 `TICKETMILL-TEST-HARNESS-SPLIT` marker, is the only place that decides a
@@ -660,7 +735,7 @@ otherwise-green issue.
 | Browser lock (mkdir + owner + stale-steal) | Concurrent agents hijacked each other's browser tabs |
 | Degrade windows + circuit breakers | Distinguish one flaky stage from a systemic failure worth stopping for |
 | `isBudgetExhaustedError` noun+verb match | A bare keyword sweep on "budget"/"ceiling" matched a target repo's own domain errors, misreporting an ordinary agent death as token exhaustion and halting every remaining issue |
-| `COMMIT_SHA_ASK` guard | Twice, an agent typed a fabricated or shortened commit SHA into a posted comment instead of reading the real one, requiring a fixup edit |
+| `COMMIT_SHA_ASK` guard (Layer 1: advisory prompt) + `probeCommitShas` (Layer 2: post-hoc existence check) | Twice, an agent typed a fabricated or shortened commit SHA into a posted comment instead of reading the real one, requiring a fixup edit |
 | `VERIFY_SKIPS` entry on a contrarian cap-out | An approach or plan gate's cap-out reached only `ctx.unresolved`, never the batch PR's Verification Gaps section, so a caveat worth a human's attention could ship and merge unseen |
 | Report-phase release stage (`releaseEnabled`, `deriveReleaseVersion`) | A batch of real engine changes (PR #56) merged with the CHANGELOG and version file left stale, because the pipeline had always assumed some later stage bumped them and no stage ever did |
 
@@ -680,6 +755,38 @@ later stage had to post a fixup comment with the correct value.
 simplify, quality fix, browser fix, test fix, test quality fix, task
 implementation, task review fix, and PR review fix. Sharing one constant
 keeps the wording in sync across all of them if it changes later.
+
+#### Layer 2: post-hoc validation of the posted SHA (issue #79)
+
+`COMMIT_SHA_ASK` is advisory only — it tells an agent how to get the real
+SHA, but the `commit` field a stage returns is still unverified free text.
+Nothing stopped a stage from posting a fabricated or stale SHA anyway.
+`collectPostedCommit(ctx, stageName, r)` is called at all eight
+`COMMIT_SHA_ASK` sites and appends every non-null `commit` a stage reports
+to `ctx.postedCommits` (guarding a null stage result and a stage that
+reported no commit at all, e.g. a fix stage that made no changes).
+
+`probeCommitShas(ctx)` then validates that list once per issue, from
+`reviewAndMerge()`, immediately before `runMergeAutoResolve()`. Same
+read-only-dispatch shape as `probeChangedFiles()` immediately above it in
+`workflows/ticketmill.js`: it early-returns with **no dispatch** when
+`ctx.postedCommits` is empty (the common case — most stages never report a
+commit), otherwise it dispatches a single read-only haiku probe that runs
+`git -C <worktree> cat-file -e <sha>^{commit}` for every distinct SHA
+collected and reports back which ones did not resolve. The probe runs
+before merge-auto-resolve deliberately: a rebase there legitimately
+rewrites every commit's SHA, and validating pre-rebase — while every posted
+SHA still resolves in the worktree — means there is nothing left to
+re-validate afterward.
+
+The check is advisory-flag, never-halt, same as the engine-owned gate and
+`probeChangedFiles()`: a missing SHA pushes a `VERIFY_SKIPS` entry (so it
+surfaces in the batch PR's Verification Gaps section) and a `ctx.deferred`
+note naming the posting stage, but never blocks the issue. A dead probe
+(the agent call dies through every retry) degrades to a recorded
+`ctx.deferred` note instead — same fail-open posture as every other
+degrade-safe probe in this engine. One dispatch validates every SHA posted
+during the issue, not eight per-site round-trips.
 
 ### Model policy
 
@@ -737,14 +844,16 @@ either. Every bracketed region sits strictly before `runPool()`, the only
 concurrent region in the engine, so these deltas stay exact regardless of
 `CONCURRENCY` even when the per-issue breakdown below them doesn't.
 
-`aggregateTokens(results, spent, concurrency, byStage)` turns the per-issue
-deltas, plus that `STAGE_TOKENS` map, into a "## Token Usage" section in plain
-JS. The pipeline injects the finished markdown into the batch PR and run
-report prompts verbatim, so no subagent is ever asked to sum or double-check
-the arithmetic. `byStage` is optional and defaults to `{}`, so 3-arg callers
-still work; each nonzero bucket folds into the running sum exactly once and
-renders as its own labeled row ("preflight (orchestration)", "select-phase
-(orchestration)"), never silently absorbed into the remainder row below it.
+`aggregateTokens(results, spent, concurrency, byStage, poolSpend)` turns the
+per-issue deltas, plus that `STAGE_TOKENS` map, into a "## Token Usage"
+section in plain JS. The pipeline injects the finished markdown into the
+batch PR and run report prompts verbatim, so no subagent is ever asked to sum
+or double-check the arithmetic. `byStage` is optional and defaults to `{}`,
+so 3-arg callers still work; each nonzero bucket folds into the running sum
+exactly once and renders as its own labeled row ("preflight (orchestration)",
+"select-phase (orchestration)"), never silently absorbed into the remainder
+row below it. `poolSpend`, a 5th optional argument, re-scopes the
+`reconcile_error` signal (issue #111, below).
 
 Only the per-issue rows are affected by concurrency. At concurrency 1, an
 issue's stage deltas can't overlap, so they're an exact partition of that
@@ -752,11 +861,18 @@ issue's run: `reconciles: true` when `spent` and some tracked data both
 exist. Above concurrency 1, several issues' stages run against the same
 shared monotonic counter, and `agent()` returns schema content only, never a
 per-call usage figure. There is no way to split a shared counter's movement
-across concurrent callers, so the per-issue rows over-count and the whole
-breakdown is labeled approximate (`reconciles: false`) rather than claiming a
-precision it doesn't have. The `STAGE_TOKENS` rows stay exact even then,
-since they're sampled outside the concurrent pool; only the per-issue rows
-above them over-count.
+across concurrent callers, so a per-issue row over-counts and the breakdown
+is labeled approximate (`reconciles: false`). That downgrade only applies
+when some per-issue row is actually tracked (`anyTracked`).
+
+A resumed run can carry its whole breakdown in `STAGE_TOKENS` buckets alone,
+with every per-issue row untracked. There's no per-issue over-count to guard
+against there: those buckets are sampled outside the concurrent pool, so
+they stay exact regardless of `CONCURRENCY`. `reconciles` stays `true` for
+that stage-only shape even above concurrency 1 (issue #65). The narrative
+footnote follows the same split. It warns about approximation only when
+`anyTracked` is true, so a stage-only breakdown above concurrency 1 renders
+with no warning, having earned none.
 
 The "orchestration/unattributed" remainder row (`spent` minus the summed
 per-issue and stage deltas, floored at 0) renders whenever `budget.spent()`
@@ -776,6 +892,48 @@ Tokens only, never dollars: price varies by model and shifts over time, so no
 currency figure appears anywhere in the engine, profile, or output. The
 per-model-tier breakdown is what lets a human run that math outside the tool.
 
+### Closing the attribution gap: reconcile_error re-scoped to the pool (issue #111)
+
+`reconcile_error` had a floor problem baked into its own denominator. It
+divided the attribution gap by the full run total, `spent`, and that total
+always includes PR-review, merge, report, retrospective, and outcome-grading
+spend, none of which `stage()` ever brackets. Even a perfectly-attributed
+per-issue pool still reported a permanent, nonzero `reconcile_error`, roughly
+a quarter of spend on a typical concurrency-1 run. `computeReworkTax`'s 0.05
+trust gate could never clear that floor, so the rework-tax signal went quiet
+on nearly every real run, defeating the point of #90's own reconciliation
+check.
+
+**`POOL_SPEND` brackets the one concurrent region from outside it.** The run
+body now samples `spentTokens()` immediately before and after the
+`runPool()` call, the same before/after idiom `addStage()` already uses for
+the preflight/select brackets above. The delta stays exact regardless of
+`CONCURRENCY`, since it's sampled outside any per-issue stage's own tracking.
+
+**When `poolSpend` is finite, `reconcile_error` re-scopes to it.** The
+denominator becomes `poolSpend`, and the numerator becomes `perIssueSum`, the
+per-issue tracked totals only, never the stage buckets (those are bracketed
+outside the pool by construction and were never part of what `poolSpend`
+measures). At concurrency 1 this reconciles near-exactly, since both sides
+sum the same contiguous deltas, and it still catches a future bare-`agent()`
+regression inside the pool at any concurrency. The run-total-vs-pool gap
+itself doesn't disappear. It surfaces honestly as its own
+`orchestration_overhead` field, `max(0, spent - poolSpend)`, rendered as its
+own markdown line, instead of being folded into (or driving) the
+attribution-error signal. `pool_spend` and `orchestration_overhead` are both
+`null` when `poolSpend` is absent or non-finite, and every existing 3-/4-arg
+caller keeps the pre-#111 formula byte for byte. `run_total`, `attributed`,
+and `remainder` are unchanged either way: they still describe the full run
+against the full `sumDeltas`.
+
+The estimator's coarser 0.5 bar (`ESTIMATOR_MAX_RECONCILE_ERROR`, "Cost
+estimator" below) predates this fix and was sized to admit that ~0.26
+baseline as expected, not pathological. Runs recorded going forward carry the
+pool-scoped `reconcile_error` instead, so a clean concurrency-1 run now
+reconciles near 0. The 0.5 bar stays in place unchanged: it's headroom for
+older ledger rows recorded under the pre-#111 formula now, rather than a
+ceiling calibrated to an expected quarter of unattributed spend.
+
 ### Budget-exhaustion detection: a noun+verb match, not a keyword sweep
 
 `isBudgetExhaustedError(msg)` decides what a caught stage error means: real
@@ -789,12 +947,20 @@ nothing to do with tokens. An ordinary agent death got misreported as
 exhaustion, and the whole batch halted with every remaining issue left
 unstarted.
 
-The check now requires a budget/token/ceiling noun to co-occur with an
-exhaustion-shaped verb: exhaust, exceed, deplete, ran out, overrun/overage,
-went over, ran over, over budget, over the limit, or limit reached. Either
-alone isn't enough. The "over" family is anchored to those overrun-shaped
-phrases rather than the bare word "over", which turns up in ordinary prose
-("budget review is over") without meaning exhaustion.
+The check now requires a budget/ceiling noun — or `token` narrowed to its
+plural `tokens` or a qualified form like `token budget`/`token limit` — to
+co-occur with an exhaustion-shaped verb: exhaust, exceed, deplete, ran out,
+overrun/overage, went over, ran over, over budget, over the limit, or limit
+reached. Either alone isn't enough. The "over" family is anchored to those
+overrun-shaped phrases rather than the bare word "over", which turns up in
+ordinary prose ("budget review is over") without meaning exhaustion. Bare
+singular `token` was dropped from the noun set (issue #62): it was broad
+enough to co-occur with an exhaustion verb in unrelated auth/rate-limit
+errors (an expired auth token, an API rate limit, a CSRF token check), each
+misreported as budget exhaustion. Narrowing to the qualified/plural forms
+also closed a recall gap — the old bare-`token` pattern never matched the
+plural, so "ran out of tokens" fell through to the death-counter backstop
+instead of tripping the fast path.
 
 Anchoring to the runtime's exact exhaustion error string was rejected: that
 text isn't documented anywhere accessible, and the runtime's budget object
@@ -830,11 +996,15 @@ keeps a `by_issue_shape` row only when its parent run has
 concurrency, see "Token tracking" above), `member_count === 1` (a group's
 whole-group total would inflate a singleton's band), and a `reconcile_error`
 at or under 0.5. That bar is deliberately coarser than the 0.05 one
-`computeReworkTax` uses to trust a run's own numbers: a clean single-lane
-run still leaves roughly a quarter of its spend as orchestration overhead
-that no per-issue row claims, the same shape `aggregateTokens` already
-documents, so the strict bar would starve the estimator down to almost no
-history at all. Rows are bucketed by predicted-files band (`0`, `1`, `2-3`,
+`computeReworkTax` uses to trust a run's own numbers. Before issue #111
+re-scoped `reconcile_error` to the per-issue pool (see "Closing the
+attribution gap" above), a clean single-lane run still left roughly a
+quarter of its spend as unbracketed orchestration overhead, and the strict
+bar would have starved the estimator down to almost no history at all. The
+0.5 bar stays unchanged, now mostly headroom for older ledger rows recorded
+under the pre-#111 formula: a run recorded after the fix reconciles near 0 at
+concurrency 1 and clears either bar easily. Rows are bucketed by
+predicted-files band (`0`, `1`, `2-3`,
 `4-7`, `8-15`, `16+`), and a band only reports a median once it holds 3 or
 more samples. Below that it degrades to `{estimate: null, confidence:
 'insufficient'}` rather than print a number built from one or two data
@@ -984,6 +1154,23 @@ per issue) and reads `depends_on #N` / `follow-up to #N` references out of
 the issue body. Both fields fail open to `[]` on any doubt. A wrong guess
 would wrongly serialize two unrelated issues; an empty prediction only costs
 the batch today's ordinary racing behavior.
+
+**A deliverable-shape gate runs before that resolution, for net-new skill or
+doc issues.** Retro #94 ('add skills/mill-review/SKILL.md') is why. The
+original resolution always fell through to a broad `git grep`/`git ls-tree`
+match against `origin/TARGET`. The two ~7,300-line engine copies plus
+`.claude/ticketmill.json` mention nearly every ticketmill concept, so a
+net-new skill or doc issue's generic identifiers matched the engine cluster.
+The asset the issue was about to create resolved to nothing: a
+precision-zero prediction, serializing the issue into the wrong lane. The
+gate checks first. Does the issue read as adding a new skill or doc/markdown
+asset, and does the body avoid naming an engine/profile/schema keyword
+(`workflows/ticketmill.js`, `.claude/ticketmill.json`, `lint-engine`, or a
+term describing the engine/profile/schema itself)? If both hold,
+`predicted_files` becomes the new asset's path exactly as written, plus the
+repo's top-level README if it has one, and the broad resolution is skipped.
+Every other issue shape falls through to the identifier extraction and
+`git grep`/`git ls-tree` resolution unchanged.
 
 **`computeLanes()` is a union-find over predicted-file overlap, with two edge
 tiers.** Trusted edges, a `serialize_globs` pattern hit or a `depends_on`

@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.1.35 (2026-07-25)
+
+Fifteen milled issues, batched as maintenance and hardening across the
+engine, outcome grading, the profile, and the docs. Patch bump
+(0.1.34 -> 0.1.35). Every change is a correctness fix, a re-activated
+opt-in, or tighter test coverage. None of it adds a new stage or a
+user-facing feature.
+
+Engine correctness and hardening:
+
+- `workflows/ticketmill.js` (#62): `isBudgetExhaustedError` now matches
+  a real exhaustion signature instead of a bare `token` noun. Auth and
+  rate-limit errors that happen to carry the word "token" stop
+  false-positiving as budget exhaustion. Covered by
+  `tests/budget-exhaustion.test.js`; rationale in `docs/ARCHITECTURE.md`.
+- `workflows/ticketmill.js` (#65): `aggregateTokens` no longer labels a
+  stage-only-attributed breakdown as approximate at concurrency > 1. The
+  `reconciles` flag reads true when the split is actually exact.
+  `tests/token-usage.test.js`, with the reasoning in
+  `docs/ARCHITECTURE.md`.
+- `workflows/ticketmill.js` (#69): `bwPort` coerces `port_span` to a
+  positive integer, the same coercion `stale_seconds` and `poll_seconds`
+  already had. A string value in the browser profile can't skew the port
+  math anymore. `tests/browser-profile-keys.test.js`.
+- `workflows/ticketmill.js` (#79): a Layer 2 post-hoc check now validates
+  the commit SHAs agents post in their reports. An agent claims a SHA;
+  the engine confirms it against the real commit after the fact.
+  `tests/commit-sha-probe.test.js`, `tests/pr-review-gate.test.js`, and
+  `docs/ARCHITECTURE.md`.
+
+Outcome grading and token analytics:
+
+- `workflows/ticketmill.js` (#103): a closed issue now threads through to
+  the `abandoned` observation field in outcome grading. A
+  closed-unmerged target grades as abandoned rather than getting dropped.
+  `tests/outcomes.test.js`, `docs/ARCHITECTURE.md`.
+- `workflows/ticketmill.js` (#104): outcome grading v2 brings back the
+  `later_batch_fix` signal. It fires on an issue cross-reference or
+  region churn. Bare file overlap no longer counts, so two issues
+  touching the same file don't read as one fixing the other.
+  `tests/outcomes.test.js`, `docs/ARCHITECTURE.md`.
+- `workflows/ticketmill.js` (#111): `reconcile_error` is re-scoped to a
+  per-issue pool. That closes the attribution gap that made efficiency
+  analytics read as suppressed when the numbers were fine.
+  `tests/token-reconcile.test.js`, `docs/ARCHITECTURE.md`.
+- `workflows/ticketmill.js` (#113): the lane predictor stops
+  over-predicting the engine cluster for "add a skill / doc" issues. Doc
+  and skill work now lands in its own lane instead of the engine one.
+  `tests/lane-predict-shape-gate.test.js`, `docs/ARCHITECTURE.md`.
+
+Profile, agents, and docs:
+
+- `.claude/ticketmill.json` (#67): the LOCKSTEP-EDIT RULE note now tells
+  agents to run `node scripts/lint-engine.js --fix` instead of the manual
+  `cp workflows/ticketmill.js .claude/workflows/ticketmill.js`, matching
+  the wording already in `docs/ARCHITECTURE.md`. Text-only change; no
+  engine behavior, lockstep enforcement, or lint logic is affected.
+- `.claude/ticketmill.json` (#83, #112): the `release` stage opt-in is
+  re-activated in ticketmill's own profile. It fires on the next
+  self-mill run. This batch doesn't trigger it. `docs/ARCHITECTURE.md`.
+- `.claude/agents/ticketmill-implementer.md`,
+  `.claude/agents/ticketmill-code-reviewer.md` (#82): both charters now
+  read release discipline as batch-level rather than per-issue, so an
+  implementer doesn't try to cut a release per merged issue.
+  `docs/ARCHITECTURE.md`.
+- `README.md`, `skills/mill-init/SKILL.md` (#70): both now spell out that
+  `profile.browser.artifact_dir` is deleted with `rm -rf` on cleanup. A
+  mis-pointed base path is a footgun, so the caution is explicit in
+  `workflows/ticketmill.js` and the user-facing docs.
+
+Test coverage:
+
+- `tests/run-record.test.js` (#85): a regression test pins run-report
+  `by_issue` entries so later issues in a large batch keep their `pr`,
+  `follow_ups`, and `timeline` fields.
+- `tests/harness.js` (#115): a first-class `assertVmEqual` helper covers
+  the cross-vm-context assertion gotcha. `tests/gate-findings.test.js`
+  uses it in place of the ad-hoc comparison it had before.
+
 ## 0.1.34 (2026-07-25)
 
 Tier 4 of the observability upgrade, one milled issue (#94): the

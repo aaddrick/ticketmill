@@ -131,6 +131,10 @@ export const meta = {
 //     // All five of port_span/lock_path/stale_seconds/poll_seconds/artifact_dir are
 //     // optional and default to the values shown above; artifact_dir substitutes
 //     // {issue} if present (like serve_command's {port}), else appends -<issue>.
+//     // CAUTION: the resolved artifact_dir is deleted with `rm -rf` on cleanup
+//     // (both the browser-verify cleanup stage and the final reviewAndMerge
+//     // cleanup) - it must be a dedicated scratch path, never a project dir,
+//     // shared mount, or $HOME.
 //     "models": { "plan": { "model": "opus", "effort": "high" } }, // OPTIONAL per-stage
 //                                        // model/effort overrides, keyed by stage name.
 //                                        // Valid keys (25): probe, setup, research,
@@ -536,6 +540,17 @@ const DIFF_PROBE_SCHEMA = {
     added_files: { type: 'array', items: { type: 'string' } },
   },
 }
+// COMMIT_PROBE_SCHEMA (issue #79, Layer 2 — post-hoc validation of agent-posted
+// commit SHAs): probeCommitShas()'s own read-only existence check. The agent
+// runs `git cat-file -e <sha>^{commit}` per collected SHA and reports back
+// which ones did NOT resolve — the engine (not agent judgment) then decides
+// what counts as a fabrication incident.
+const COMMIT_PROBE_SCHEMA = {
+  type: 'object', required: ['unresolved_shas'],
+  properties: {
+    unresolved_shas: { type: 'array', items: { type: 'string' } },
+  },
+}
 const CLAIM_SCHEMA = {
   type: 'object', required: ['issue', 'claimed'],
   properties: { issue: { type: 'integer' }, claimed: { type: 'boolean' }, reason: { type: 'string' } },
@@ -767,6 +782,40 @@ const OUTCOMES_SCHEMA = {
           reopen_found: { type: 'boolean' },
           hotfix_ref: { type: ['integer', 'null'] },
           merged_at: { type: ['string', 'null'] },
+          // issue_state (issue #103): the `state` field off the SAME `gh issue
+          // view --json state,timelineItems` read step 2c already runs for
+          // reopen_found/hotfix_ref — threaded through so the post-hoc pass can
+          // derive `abandoned` (deriveAbandoned above) instead of discarding it.
+          issue_state: { enum: ['open', 'closed', 'unknown'] },
+          // later_fix_pr/batch_pr_merge_sha/churned_regions/later_fix_body (issue
+          // #104): RAW inputs to computeLaterBatchFix/isPlannedFollowup only —
+          // this agent never decides later_batch_fix itself (same PIN as every
+          // other field on this schema). later_fix_pr is the number of the first
+          // later, DISTINCT, merged PR that cross-references THIS batch PR's own
+          // timeline and survives the prompt's cheap planning-edge pre-filter
+          // (null if none). later_fix_body is that PR's raw body text verbatim
+          // (null if later_fix_pr is null) — the sole input to the post-hoc
+          // isPlannedFollowup exclusion; deliberately absent from
+          // pickOutcomeSignals' compact `signals` (prose, not a compact signal).
+          // batch_pr_merge_sha is THIS batch PR's own squash-merge commit SHA
+          // (null if unresolved/unmerged). churned_regions is an array of
+          // { file, blamed_shas } — one entry per hunk in later_fix_pr's diff,
+          // each resolved via a read-only `git blame` of the PRE-IMAGE lines it
+          // replaced, blamed_shas holding every distinct commit SHA those lines
+          // attribute to (empty array if later_fix_pr is null or unresolved).
+          later_fix_pr: { type: ['integer', 'null'] },
+          batch_pr_merge_sha: { type: ['string', 'null'] },
+          later_fix_body: { type: ['string', 'null'] },
+          churned_regions: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                file: { type: 'string' },
+                blamed_shas: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
         },
       },
     },
@@ -817,7 +866,11 @@ const REVISIT_RISK_SCHEMA = {
           // via `gh pr view <signals.hotfix_pr> --json files`; reverted via a
           // best-effort live revert-commit diff (else []); reopened is always
           // [] (no recoverable locus without a squashed diff — an
-          // approach-challenge-i2 minor left deliberately open). An empty
+          // approach-challenge-i2 minor left deliberately open). later_batch_fix
+          // (issue #104) is ALSO always [] — a deliberate, documented fail-open:
+          // its evidence (churned_regions) lives in a later PR's own coordinate
+          // space, not a diff this pass can walk to a file list; revisit-risk
+          // coverage for it is a follow-up, not silently dropped. An empty
           // array is non-flagging, never an error.
           files: { type: 'array', items: { type: 'string' } },
         },
@@ -1568,17 +1621,24 @@ function tripBudgetStop(reason) {
 // isBudgetExhaustedError: only a real budget/token-exhaustion signature is
 // fatal for the whole run (tripStop), not a per-attempt death — shared by
 // stage() and consolidationAgent() so the two call sites can't drift on what
-// counts as one. Requires a budget/token/ceiling NOUN to co-occur with an
+// counts as one. Requires a budget/ceiling/tokens NOUN to co-occur with an
 // exhaust/exceed/deplete/ran-out/overrun-shaped/limit-reached VERB; either
 // alone is not enough, so a target repo's own domain error that merely names
 // "budget" (no exhaustion verb) or merely exceeds something unrelated (no
 // budget noun) is left to the ordinary per-attempt retry + recordAgentDeath()
-// path instead of halting the whole run. The "over" family is deliberately
-// anchored to overrun-shaped phrasing (overrun/overage/went over/ran over/
-// over budget/over the limit) rather than the bare word "over", which shows
-// up in ordinary prose ("budget review is over") without meaning exhaustion.
+// path instead of halting the whole run. The noun side deliberately excludes
+// bare singular "token": that word alone is common in non-budget domain
+// errors (auth tokens, CSRF tokens, API rate-limit tokens) and, paired with
+// an exhaustion-shaped verb like "limit reached", produced false positives
+// (e.g. "authentication token expired; retry limit reached"). "token" only
+// counts when pluralized ("tokens", as in "ran out of tokens") or directly
+// qualified by "budget"/"limit" ("token budget", "token limit"). The "over"
+// family is deliberately anchored to overrun-shaped phrasing (overrun/
+// overage/went over/ran over/over budget/over the limit) rather than the
+// bare word "over", which shows up in ordinary prose ("budget review is
+// over") without meaning exhaustion.
 function isBudgetExhaustedError(msg) {
-  const hasBudgetNoun = /\b(?:budget|token|ceiling)\b/i.test(msg)
+  const hasBudgetNoun = /\b(?:budget|ceiling|tokens|token[\s-]+(?:budget|limit))\b/i.test(msg)
   const hasExhaustionVerb = /\b(?:exhaust(?:ed|ion|s)?|exceed(?:ed|s|ing)?|deplete(?:d|s)?|ran\s+out|over[\s-]?(?:run|age)\b|went\s+over|ran\s+over|over\s+budget|over\s+the\s+limit|limit[\s-]?reached)\b/i.test(msg)
   if (!hasBudgetNoun || !hasExhaustionVerb) return false
   tripStop('token budget exhausted (' + msg + ')')
@@ -1801,6 +1861,64 @@ const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotch
 const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> log -1 --format=%H — it prints the ' +
   'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
   'or recall a SHA from memory.'
+
+// ----- preflight step 5 (predicted_files lane-scheduling hint) (issue #113) -----
+// A PURE FUNCTION of (ROOT, TARGET), NOT a plain string: it is invoked at the
+// preflight call site (below the TICKETMILL-TEST-HARNESS-SPLIT marker) with the
+// runtime ROOT/TARGET values discovered by the bootstrap probe. ROOT/TARGET are
+// module-scope `let = null` and only assigned real values below the split marker
+// (~6442/6561/6572) — a load-time string here would capture null and bake
+// `git -C null ... origin/null` into every probe, regressing predicted_files to []
+// for every issue. Retro (#94, 'add skills/mill-review/SKILL.md'): the original
+// step-5 identifier->tree resolution (5b/5c below) always falls through to a
+// broad `git grep`/`git ls-tree` match against origin/TARGET, and the two
+// ~7,300-line engine copies plus .claude/ticketmill.json mention nearly every
+// ticketmill concept — so a net-new skill/doc issue's generic identifiers
+// grep-match the engine cluster while the not-yet-created asset path itself
+// resolves to nothing, yielding a precision-0 engine-cluster prediction instead
+// of the real (narrow) diff. The deliverable-shape gate below intercepts that
+// case before the broad resolution runs; every other issue shape (in particular
+// anything naming an engine/profile/schema keyword) falls through to steps a-c
+// verbatim, unchanged from the original prompt.
+const PREDICTED_FILES_ASK = (ROOT, TARGET) => [
+  '5. predicted_files (best-effort lane-scheduling hint — fail open to [] on ANY doubt, never guess a path):',
+  '   Deliverable-shape gate (check this FIRST, before extracting identifiers below): does the issue title/body',
+  '      read as adding/creating a NEW skill or a new doc/markdown asset (e.g. "add a skill", "new SKILL.md",',
+  '      "add docs for X", a new .md file described in prose)? AND does the body NOT explicitly name an',
+  '      engine/profile/schema keyword — "workflows/ticketmill.js", ".claude/ticketmill.json", "lint-engine", or a',
+  '      term describing the engine/profile/schema itself (e.g. "engine-owned", "profile", "schema")?',
+  '      If BOTH hold: predicted_files = the new asset\'s path exactly as written in the title/body, plus the',
+  '      repo\'s top-level README (e.g. README.md) if the repo has one — do NOT resolve or grep anything for this',
+  '      case. Skip steps a-c below entirely.',
+  '      Otherwise (the gate does not hold, or the deliverable shape is unclear on any doubt): fall through to',
+  '      steps a-c below, unchanged.',
+  '   a. From the issue title + body, extract ONLY high-signal identifiers: backticked spans (`like this`),',
+  '      quoted spans ("like this"), path-like strings (contain a / or a file extension such as .js/.md/.json/.sh),',
+  '      and code-symbol tokens (PascalCase, camelCase, snake_case, or ALL_CAPS words of 3+ chars).',
+  '      REJECT bare dictionary/English nouns used in ordinary prose (e.g. "engine", "button", "config" alone,',
+  '      with no code formatting, path shape, or distinctive casing) — those are not identifiers.',
+  '      If nothing clears this bar, predicted_files = [] and skip the rest of this step.',
+  '   b. Resolve each surviving identifier against the REAL tree at origin/' + TARGET + ' (already fetched read-only',
+  '      before this step; never the working directory, which may be on a different branch):',
+  '      git -C ' + ROOT + ' grep -l -I -F -i -- "<identifier>" origin/' + TARGET + ' for a content match, and',
+  '      git -C ' + ROOT + ' ls-tree -r --name-only origin/' + TARGET + ' filtered for a',
+  '      case-insensitive substring match for a path/filename match. Keep ONLY the exact repo-relative paths those',
+  '      commands actually return — never fabricate or normalize a path yourself.',
+  '   c. Dedupe and cap at 20 paths. If every resolution comes back empty, or any command errors, predicted_files = [].',
+].join('\n')
+
+// collectPostedCommit (issue #79, Layer 2): collects every non-null commit a
+// stage reports into ctx.postedCommits so probeCommitShas() (below) can later
+// confirm each one actually exists in the worktree, once, before merge-auto-
+// resolve rebases anything — instead of trusting each of the 8 call sites on
+// its own; see probeCommitShas() for why COMMIT_SHA_ASK alone isn't enough.
+// Guards a null stage result (call sites already degrade on that themselves)
+// and a stage that reported no commit (review/validate stages, or a fix stage
+// that made no changes).
+function collectPostedCommit(ctx, stageName, r) {
+  if (!r || !r.commit) return
+  ctx.postedCommits.push({ stage: stageName, commit: r.commit })
+}
 function collectNotes(ctx, from, r) {
   const arr = (r && r.notes_for_downstream) || []
   for (const n of arr) {
@@ -1960,7 +2078,14 @@ const STAGE_LABELS = { preflight: 'preflight (orchestration)', select: 'select-p
 //       per-call usage figure, so there is no way to split budget.spent()'s
 //       movement between concurrent callers. Overlapping stages each see (and
 //       get attributed) the same movement, so per-issue deltas over-count and
-//       the whole breakdown is labelled approximate (reconciles: false).
+//       the whole breakdown is labelled approximate (reconciles: false) —
+//       but ONLY when some per-issue row is actually tracked (anyTracked).
+//       If every per-issue row is untracked and the breakdown is carried
+//       entirely by stage buckets (below), there is no per-issue over-count
+//       to guard against — those buckets are region-boundary-bracketed
+//       outside the concurrent pool regardless of concurrency — so that
+//       stage-only breakdown still reconciles exactly (reconciles: true)
+//       even at concurrency > 1.
 //   byStage      - optional (normalizes to {}, so existing 3-arg callers are
 //                  unaffected): a flat { preflight, select, ... } map of
 //                  region-bracketed orchestration spend sampled OUTSIDE the
@@ -1972,18 +2097,53 @@ const STAGE_LABELS = { preflight: 'preflight (orchestration)', select: 'select-p
 //                  where every per-issue result is untracked but the stage
 //                  buckets are populated (e.g. a resumed run) still counts as
 //                  "tracked" and still renders a breakdown, via anyStage.
+//   poolSpend    - optional (issue #111; absent/non-finite preserves every
+//                  byte of pre-#111 behavior for existing 3-/4-arg callers,
+//                  including reconcile_error's denominator): the exact
+//                  budget.spent() delta bracketed immediately around the
+//                  runPool() call (sampled OUTSIDE this function, by the
+//                  caller — see the runPool() call site), i.e. the per-issue
+//                  pool's own share of the run. When finite, reconcile_error
+//                  is RE-SCOPED off the full run total to this pool-scoped
+//                  denominator: |poolSpend - perIssueSum| / poolSpend, where
+//                  perIssueSum is ONLY the per-issue tracked totals (NOT
+//                  byStage's preflight/select buckets, which are bracketed
+//                  outside the pool by construction and so are never part of
+//                  what poolSpend measures). At concurrency 1 this reconciles
+//                  near-exactly (both sides sum the same contiguous
+//                  spentTokens() deltas), same caveat as `reconciles` above —
+//                  it still catches a future bare-agent() regression inside
+//                  the pool, and remains a real (non-tautological) check at
+//                  concurrency > 1. The run-total-vs-pool gap (max(0, spent -
+//                  poolSpend) — preflight/select-phase orchestration plus
+//                  anything else sampled outside the pool, e.g. the
+//                  claims-release sweep) is surfaced honestly as its own
+//                  `orchestration_overhead` field/markdown line instead of
+//                  being folded into (or driving) the attribution-error
+//                  signal. `pool_spend`/`orchestration_overhead` are both null
+//                  when poolSpend is absent/non-finite. run_total/attributed/
+//                  remainder (below) are UNCHANGED by poolSpend — they still
+//                  describe the full run against the full sumDeltas, exactly
+//                  as before.
 // remainder (whatever budget.spent() counted that no per-issue row or stage
 // bucket attributed — max(0, spent - sumDeltas)) is computed and rendered as
 // its own "orchestration/unattributed" row whenever `spent` is available,
 // regardless of concurrency/reconciles — including the approximate
 // concurrency>1 case, so that spend is never left implicit — since the stage
 // buckets are already folded into sumDeltas, it is never double-counted.
-function aggregateTokens(results, spent, concurrency, byStage) {
+function aggregateTokens(results, spent, concurrency, byStage, poolSpend) {
   const list = results || []
   const stages = byStage || {}
   const byIssue = []
   const byModel = {}
   let sumDeltas = 0
+  // perIssueSum (issue #111): the per-issue-attributable slice only — NOT
+  // stage buckets (those are bracketed outside the pool by construction, see
+  // the poolSpend param doc above) — tracked separately from sumDeltas
+  // (which still folds stage buckets in, for run_total/attributed/remainder,
+  // unchanged from pre-#111 behavior) so the re-scoped reconcile_error has
+  // the right numerator when poolSpend is finite.
+  let perIssueSum = 0
   let anyTracked = false
 
   for (const r of list) {
@@ -1992,6 +2152,7 @@ function aggregateTokens(results, spent, concurrency, byStage) {
       anyTracked = true
       const total = t.total || 0
       sumDeltas += total
+      perIssueSum += total
       byIssue.push({ issue: r.issue, total: total, by_model: Object.assign({}, t.byModel || {}), tracked: true })
       const models = t.byModel || {}
       for (const m in models) {
@@ -2025,23 +2186,46 @@ function aggregateTokens(results, spent, concurrency, byStage) {
   const runTotal = hasSpent ? spent : null
   const trackedAny = anyTracked || anyStage
   const tracked = trackedAny || hasSpent
-  const reconciles = concurrency === 1 && hasSpent && trackedAny
+  const reconciles = hasSpent && trackedAny && (concurrency === 1 || !anyTracked)
   const remainder = hasSpent ? Math.max(0, spent - sumDeltas) : null
-  // reconcile_error (issue #90): the HONEST, concurrency-independent reconciliation
-  // signal, unlike `reconciles` (which is defined true whenever concurrency===1 and
-  // some spend is tracked, WITHOUT ever comparing the attributed sum to the real
-  // total — so a concurrency:1 run reports reconciles:true even with a large
-  // unattributed gap). reconcile_error = |spent - attributed| / spent captures both
-  // failure modes: the concurrency>1 over-count (attributed > spent, error grows past
-  // 0) AND the concurrency:1 under-attribution (the ~26% of PR-review/merge/report
-  // spend left unbracketed — attributed < spent). Downstream efficiency metrics
-  // (rework-tax, issue #91) MUST gate on this fraction being small, never on the
-  // `reconciles` boolean. null when budget.spent() is unavailable, or when spent is 0
-  // and nothing was attributed (trivially exact, error 0) — see below.
+  const hasPoolSpend = isFiniteNumber(poolSpend)
+  // reconcile_error (issue #90, re-scoped by #111): the HONEST reconciliation
+  // signal downstream efficiency metrics (rework-tax, issue #91) MUST gate on,
+  // never on the `reconciles` boolean above (which is defined true whenever
+  // concurrency===1 and some spend is tracked, OR whenever concurrency>1 but
+  // no per-issue row is tracked — in neither case ever comparing the
+  // attributed sum to a real total).
+  //
+  // When poolSpend is finite (issue #111): re-scoped to the per-issue-
+  // attributable slice — reconcile_error = |poolSpend - perIssueSum| /
+  // poolSpend, where poolSpend is the exact budget.spent() delta bracketed
+  // around the runPool() call and perIssueSum is ONLY the per-issue tracked
+  // totals (stage buckets are bracketed outside the pool, so they're outside
+  // this denominator too — see the poolSpend param doc above). This avoids
+  // the old formula's dominant failure mode: unbracketed late-stage spend
+  // (PR-review/merge/report/retrospective/...) inflating |spent -
+  // attributed| against the FULL run total even though that spend was never
+  // attributable to a per-issue row in the first place. The run-total-vs-pool
+  // gap is surfaced honestly instead, as orchestration_overhead below.
+  //
+  // When poolSpend is absent/non-finite: falls back to the pre-#111 formula,
+  // byte-identical for existing 3-/4-arg callers — reconcile_error = |spent -
+  // attributed| / spent, null when budget.spent() is unavailable, or when
+  // spent is 0 and nothing was attributed (trivially exact, error 0).
   const attributed = sumDeltas
-  const reconcileError = !hasSpent
-    ? null
-    : (spent > 0 ? Math.abs(spent - sumDeltas) / spent : (sumDeltas === 0 ? 0 : null))
+  const reconcileError = hasPoolSpend
+    ? (poolSpend > 0 ? Math.abs(poolSpend - perIssueSum) / poolSpend : (perIssueSum === 0 ? 0 : null))
+    : (!hasSpent
+        ? null
+        : (spent > 0 ? Math.abs(spent - sumDeltas) / spent : (sumDeltas === 0 ? 0 : null)))
+  // pool_spend / orchestration_overhead (issue #111): both null unless
+  // poolSpend is finite. orchestration_overhead is the honest run-total-vs-
+  // pool gap (max(0, spent - poolSpend)) — e.g. preflight/select-phase
+  // orchestration plus anything else sampled outside the pool before this
+  // aggregation runs (see the poolSpend param doc above) — reported as its
+  // own named field/line rather than folded into (or driving) reconcile_error.
+  const poolSpendOut = hasPoolSpend ? poolSpend : null
+  const orchestrationOverhead = (hasSpent && hasPoolSpend) ? Math.max(0, spent - poolSpend) : null
   const models = Object.keys(byModel).sort()
 
   const lines = []
@@ -2050,6 +2234,9 @@ function aggregateTokens(results, spent, concurrency, byStage) {
   lines.push(hasSpent
     ? 'Run total (output tokens, via budget.spent()): **' + spent + '**'
     : 'Run total: not tracked (budget.spent() unavailable this run)')
+  if (hasSpent && hasPoolSpend) {
+    lines.push('Orchestration overhead (outside the per-issue pool): **' + orchestrationOverhead + '**')
+  }
   lines.push('')
 
   if (!tracked) {
@@ -2063,7 +2250,7 @@ function aggregateTokens(results, spent, concurrency, byStage) {
       // of it vanishing into a "not tracked" line that contradicts "Run total: N".
       lines.push('_no per-issue or stage data attributed any spend this run — the "orchestration/unattributed" row ' +
         'below carries the full run total instead of leaving it implicit._')
-    } else if (concurrency > 1) {
+    } else if (concurrency > 1 && anyTracked) {
       lines.push('_approximate - overlapping concurrent stages over-count and do NOT reconcile to the run total._')
       lines.push('(A single shared monotonic counter cannot be split per concurrent call — agent() returns schema ' +
         'content only, no per-call usage — so simultaneous issues each see the same counter movement. The stage ' +
@@ -2108,6 +2295,8 @@ function aggregateTokens(results, spent, concurrency, byStage) {
     remainder: remainder,
     attributed: attributed,
     reconcile_error: reconcileError,
+    pool_spend: poolSpendOut,
+    orchestration_overhead: orchestrationOverhead,
     tracked: tracked,
     reconciles: reconciles,
     markdown: lines.join('\n'),
@@ -2726,6 +2915,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       ].join('\n'), stageOpts('simplify'), IMPL_SCHEMA)
       if (!simp || simp.status === 'error') { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': simplify degraded'); break }
       collectNotes(ctx, 'simplify', simp)
+      collectPostedCommit(ctx, 'simplify-' + prefix + '-i' + iter, simp)
     } else if (iter === 1) {
       log('#' + ctx.issue + ' quality ' + prefix + ': simplify skipped (no in-scope files in change)')
     }
@@ -2771,6 +2961,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!fix || fix.status === 'error') { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': fix degraded'); break }
     collectNotes(ctx, 'quality-fix', fix)
+    collectPostedCommit(ctx, 'quality-fix-' + prefix + '-i' + iter, fix)
     tallyTouches(ctx, fix.files_changed)
     if (!runSimplify && (fix.files_changed || []).some(inScope)) runSimplify = true
   }
@@ -2800,7 +2991,7 @@ function withBrowser(fn) {
   BW_QUEUE = run.then(function () {}, function () {}) // keep the chain alive past failures
   return run
 }
-function bwPort(issue) { return ((BROWSER && BROWSER.port_base) || 8100) + (issue % ((BROWSER && BROWSER.port_span) || 900)) }
+function bwPort(issue) { const span = parseInt((BROWSER && BROWSER.port_span), 10); return ((BROWSER && BROWSER.port_base) || 8100) + (issue % (span >= 1 ? span : 900)) }
 function serveCmd(issue) {
   return String((BROWSER && BROWSER.serve_command) || '').replace(/\{port\}/g, String(bwPort(issue)))
 }
@@ -2959,6 +3150,7 @@ async function runBrowserCheck(ctx, where) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!fix || fix.status === 'error') return { ok: false, error: 'browser-fix stage failed (' + where + ')' }
     collectNotes(ctx, 'browser-fix', fix)
+    collectPostedCommit(ctx, 'browser-fix-' + where + '-i' + iter, fix)
     tallyTouches(ctx, fix.files_changed)
   }
   return { ok: false, error: 'browser verification still failing after ' + MAX_BROWSER_ITERATIONS + ' iterations (' + where + ')' }
@@ -3027,6 +3219,51 @@ async function probeChangedFiles(ctx) {
   }
   ctx.changed_files = probe.changed_files || []
   ctx.added_files = probe.added_files || []
+}
+
+// probeCommitShas (issue #79, Layer 2 — post-hoc validation of agent-posted
+// commit SHAs): follow-up to #47/PR #78's COMMIT_SHA_ASK (Layer 1, advisory
+// only — it tells the agent HOW to get the real SHA, but the `commit` field a
+// stage returns is still unverified free text). Same read-only-dispatch shape
+// as probeChangedFiles() immediately above, but a DIFFERENT call site in
+// reviewAndMerge(): probeCommitShas() runs BEFORE runMergeAutoResolve(),
+// deliberately, because a rebase+force-push there legitimately rewrites every
+// commit's SHA (parent hashes change) — validating pre-rebase, while every
+// posted SHA still resolves in the worktree, means there is nothing left to
+// re-validate afterward and no reset of ctx.postedCommits is needed. Checks
+// ctx.postedCommits — every non-null `commit` collectPostedCommit() gathered
+// at the 8 COMMIT_SHA_ASK sites, all of which fire earlier in reviewAndMerge()
+// than this call — instead of the working diff. Early-returns with NO dispatch
+// when nothing was posted (the common case: many stages never report a
+// commit). One read-only haiku probe for the whole issue, not eight per-site
+// round-trips. On a missing SHA: flagged via VERIFY_SKIPS (surfaces in the
+// batch PR's Verification Gaps section) and ctx.deferred (fabrication-incident
+// framing naming the posting stage) — never halts. On probe death:
+// degrade-recorded via ctx.deferred, never blocks — mirrors probeChangedFiles.
+async function probeCommitShas(ctx) {
+  if (!ctx.postedCommits.length) return
+  const shas = [...new Set(ctx.postedCommits.map(function (p) { return p.commit }))]
+  const probe = await stage(ctx, 'commit-sha-probe', [
+    'READ-ONLY probe for issue #' + ctx.issue + ': confirm each commit SHA below actually exists in worktree ' + ctx.worktree + '.',
+    'For EACH sha in the list, run exactly (substituting the sha):',
+    'git -C ' + ctx.worktree + ' cat-file -e <sha>^{commit}',
+    'SHAs to check:',
+    shas.map(function (s) { return '- ' + s }).join('\n'),
+    'Return unresolved_shas: the SHAs from the list above whose cat-file check FAILED (non-zero exit, i.e. the SHA does',
+    'NOT exist as a commit in this worktree). Empty array if every SHA resolved.',
+  ].join('\n'), stageOpts('probe'), COMMIT_PROBE_SCHEMA)
+  if (!probe) {
+    log('#' + ctx.issue + ' commit-sha probe died — degrading (recorded), not blocking the issue')
+    ctx.deferred.push('Commit-SHA probe: could not validate ' + shas.length + ' posted commit SHA(s) for issue #' + ctx.issue + ' — verify manually before merge.')
+    return
+  }
+  const unresolved = probe.unresolved_shas || []
+  for (const sha of unresolved) {
+    const posting = ctx.postedCommits.find(function (p) { return p.commit === sha })
+    const fromStage = posting ? posting.stage : 'unknown stage'
+    VERIFY_SKIPS.push('#' + ctx.issue + ': stage "' + fromStage + '" posted commit SHA ' + sha + ' that does NOT exist in the worktree — possible fabricated SHA, verify manually before merge')
+    ctx.deferred.push('Fabrication incident: stage "' + fromStage + '" for issue #' + ctx.issue + ' claimed commit ' + sha + ', but the post-hoc probe could not find it in the worktree — treat this stage\'s reported commit as unverified and check manually before trusting it.')
+  }
 }
 async function runEngineOwnedGate(ctx) {
   if (!ENGINE_OWNED.length) return { ok: true }
@@ -3199,6 +3436,7 @@ async function runTestLoop(ctx, forced) {
       ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
       if (!fix || fix.status === 'error') return { ok: false, error: 'test-fix stage failed — halting test loop' }
       collectNotes(ctx, 'test-fix', fix)
+      collectPostedCommit(ctx, 'test-fix-i' + iter, fix)
       tallyTouches(ctx, fix.files_changed)
       continue
     }
@@ -3243,6 +3481,7 @@ async function runTestLoop(ctx, forced) {
     ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
     if (!qfix || qfix.status === 'error') return { ok: false, error: 'test-quality-fix stage failed — halting test loop' }
     collectNotes(ctx, 'test-quality-fix', qfix)
+    collectPostedCommit(ctx, 'test-quality-fix-i' + iter, qfix)
     tallyTouches(ctx, qfix.files_changed)
     ctx.metrics.test_quality_fix_rounds++
   }
@@ -4202,6 +4441,7 @@ async function implementIssue(ctx) {
     if (!impl) { failedTasks.push(task.id); log('#' + ctx.issue + ' task ' + task.id + ': implement died — task failed'); continue }
     if (impl.status !== 'success') { failedTasks.push(task.id); log('#' + ctx.issue + ' task ' + task.id + ': implement error — task failed'); continue }
     collectNotes(ctx, 'task-' + task.id, impl)
+    collectPostedCommit(ctx, 'task-' + task.id + '-implement', impl)
 
     let approved = false
     let lastComments = ''
@@ -4253,6 +4493,7 @@ async function implementIssue(ctx) {
       ].join('\n'), stageOpts('fix'), FIX_SCHEMA)
       if (!fx || fx.status === 'error') break
       collectNotes(ctx, 'task-' + task.id + '-fix', fx)
+      collectPostedCommit(ctx, 'task-' + task.id + '-fix-a' + attempt, fx)
     }
 
     if (!approved) {
@@ -4432,6 +4673,7 @@ async function reviewAndMerge(ctx) {
     if (!fix || fix.status === 'error') return fail(ctx, 'needs_human', 'pr-fix', 'PR fix stage failed — PR #' + ctx.pr + ' left open for human review')
     pushDecision(ctx, 'PR Review Fix (i' + iter + ')', fix.summary || 'fixes applied')
     collectNotes(ctx, 'pr-fix', fix)
+    collectPostedCommit(ctx, 'pr-fix-i' + iter, fix)
     tallyTouches(ctx, fix.files_changed)
 
     const q = await runQualityLoop(ctx, 'pr-fix-i' + iter, 'post-review fixes for PR #' + ctx.pr, fix.files_changed)
@@ -4464,6 +4706,21 @@ async function reviewAndMerge(ctx) {
     ].join('\n'), stageOpts('techDocs'), TECH_DOCS_SCHEMA)
     if (!td || td.status === 'error') log('#' + ctx.issue + ' tech-docs degraded (non-fatal) — continuing to merge')
   }
+
+  // ---- COMMIT-SHA PROBE (issue #79, Layer 2) — post-hoc validation of every
+  // commit SHA an agent posted during this issue (ctx.postedCommits), run here,
+  // BEFORE merge-auto-resolve, deliberately: every collectPostedCommit() call
+  // site (task-implement/fix/test/pr-fix/browser-fix stages) fires earlier in
+  // this same function, so by this point ctx.postedCommits already holds every
+  // SHA there is to check for the issue — and the worktree still holds those
+  // SHAs' pre-rebase commits. Running the probe here validates them while they
+  // still exist, so a later rebase-and-force-push (which legitimately rewrites
+  // every commit's SHA, even a clean one, because parent hashes change) can
+  // never be mistaken for a fabricated SHA — there is no reset-ctx.postedCommits
+  // hack needed because nothing is left unvalidated once the rebase happens.
+  // Never gates the merge: probeCommitShas() degrades to a recorded deferred
+  // note on a dead probe, and flags (never halts) on an unresolved SHA. ----
+  await probeCommitShas(ctx)
 
   // ---- MERGE AUTO-RESOLVE (mechanical CONFLICTING recovery before the merge
   // stage's own preflight would otherwise escalate straight to needs_human) ----
@@ -4579,6 +4836,7 @@ async function processIssue(pre) {
     added_files: null,
     touch_counts: {},   // per-file re-touch tally across fix-stage files_changed (tallyTouches(), issue #87 task 2)
     gate_findings: {},  // per-gate finding tally/disposition (recordGateOutcome(), issue #87 task 3)
+    postedCommits: [],  // {stage, commit} per COMMIT_SHA_ASK site that reported a commit (collectPostedCommit(), issue #79) — validated post-hoc by probeCommitShas()
   }
   if (pre.resume_point === 'skip') {
     log('#' + ctx.issue + ' skipped: ' + pre.reason)
@@ -5230,6 +5488,8 @@ function buildRunRecord(f) {
       by_stage: t.by_stage,
       attributed: t.attributed,
       reconcile_error: t.reconcile_error,
+      pool_spend: t.pool_spend,
+      orchestration_overhead: t.orchestration_overhead,
       tracked: t.tracked,
       reconciles: t.reconciles,
     },
@@ -5773,14 +6033,22 @@ function buildBudgetEstimateMap(history, units) {
 // rule). 'pending' and 'clean' are deliberately excluded: 'pending' is a
 // placeholder by definition, and 'clean' stays open to correction (a PR
 // certified clean today can still be reverted next week) — only a target that
-// can never produce new signal (a revert/reopen/hotfix already happened, or the
-// PR never merged at all) is truly done.
-const OUTCOME_TERMINAL_GRADES = ['reverted', 'reopened', 'hotfix', 'closed_unmerged', 'abandoned']
+// can never produce new signal (a revert/reopen/hotfix/later_batch_fix already
+// happened, or the PR never merged at all) is truly done. 'later_batch_fix'
+// (issue #104) is terminal for the same reason 'hotfix' is: once a later PR's
+// own blame-forward resolution has named this batch PR's merge SHA as the
+// origin of the lines it just repaired, that fact never un-happens.
+const OUTCOME_TERMINAL_GRADES = ['reverted', 'reopened', 'hotfix', 'later_batch_fix', 'closed_unmerged', 'abandoned']
 // OUTCOME_NEGATIVE_GRADES: the anti-Goodhart quality-negative signals proper —
 // excludes closed_unmerged/abandoned, which are a terminal ESCAPE for a target
 // that can never reach "clean" (no merge occurred), not evidence of a bad
-// outcome, so they must not inflate a negative-outcome rate.
-const OUTCOME_NEGATIVE_GRADES = ['reverted', 'reopened', 'hotfix']
+// outcome, so they must not inflate a negative-outcome rate. 'later_batch_fix'
+// (issue #104) belongs here: a later PR blame-forward-resolved to this batch
+// PR's own merge SHA is exactly the kind of quality-negative "this shipped a
+// defect that needed a real repair" signal reverted/reopened/hotfix already
+// capture, just via a different, stronger-evidence mechanism than bare
+// changed_files overlap (see computeLaterBatchFix below).
+const OUTCOME_NEGATIVE_GRADES = ['reverted', 'reopened', 'hotfix', 'later_batch_fix']
 
 // outcomeLineKey: the ledger's identity key — run_tag + batch_pr + issue (one row
 // per member issue of a batch PR, not one row per PR, so a multi-issue batch PR
@@ -5817,7 +6085,14 @@ function ageInDays(isoTimestamp, now) {
 // pickOutcomeSignals: the compact, audit-friendly subset of an observation's raw
 // fields carried onto the ledger line as `signals` — enough to explain WHY a
 // grade was assigned (mirrors gate_yield's raw-count-alongside-verdict idiom)
-// without echoing back the full agent payload.
+// without echoing back the full agent payload. later_fix_pr/batch_pr_merge_sha/
+// churned_regions (issue #104) are the raw inputs computeLaterBatchFix decides
+// the later_batch_fix grade from — carried through verbatim (same fail-open
+// defaulting as every other field here) so a ledger line can be audited without
+// re-deriving the blame-forward resolution. Deliberately excludes the later
+// fix's raw body text (isPlannedFollowup's input) — that's prose, not a compact
+// signal, and the grade it excluded/didn't-exclude is already legible from
+// which grade got written.
 function pickOutcomeSignals(observation) {
   const o = observation || {}
   return {
@@ -5828,7 +6103,67 @@ function pickOutcomeSignals(observation) {
     hotfix_pr: o.hotfix_pr != null ? o.hotfix_pr : null,
     issue_state: o.issue_state != null ? o.issue_state : null,
     abandoned: !!o.abandoned,
+    later_fix_pr: o.later_fix_pr != null ? o.later_fix_pr : null,
+    batch_pr_merge_sha: o.batch_pr_merge_sha != null ? o.batch_pr_merge_sha : null,
+    churned_regions: Array.isArray(o.churned_regions) ? o.churned_regions : [],
   }
+}
+
+// computeLaterBatchFix (issue #104): the sole place the later_batch_fix grade
+// decision is made — reintroduces the v1-dropped "this batch caused a later
+// fix" signal, but gated on a fundamentally different, stronger mechanism than
+// the raw changed_files overlap plan review rejected (guaranteed-coincidental
+// in this repo, where every tier touches workflows/ticketmill.js). Instead of
+// "did the two diffs touch the same file", this asks "did the later fix PR's
+// own blame-forward resolution name THIS batch PR's own squash-merge commit as
+// the SHA that introduced the lines it just changed" — proof the later fix is
+// repairing a line the batch PR itself wrote, resolved entirely in the later
+// PR's own coordinate space (a read-only `git blame` on the pre-image lines it
+// replaced), never a synthesized/translated hunk-range intersection across two
+// diffs' distinct coordinate spaces (the mechanism approach-challenge
+// iteration 1 replaced).
+//
+// observation.churned_regions: an array of { file, blamed_shas } entries — one
+// per churned region (hunk) in the later fix PR's diff, each already resolved
+// live by the Select-phase agent. blamed_shas is itself an array (a region can
+// span lines last touched by more than one prior commit) of commit SHA
+// strings.
+//
+// Fires iff observation.batch_pr_merge_sha is a non-empty string AND appears
+// in the UNION of every region's blamed_shas. Fails open to false on anything
+// malformed or missing (no batch_pr_merge_sha, no churned_regions, a region
+// missing blamed_shas) — same fail-open ethos as ageInDays/deriveAbandoned: an
+// unresolvable signal must never manufacture a grade.
+function computeLaterBatchFix(observation) {
+  const o = observation || {}
+  const sha = o.batch_pr_merge_sha
+  if (typeof sha !== 'string' || sha === '') return false
+  const regions = Array.isArray(o.churned_regions) ? o.churned_regions : []
+  for (const region of regions) {
+    if (!region) continue
+    const blamed = Array.isArray(region.blamed_shas) ? region.blamed_shas : []
+    if (blamed.indexOf(sha) !== -1) return true
+  }
+  return false
+}
+
+// isPlannedFollowup (issue #104): the planning-edge exclusion validated by task
+// 1 against real history — a later PR/issue whose OWN body declares itself a
+// pre-planned continuation of prior work (not a reactive repair) must never be
+// graded later_batch_fix, no matter what computeLaterBatchFix's blame-forward
+// resolution finds. Case-insensitive substring match against a small,
+// deliberately narrow set of planning phrases. Task 1 confirmed this drops
+// #103's body ("Follow-up from #92") but does NOT drop reactive-repair
+// language like "regression introduced by", which must stay eligible.
+// Non-string input (missing body) degrades to '' — never planned, never
+// throws.
+function isPlannedFollowup(bodyText) {
+  const text = typeof bodyText === 'string' ? bodyText.toLowerCase() : ''
+  const PLANNED_PHRASES = ['follow-up from', 'follow up from', 'depends on', 'deferred from']
+  for (const phrase of PLANNED_PHRASES) {
+    if (text.indexOf(phrase) !== -1) return true
+  }
+  return false
 }
 
 // gradeFromObservation (issue #92): the deterministic grade decision. Takes ONE
@@ -5848,13 +6183,20 @@ function pickOutcomeSignals(observation) {
 //   1. reverted   — a revert commit referencing this PR/issue was found.
 //   2. reopened   — the issue's timeline shows it reopened after this run closed it.
 //   3. hotfix     — a later PR cross-references this issue as a fix for it.
-//   4. closed_unmerged — batch_pr closed without ever merging: this target can
+//   4. later_batch_fix (issue #104) — computeLaterBatchFix's blame-forward
+//      resolution named this batch PR's own merge SHA as the origin of the
+//      lines a later PR just repaired, AND that later PR/issue isn't itself
+//      declaring a pre-planned continuation (isPlannedFollowup). Sits below
+//      hotfix (a same-issue cross-referenced fix is the stronger, more direct
+//      claim) and above closed_unmerged/abandoned (a real later fix landing is
+//      strictly more informative than either terminal escape).
+//   5. closed_unmerged — batch_pr closed without ever merging: this target can
 //      never reach "clean" (there was nothing to hold up), so it gets a terminal
 //      escape now instead of sitting `pending` forever.
-//   5. abandoned  — the issue itself was abandoned (closed, no PR ever merged),
+//   6. abandoned  — the issue itself was abandoned (closed, no PR ever merged),
 //      same terminal-escape reasoning as closed_unmerged.
-//   6. clean      — merged, no negative signal, and >= min_age_days old.
-//   7. pending    — everything else (merged but still too young, or state unknown).
+//   7. clean      — merged, no negative signal, and >= min_age_days old.
+//   8. pending    — everything else (merged but still too young, or state unknown).
 function gradeFromObservation(observation, now, cfg) {
   const o = observation || {}
   const c = cfg || OUTCOME_GRADING
@@ -5864,6 +6206,9 @@ function gradeFromObservation(observation, now, cfg) {
   if (o.reverted) return { grade: 'reverted', signals: signals }
   if (o.reopened) return { grade: 'reopened', signals: signals }
   if (o.hotfix_pr) return { grade: 'hotfix', signals: signals }
+  if (computeLaterBatchFix(o) && !isPlannedFollowup(o.later_fix_body)) {
+    return { grade: 'later_batch_fix', signals: signals }
+  }
   if (o.pr_state === 'closed' && !o.merged_at) return { grade: 'closed_unmerged', signals: signals }
   if (o.abandoned) return { grade: 'abandoned', signals: signals }
 
@@ -5873,6 +6218,20 @@ function gradeFromObservation(observation, now, cfg) {
   }
 
   return { grade: 'pending', signals: signals }
+}
+
+// deriveAbandoned (issue #103): the deterministic decision behind
+// gradeFromObservation's `abandoned` precedence branch above — closes the
+// upstream wiring gap left by #92/PR#102, where nothing ever populated
+// `abandoned`/`issue_state` on the observation gradeFromObservation receives.
+// Positive whitelist guard (issue_state==='closed' AND live_merge_state is one
+// of 'open'/'closed'/'none') on purpose: 'merged' is deliberately excluded so a
+// merged batch PR never yields abandoned (closed_unmerged/clean already own
+// that outcome), and 'unknown' is deliberately excluded so a transient `gh pr
+// view` read failure never yields a terminal grade off an unresolved signal.
+// Pure and placed above the TICKETMILL-TEST-HARNESS-SPLIT marker.
+function deriveAbandoned(issue_state, live_merge_state) {
+  return issue_state === 'closed' && ['open', 'closed', 'none'].indexOf(live_merge_state) !== -1
 }
 
 // buildOutcomeLine (issue #92): the compact single-object JSONL shape appended to
@@ -6317,8 +6676,10 @@ const learnPromise = agent([
 // core above the TICKETMILL-TEST-HARNESS-SPLIT marker.
 const outcomeGradePromise = agent([
   'READ-ONLY outcome-grading pass over ' + REPO + '\'s ticketmill run history under ' + LOGS + '.',
-  'NO repo mutations of any kind: no git fetch, no local file writes, no gh command that changes state —',
-  'only cat and gh READ commands (gh pr view, gh issue view, gh search, gh pr list) below.',
+  'NO repo mutations of any kind: no git fetch, no checkout/reset, no local file writes, no gh command that changes',
+  'state — only cat, gh READ commands (gh pr view, gh issue view, gh search, gh pr list), and read-only local git',
+  'object-database inspection (git blame, git show — never fetch/checkout/reset) below. This repo is already a full,',
+  'non-shallow clone, so a later merge commit\'s SHA and its parent resolve locally without a git fetch.',
   '',
   '0. now: run `date -u +%Y-%m-%dT%H:%M:%SZ` and return it verbatim as `now`.',
   '',
@@ -6340,9 +6701,8 @@ const outcomeGradePromise = agent([
   '      raw lines VERBATIM, one array entry per line, as prior_ledger_lines — do not parse, reshape, or',
   '      interpret them for the RETURNED array; the caller does that. For target SELECTION only (not for what',
   '      you return), parse each line yourself: per {run_tag, batch_pr, issue} key, using the LAST line that',
-  '      key appears on (later lines override earlier ones), if its grade is one of reverted / reopened / hotfix /',
-  '      closed_unmerged / abandoned, that target is TERMINAL — drop it from the candidate list, it can never be',
-  '      re-graded.',
+  '      key appears on (later lines override earlier ones), if its grade is one of ' + OUTCOME_TERMINAL_GRADES.join(' / ') + ',',
+  '      that target is TERMINAL — drop it from the candidate list, it can never be re-graded.',
   '   e. From the surviving candidates, sort oldest run_tag first (grade the longest-unobserved history first) and',
   '      keep at most ' + OUTCOME_GRADING.sample_cap + '. Set sample_cap_hit = true if more candidates existed than',
   '      that cap, else false.',
@@ -6359,14 +6719,41 @@ const outcomeGradePromise = agent([
   '      this specific PR (not merely mentioning its number in passing).',
   '   c. reopen_found: gh issue view <issue> --repo ' + REPO + ' --json state,timelineItems — scan timelineItems',
   '      for a ReopenedEvent that occurs AFTER the ClosedEvent this run produced (issue reopened following the',
-  '      batch PR merge, not reopened-then-reclosed earlier in its history). true only on a clear match.',
+  '      batch PR merge, not reopened-then-reclosed earlier in its history). true only on a clear match. Also',
+  '      return issue_state = that SAME read\'s `state` field, lowercased ("open" or "closed").',
   '   d. hotfix_ref: from that SAME timelineItems read, look for a CrossReferencedEvent whose source is a',
   '      DIFFERENT, later-merged PR that references this issue AND whose title/body language indicates it fixes a',
   '      problem from the original change (e.g. "fix"/"hotfix"/"regression" — not a routine follow-up feature).',
   '      hotfix_ref = that PR\'s number, else null.',
   '   e. On any gh command failure for a target, still return an entry for it with whatever fields you resolved',
-  '      and the rest null/false/"unknown" — never drop a target silently; the caller must see every target it',
-  '      asked about, even a partially-resolved one.',
+  '      and the rest null/false/"unknown" (issue_state: "unknown") — never drop a target silently; the caller must',
+  '      see every target it asked about, even a partially-resolved one.',
+  '   f. later_batch_fix raw signal (issue #104) — evidence stronger than bare changed_files overlap. This step',
+  '      NEVER decides the later_batch_fix grade itself (that is computeLaterBatchFix\'s job, post-hoc); it only',
+  '      resolves the raw fields that decision is made from.',
+  '      i. From THIS batch PR\'s own timeline (gh pr view <batch_pr> --repo ' + REPO + ' --json timelineItems — a',
+  '         DIFFERENT read from step c\'s issue timeline), scan for CrossReferencedEvent entries whose source is a',
+  '         DIFFERENT, MERGED pull request that cross-references THIS BATCH PR itself (not the issue). Sort',
+  '         surviving candidates oldest-merged-first.',
+  '      ii. Walk candidates oldest-first. For each, gh pr view <candidate> --repo ' + REPO + ' --json body,mergedAt',
+  '         and apply a CHEAP pre-filter only, to avoid spending a git blame call on an obviously unrelated',
+  '         candidate — this is target selection, NOT the final exclusion (the engine\'s isPlannedFollowup re-derives',
+  '         that post-hoc from the later_fix_body you return): if the body reads as announcing a pre-planned',
+  '         continuation of prior work ("follow-up from", "follow up from", "depends on", "deferred from" —',
+  '         case-insensitive), skip it and try the next candidate. Stop at the first candidate that survives this',
+  '         pre-filter (call it the survivor), or when none do.',
+  '      iii. If a survivor exists: later_fix_pr = its number, later_fix_body = its raw body text verbatim. Resolve',
+  '         batch_pr_merge_sha = THIS batch PR\'s own squash-merge commit SHA (gh pr view <batch_pr> --repo ' + REPO + ' ',
+  '         --json mergeCommit, the .mergeCommit.oid field — null if the PR never merged or the field is absent).',
+  '      iv. If a survivor exists AND batch_pr_merge_sha resolved: for each hunk changed by the survivor\'s merge',
+  '         commit (gh api repos/' + REPO + '/commits/<survivor mergeCommit sha> --jq \'.files[] | {filename, patch}\'',
+  '         to see which line ranges it touched, or an equivalent read-only `git show <sha> -- <file>` on this local',
+  '         clone), resolve the PRE-IMAGE lines it replaced via a read-only `git blame <survivor mergeCommit sha>^ -L',
+  '         <start>,<end> -- <file>` and collect one { file, blamed_shas } entry per hunk, blamed_shas holding every',
+  '         DISTINCT commit SHA that `git blame` attributes those pre-image lines to. Local clone only — never `git',
+  '         fetch`; if the survivor\'s commits are not locally resolvable, or any command fails, churned_regions = [].',
+  '      v. If no survivor exists, or any step above fails: later_fix_pr = null, batch_pr_merge_sha = null,',
+  '         later_fix_body = null, churned_regions = [] — fail open, never fabricate a PR number, SHA, or region.',
   '',
   'Return observations (array, one entry per target — even partially-resolved ones), prior_ledger_lines (the raw',
   'outcomes.jsonl lines, verbatim, unparsed), sample_cap_hit, and now (from step 0).',
@@ -6402,7 +6789,8 @@ const revisitRiskPromise = agent([
   '      parse each line yourself: {run_tag, batch_pr, issue, grade, signals, decided_at} (schema_version 1). Group',
   '      by {run_tag, batch_pr, issue} and, per key, keep ONLY the LAST line (the ledger is append-only; later lines',
   '      override earlier ones for the same key). Keep only keys whose current (last-line-wins) grade is one of',
-  '      reverted / reopened / hotfix (pending/clean/closed_unmerged/abandoned are not evidence of a regression).',
+  '      ' + OUTCOME_NEGATIVE_GRADES.join(' / ') + ' (pending/clean/closed_unmerged/abandoned are not evidence of a',
+  '      regression).',
   '   c. Drop any survivor whose age is already outside the ' + REVISIT_RISK.window_days + '-day window: age in whole',
   '      days from its own decided_at field (fall back to signals.merged_at ONLY if decided_at is missing) to `now`',
   '      from step 0. This is a target-selection optimization only, to keep this pass\'s gh-call budget cheap — if in',
@@ -6419,6 +6807,12 @@ const revisitRiskPromise = agent([
   '        if the revert itself was a PR, gh pr view <that PR> --json files). If no revert commit/PR is clearly',
   '        identifiable, or any command fails, files = [].',
   '      - reopened: files = [] always (no recoverable regression locus without a squashed diff to compare).',
+  '      - later_batch_fix (issue #104): files = [] always. Its evidence (churned_regions, a per-hunk blame-forward',
+  '        resolution the outcome-grading pass already performed in the LATER PR\'s own coordinate space) is not a',
+  '        diff this pass can walk to a file list, and translating it back would reintroduce exactly the',
+  '        coincidental-file-overlap risk later_batch_fix was designed to avoid. Explicit fail-open, not a silent',
+  '        gap — revisit-risk coverage for this grade is a documented follow-up (see decision-chain notes), and',
+  '        files:[] is guaranteed to never spuriously flag a predicted_files match (computeRevisitRisk).',
   '   e. Return one entry per surviving key: {issue, batch_pr, files} — grade/decided_at/merged_at are NOT part of',
   '      the returned entry; the caller re-derives those itself from prior_ledger_lines (step a).',
   '',
@@ -6472,20 +6866,7 @@ let preflights = (await Promise.all(issueList.map(function (it) {
     '   git -C ' + ROOT + ' status --porcelain -- ' + enginePathspec.join(' '),
     '   Return every dirty path under that pathspec as root_dirty_engine_paths (empty array if the pathspec is clean).',
     '',
-    '5. predicted_files (best-effort lane-scheduling hint — fail open to [] on ANY doubt, never guess a path):',
-    '   a. From the issue title + body, extract ONLY high-signal identifiers: backticked spans (`like this`),',
-    '      quoted spans ("like this"), path-like strings (contain a / or a file extension such as .js/.md/.json/.sh),',
-    '      and code-symbol tokens (PascalCase, camelCase, snake_case, or ALL_CAPS words of 3+ chars).',
-    '      REJECT bare dictionary/English nouns used in ordinary prose (e.g. "engine", "button", "config" alone,',
-    '      with no code formatting, path shape, or distinctive casing) — those are not identifiers.',
-    '      If nothing clears this bar, predicted_files = [] and skip the rest of this step.',
-    '   b. Resolve each surviving identifier against the REAL tree at origin/' + TARGET + ' (already fetched read-only',
-    '      before this step; never the working directory, which may be on a different branch):',
-    '      git -C ' + ROOT + ' grep -l -I -F -i -- "<identifier>" origin/' + TARGET + ' for a content match, and',
-    '      git -C ' + ROOT + ' ls-tree -r --name-only origin/' + TARGET + ' filtered for a',
-    '      case-insensitive substring match for a path/filename match. Keep ONLY the exact repo-relative paths those',
-    '      commands actually return — never fabricate or normalize a path yourself.',
-    '   c. Dedupe and cap at 20 paths. If every resolution comes back empty, or any command errors, predicted_files = [].',
+    PREDICTED_FILES_ASK(ROOT, TARGET),
     '6. depends_on (best-effort lane-scheduling hint — fail open to [] on ANY doubt):',
     '   a. Scan the issue body for "depends on #N", "depends-on #N", or "follow-up to #N" (case-insensitive). Collect each N.',
     '   b. Drop any N that is not one of this batch\'s issue numbers (' + batchIssueNumbers.join(', ') + '), and drop N == ' + it.number + '.',
@@ -6571,6 +6952,17 @@ if (outcomeGradeR) {
       reverted: !!o.revert_found,
       reopened: !!o.reopen_found,
       hotfix_pr: o.hotfix_ref,
+      issue_state: o.issue_state,
+      abandoned: deriveAbandoned(o.issue_state, o.live_merge_state),
+      // later_fix_pr/batch_pr_merge_sha/churned_regions/later_fix_body (issue #104):
+      // computeLaterBatchFix/isPlannedFollowup's raw inputs, threaded straight
+      // through from the observation — same fail-open defaulting as every other
+      // field above, so a malformed/absent field degrades to computeLaterBatchFix's
+      // own "false" default rather than throwing.
+      later_fix_pr: o.later_fix_pr != null ? o.later_fix_pr : null,
+      batch_pr_merge_sha: o.batch_pr_merge_sha != null ? o.batch_pr_merge_sha : null,
+      churned_regions: Array.isArray(o.churned_regions) ? o.churned_regions : [],
+      later_fix_body: o.later_fix_body != null ? o.later_fix_body : null,
     }, outcomeGradeR.now)
     return buildOutcomeLine({ run_tag: o.run_tag, batch_pr: o.batch_pr, issue: o.issue, grade: g.grade, signals: g.signals, decided_at: outcomeGradeR.now })
   })
@@ -6920,7 +7312,17 @@ if (isFiniteNumber(tokenBudgetResolved.budget)) {
 const TOKEN_BUDGET_CTX = { budget: tokenBudgetResolved.budget, estimateByIssue: budgetEstimate.estimateByIssue }
 
 // ---- Process: per-issue pipeline with issue-level concurrency + breakers ----
+// poolBefore/poolAfter (issue #111): bracket the ONE concurrent region
+// (runPool() drains `units` through processIssue at CONCURRENCY, so this is
+// the only place multiple issues' agent() calls can overlap) from OUTSIDE it
+// — exact regardless of CONCURRENCY, same addStage() idiom as the
+// STAGE_TOKENS preflight/select brackets above, just inlined here since the
+// delta (POOL_SPEND, below) feeds aggregateTokens' new 5th param rather than
+// a STAGE_TOKENS bucket.
+const poolBefore = spentTokens()
 const results = await runPool(units, CONCURRENCY, processIssue, lanes, TOKEN_BUDGET_CTX)
+const poolAfter = spentTokens()
+const POOL_SPEND = (isFiniteNumber(poolBefore) && isFiniteNumber(poolAfter)) ? Math.max(0, poolAfter - poolBefore) : null
 
 const counts = {}
 for (const r of results) counts[r.status] = (counts[r.status] || 0) + 1
@@ -6968,7 +7370,7 @@ if (HELD_CLAIMS.length) {
 }
 
 // ---- Token usage: JS-computed aggregation (no LLM math), injected verbatim below ----
-const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY, STAGE_TOKENS)
+const TOKEN_AGG = aggregateTokens(results, spentTokens(), CONCURRENCY, STAGE_TOKENS, POOL_SPEND)
 
 // ---- Merge auto-resolution: JS-computed run-level rollup, injected verbatim below ----
 const MERGE_RESOLVE_AGG = aggregateMergeAutoResolve(results)

@@ -43,6 +43,16 @@ test('bwPort: uses profile.browser.port_base and port_span when set', function (
   assert.strictEqual(context.bwPort(142), 3000 + (142 % 100))
 })
 
+test('bwPort: coerces port_span to an integer >= 1, falling back to 900 for negatives/non-integers and truncating floats', function () {
+  const context = harness.boot()
+  harness.readGlobal(context, "BROWSER = { serve_command: 'x', port_span: -1 }")
+  assert.strictEqual(context.bwPort(7), 8100 + (7 % 900))
+  harness.readGlobal(context, "BROWSER = { serve_command: 'x', port_span: 'abc' }")
+  assert.strictEqual(context.bwPort(7), 8100 + (7 % 900))
+  harness.readGlobal(context, "BROWSER = { serve_command: 'x', port_span: 4.5 }")
+  assert.strictEqual(context.bwPort(7), 8100 + (7 % 4))
+})
+
 test('bwArtifactDir: defaults to /tmp/ticketmill-issue-<n> when profile.browser is unset', function () {
   const context = harness.boot()
   assert.strictEqual(context.bwArtifactDir(39), '/tmp/ticketmill-issue-39')

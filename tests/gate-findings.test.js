@@ -11,15 +11,6 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const harness = require('./harness')
 
-// ctx.gate_findings' nested {severity, disposition} objects are built inside
-// the vm-realm engine function, so their prototype differs from this file's
-// own object literals and fails deepStrictEqual's prototype check even when
-// structurally identical (same cross-realm reasoning as tests/token-usage.test.js's
-// Object.assign({}, ...) and the harness's documented Array.from(...) workaround).
-// The data is plain JSON (numbers/strings only), so a JSON round-trip is a safe,
-// realm-agnostic normalizer for the whole nested shape.
-function plain(x) { return JSON.parse(JSON.stringify(x)) }
-
 test('recordGateOutcome: a fresh gate key tallies count and severity mix from its findings', function () {
   const context = harness.boot()
   const ctx = harness.makeCtx({ issue: 1 })
@@ -30,7 +21,7 @@ test('recordGateOutcome: a fresh gate key tallies count and severity mix from it
     { severity: 'minor', summary: 'c' },
   ], 'carried-unresolved')
 
-  assert.deepStrictEqual(plain(ctx.gate_findings.approach), {
+  harness.assertVmEqual(ctx.gate_findings.approach, {
     count: 3,
     severity: { critical: 1, major: 1, minor: 1 },
     disposition: { 'carried-unresolved': 1 },
@@ -47,8 +38,8 @@ test('recordGateOutcome: repeated calls for the same gate accumulate rather than
 
   const g = ctx.gate_findings.plan
   assert.strictEqual(g.count, 3)
-  assert.deepStrictEqual(plain(g.severity), { critical: 0, major: 2, minor: 1 })
-  assert.deepStrictEqual(plain(g.disposition), { 're-litigated': 2, accepted: 1 })
+  harness.assertVmEqual(g.severity, { critical: 0, major: 2, minor: 1 })
+  harness.assertVmEqual(g.disposition, { 're-litigated': 2, accepted: 1 })
 })
 
 test('recordGateOutcome: different gate keys tally independently', function () {
@@ -60,8 +51,8 @@ test('recordGateOutcome: different gate keys tally independently', function () {
 
   assert.strictEqual(ctx.gate_findings.approach.count, 1)
   assert.strictEqual(ctx.gate_findings.plan.count, 1)
-  assert.deepStrictEqual(plain(ctx.gate_findings.approach.disposition), { accepted: 1 })
-  assert.deepStrictEqual(plain(ctx.gate_findings.plan.disposition), { dismissed: 1 })
+  harness.assertVmEqual(ctx.gate_findings.approach.disposition, { accepted: 1 })
+  harness.assertVmEqual(ctx.gate_findings.plan.disposition, { dismissed: 1 })
 })
 
 test('recordGateOutcome: a "dismissed" outcome (dead challenger) with no findings still tallies the disposition', function () {
@@ -70,7 +61,7 @@ test('recordGateOutcome: a "dismissed" outcome (dead challenger) with no finding
 
   context.recordGateOutcome(ctx, 'approach', [], 'dismissed')
 
-  assert.deepStrictEqual(plain(ctx.gate_findings.approach), {
+  harness.assertVmEqual(ctx.gate_findings.approach, {
     count: 0,
     severity: { critical: 0, major: 0, minor: 0 },
     disposition: { dismissed: 1 },
@@ -85,7 +76,7 @@ test('recordGateOutcome: an unrecognized/missing severity value is counted but n
 
   const g = ctx.gate_findings.approach
   assert.strictEqual(g.count, 1)
-  assert.deepStrictEqual(plain(g.severity), { critical: 0, major: 0, minor: 0 })
+  harness.assertVmEqual(g.severity, { critical: 0, major: 0, minor: 0 })
 })
 
 test('recordGateOutcome: defensive against a missing/partial ctx or gate name — never throws', function () {
@@ -110,7 +101,7 @@ test('fail(): the returned result carries ctx.gate_findings exactly as tallied',
 
   const result = await context.fail(ctx, 'needs_human', 'some-stage', 'boom')
 
-  assert.deepStrictEqual(plain(result.gate_findings.approach), {
+  harness.assertVmEqual(result.gate_findings.approach, {
     count: 1,
     severity: { critical: 0, major: 1, minor: 0 },
     disposition: { 'carried-unresolved': 1 },
