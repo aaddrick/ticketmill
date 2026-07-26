@@ -35,10 +35,36 @@
 // or `phase('Select')` moves before it), loadEngine() throws immediately with a
 // message telling you to update this file — it never silently truncates the wrong
 // thing.
+//
+// CROSS-VM STRUCTURAL EQUALITY (normalize() / assertVmEqual(), below): loadEngine()
+// runs the engine's declarations inside a real node:vm.Context — a separate JS
+// realm with its own Object/Array/Date/Map/Set constructors. Any object or array
+// literal CONSTRUCTED INSIDE that vm-executed code (a helper's return value, a
+// `raw || []` fallback, a nested {count, severity, disposition} tally, ...)
+// carries that realm's Object.prototype/Array.prototype, not this file's.
+// assert.deepStrictEqual checks prototype identity, so it fails on such values
+// even when they are structurally identical to a host-realm expected literal.
+// Apply normalize()/assertVmEqual() ONLY to that case. Do NOT apply them to a
+// value merely PASSED INTO a vm function and handed back BY REFERENCE (e.g. a
+// host-built ctx/fixture object the engine code mutated in place) — such values
+// already have host-realm prototypes and compare fine with plain
+// assert.deepStrictEqual(actual, expected); normalizing them anyway is needless
+// indirection, not a bug, but it muddies which sites actually need the helper.
+// The JSON round-trip these helpers use is a safe realm-agnostic normalizer only
+// for plain-JSON data (strings/numbers/booleans/null/plain objects/arrays of the
+// same) — it silently drops undefined fields, turns NaN/Infinity into null, and
+// strips Map/Set/Date/RegExp/class identity entirely instead of erroring, so
+// never reach for it to compare values carrying those types.
+//
+// PROFILE non-null seed note: helpers modeled on runTestLoop's control flow read
+// module-level PROFILE at call time and misbehave against a null PROFILE; tests
+// that boot such a helper need `context.__seed({ PROFILE: {} })` (or a fuller
+// fixture) before invoking it, even if the test itself never inspects PROFILE.
 
 const fs = require('node:fs')
 const path = require('node:path')
 const vm = require('node:vm')
+const assert = require('node:assert/strict')
 
 const ENGINE_PATH = path.join(__dirname, '..', 'workflows', 'ticketmill.js')
 
@@ -273,6 +299,26 @@ function installScriptedAgent(context, responder) {
   return scriptedAgent
 }
 
+/**
+ * Re-materialize a vm-realm object/array literal with host-realm prototypes via
+ * a JSON round-trip. See "CROSS-VM STRUCTURAL EQUALITY" in the top-of-file doc
+ * block for exactly when this is (and isn't) the right tool.
+ */
+function normalize(vmValue) {
+  return JSON.parse(JSON.stringify(vmValue))
+}
+
+/**
+ * assert.deepStrictEqual, but normalize() only `actual` first — `expected` is
+ * assumed to already be a host-realm plain-JSON literal (as tests write it
+ * inline). Use for asserting against object/array literals constructed inside
+ * vm-executed engine code; see the top-of-file doc block for the full
+ * when-to-use rule.
+ */
+function assertVmEqual(actual, expected, message) {
+  assert.deepStrictEqual(normalize(actual), expected, message)
+}
+
 module.exports = {
   ENGINE_PATH,
   SPLIT_MARKER,
@@ -288,4 +334,6 @@ module.exports = {
   installScriptedAgent,
   freshMetrics,
   freshTokens,
+  normalize,
+  assertVmEqual,
 }
