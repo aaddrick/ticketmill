@@ -238,11 +238,13 @@ new failure mode.
 `changelog: "CHANGELOG.md"`, `bump: null`. `profile.release` is read once
 at engine startup, so the batch that adds the field still runs on the old,
 unset profile. The stage takes effect starting with the next self-mill
-run, not the run that turned it on. Two agent charters still describe
-per-issue release discipline (`.claude/agents/ticketmill-implementer.md`
-and `ticketmill-code-reviewer.md`, both engine-owned) and still need
-realignment: an implementer should stop bumping per-issue, and the code
-reviewer should stop flagging a per-issue PR for a missing bump.
+run, not the run that turned it on. The two agent charters
+(`.claude/agents/ticketmill-implementer.md` and
+`ticketmill-code-reviewer.md`, both engine-owned) have been realigned to
+match: the implementer no longer bumps the version or adds a CHANGELOG
+entry per-issue, and the code reviewer no longer flags a per-issue PR for
+a missing bump — both describe that release discipline as batch-level,
+owned by the gated Report-phase `release` stage.
 
 ### Merge auto-resolve: one mechanical recovery attempt before needs_human
 
