@@ -1155,6 +1155,23 @@ the issue body. Both fields fail open to `[]` on any doubt. A wrong guess
 would wrongly serialize two unrelated issues; an empty prediction only costs
 the batch today's ordinary racing behavior.
 
+**A deliverable-shape gate runs before that resolution, for net-new skill or
+doc issues.** Retro #94 ('add skills/mill-review/SKILL.md') is why. The
+original resolution always fell through to a broad `git grep`/`git ls-tree`
+match against `origin/TARGET`. The two ~7,300-line engine copies plus
+`.claude/ticketmill.json` mention nearly every ticketmill concept, so a
+net-new skill or doc issue's generic identifiers matched the engine cluster.
+The asset the issue was about to create resolved to nothing: a
+precision-zero prediction, serializing the issue into the wrong lane. The
+gate checks first. Does the issue read as adding a new skill or doc/markdown
+asset, and does the body avoid naming an engine/profile/schema keyword
+(`workflows/ticketmill.js`, `.claude/ticketmill.json`, `lint-engine`, or a
+term describing the engine/profile/schema itself)? If both hold,
+`predicted_files` becomes the new asset's path exactly as written, plus the
+repo's top-level README if it has one, and the broad resolution is skipped.
+Every other issue shape falls through to the identifier extraction and
+`git grep`/`git ls-tree` resolution unchanged.
+
 **`computeLanes()` is a union-find over predicted-file overlap, with two edge
 tiers.** Trusted edges, a `serialize_globs` pattern hit or a `depends_on`
 reference, always unite their units and are never dissolved. Heuristic
