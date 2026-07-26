@@ -1824,9 +1824,9 @@ const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> l
   'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
   'or recall a SHA from memory.'
 // collectPostedCommit (issue #79, Layer 2): collects every non-null commit a
-// stage reports into ctx.postedCommits so probeCommitShas() (below, co-located
-// with probeChangedFiles()) can later confirm each one actually exists in the
-// worktree, once, near merge — instead of trusting each of the 8 call sites on
+// stage reports into ctx.postedCommits so probeCommitShas() (below) can later
+// confirm each one actually exists in the worktree, once, before merge-auto-
+// resolve rebases anything — instead of trusting each of the 8 call sites on
 // its own; see probeCommitShas() for why COMMIT_SHA_ASK alone isn't enough.
 // Guards a null stage result (call sites already degrade on that themselves)
 // and a stage that reported no commit (review/validate stages, or a fix stage
@@ -3079,20 +3079,22 @@ async function probeChangedFiles(ctx) {
 // probeCommitShas (issue #79, Layer 2 — post-hoc validation of agent-posted
 // commit SHAs): follow-up to #47/PR #78's COMMIT_SHA_ASK (Layer 1, advisory
 // only — it tells the agent HOW to get the real SHA, but the `commit` field a
-// stage returns is still unverified free text). Co-located with
-// probeChangedFiles() immediately above (same read-only-dispatch shape, same
-// call site in reviewAndMerge(), run once near merge) but checks
+// stage returns is still unverified free text). Same read-only-dispatch shape
+// as probeChangedFiles() immediately above, but a DIFFERENT call site in
+// reviewAndMerge(): probeCommitShas() runs BEFORE runMergeAutoResolve(),
+// deliberately, because a rebase+force-push there legitimately rewrites every
+// commit's SHA (parent hashes change) — validating pre-rebase, while every
+// posted SHA still resolves in the worktree, means there is nothing left to
+// re-validate afterward and no reset of ctx.postedCommits is needed. Checks
 // ctx.postedCommits — every non-null `commit` collectPostedCommit() gathered
-// at the 8 COMMIT_SHA_ASK sites — instead of the working diff. Early-returns
-// with NO dispatch when nothing was posted (the common case: many stages never
-// report a commit, and reviewAndMerge() also clears ctx.postedCommits whenever
-// runMergeAutoResolve() actually rebased+force-pushed — see the call site —
-// since a rebase legitimately rewrites every pre-rebase SHA). One read-only
-// haiku probe for the whole issue, not eight per-site round-trips. On a
-// missing SHA: flagged via VERIFY_SKIPS (surfaces in the batch PR's
-// Verification Gaps section) and ctx.deferred (fabrication-incident framing
-// naming the posting stage) — never halts. On probe death: degrade-recorded
-// via ctx.deferred, never blocks — mirrors probeChangedFiles.
+// at the 8 COMMIT_SHA_ASK sites, all of which fire earlier in reviewAndMerge()
+// than this call — instead of the working diff. Early-returns with NO dispatch
+// when nothing was posted (the common case: many stages never report a
+// commit). One read-only haiku probe for the whole issue, not eight per-site
+// round-trips. On a missing SHA: flagged via VERIFY_SKIPS (surfaces in the
+// batch PR's Verification Gaps section) and ctx.deferred (fabrication-incident
+// framing naming the posting stage) — never halts. On probe death:
+// degrade-recorded via ctx.deferred, never blocks — mirrors probeChangedFiles.
 async function probeCommitShas(ctx) {
   if (!ctx.postedCommits.length) return
   const shas = []
@@ -4561,24 +4563,25 @@ async function reviewAndMerge(ctx) {
     if (!td || td.status === 'error') log('#' + ctx.issue + ' tech-docs degraded (non-fatal) — continuing to merge')
   }
 
+  // ---- COMMIT-SHA PROBE (issue #79, Layer 2) — post-hoc validation of every
+  // commit SHA an agent posted during this issue (ctx.postedCommits), run here,
+  // BEFORE merge-auto-resolve, deliberately: every collectPostedCommit() call
+  // site (task-implement/fix/test/pr-fix/browser-fix stages) fires earlier in
+  // this same function, so by this point ctx.postedCommits already holds every
+  // SHA there is to check for the issue — and the worktree still holds those
+  // SHAs' pre-rebase commits. Running the probe here validates them while they
+  // still exist, so a later rebase-and-force-push (which legitimately rewrites
+  // every commit's SHA, even a clean one, because parent hashes change) can
+  // never be mistaken for a fabricated SHA — there is no reset-ctx.postedCommits
+  // hack needed because nothing is left unvalidated once the rebase happens.
+  // Never gates the merge: probeCommitShas() degrades to a recorded deferred
+  // note on a dead probe, and flags (never halts) on an unresolved SHA. ----
+  await probeCommitShas(ctx)
+
   // ---- MERGE AUTO-RESOLVE (mechanical CONFLICTING recovery before the merge
   // stage's own preflight would otherwise escalate straight to needs_human) ----
   const mar = await runMergeAutoResolve(ctx)
   if (!mar.ok) return fail(ctx, STOP.tripped ? 'halted' : 'needs_human', 'merge-auto-resolve', mar.error + ' — PR #' + ctx.pr + ' left open for human review')
-
-  // Post-rebase postedCommits reset (issue #79 quality-fix, iteration 1):
-  // mar.resolved === true means runMergeAutoResolve rebased the branch onto
-  // TARGET and force-pushed (see its own doc comment) — a rebase rewrites the
-  // SHA of every commit on the branch, even a clean one, because parent
-  // hashes change. Every entry collectPostedCommit() gathered BEFORE this
-  // point (task-implement/fix/test/pr-fix stages) now names a pre-rebase SHA
-  // that legitimately no longer exists — not a fabrication. Clear
-  // ctx.postedCommits here so probeCommitShas() below only checks SHAs posted
-  // AFTER the rewrite (there are none yet at this point in the flow, which is
-  // correct: nothing has posted a NEW commit since the force-push, so the
-  // probe will simply no-op via its own empty-list early return for this
-  // issue).
-  if (mar.resolved) ctx.postedCommits = []
 
   // ---- CHANGED-FILES PROBE (issue #87) — unconditional, once per issue, after
   // the full review/fix loop has landed and before the worktree teardown below,
@@ -4586,13 +4589,6 @@ async function reviewAndMerge(ctx) {
   // gates the merge: probeChangedFiles() degrades to a recorded deferred note
   // on a dead probe rather than failing the issue. ----
   await probeChangedFiles(ctx)
-
-  // ---- COMMIT-SHA PROBE (issue #79, Layer 2) — post-hoc validation of every
-  // commit SHA an agent posted during this issue (ctx.postedCommits), right
-  // after the changed-files probe and before the worktree teardown below.
-  // Never gates the merge: probeCommitShas() degrades to a recorded deferred
-  // note on a dead probe, and flags (never halts) on an unresolved SHA. ----
-  await probeCommitShas(ctx)
 
   // ---- MERGE (preflight, squash merge, complete comment, follow-ups, cleanup) ----
   const deferredBlock = ctx.deferred.length ? ctx.deferred.map(function (d) { return '- ' + d }).join('\n') : ''

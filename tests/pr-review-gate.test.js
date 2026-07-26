@@ -61,6 +61,7 @@ function seedReviewFlow(context, overrides) {
 
 const APPROVED_REVIEW = { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
 const CHANGED_FILES_PROBE_OK = { changed_files: ['workflows/ticketmill.js'], added_files: [] }
+const COMMIT_PROBE_OK = { unresolved_shas: [] }
 const MERGE_OK = { status: 'merged', follow_up_issues: [], error: null }
 const FIX_OK = { status: 'success', commit: 'deadbeef', files_changed: [], fixes_applied: ['addressed review feedback'], summary: 'fixed', error: null }
 const SIMPLIFY_OK = { status: 'success', commit: null, files_changed: [], summary: 'nothing to simplify' }
@@ -110,6 +111,10 @@ test('reviewAndMerge(): a changes-requested iteration followed by a clean approv
     // ---- iteration 2: both approve ----
     'spec-review-i2': APPROVED_REVIEW,
     'code-review-i2': APPROVED_REVIEW,
+    // pr-fix-i1 (FIX_OK) posted a commit, so reviewAndMerge()'s commit-sha
+    // probe (issue #79, Layer 2) dispatches once for the whole issue, before
+    // changed-files-probe — see the probeCommitShas() call site.
+    'commit-sha-probe': COMMIT_PROBE_OK,
     'changed-files-probe': CHANGED_FILES_PROBE_OK,
     merge: MERGE_OK,
   })
@@ -129,7 +134,7 @@ test('reviewAndMerge(): a changes-requested iteration followed by a clean approv
   const keys = context.agent.calls.map(stageKeyOf)
   assert.deepStrictEqual(keys, [
     'spec-review-i1', 'code-review-i1', 'pr-fix-i1', 'simplify-pr-fix-i1-i1', 'quality-review-pr-fix-i1-i1',
-    'spec-review-i2', 'code-review-i2', 'changed-files-probe', 'merge',
+    'spec-review-i2', 'code-review-i2', 'commit-sha-probe', 'changed-files-probe', 'merge',
   ])
 })
 
