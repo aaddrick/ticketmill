@@ -81,6 +81,47 @@ test('computeGateYield: an issue with no pr-review findings at all is never flag
   assert.deepStrictEqual(plain(gy.by_issue), [{ issue: 7, escaped: false }, { issue: 8, escaped: false }])
 })
 
+// ---- escaped defects vs a dead challenger ----
+
+test('computeGateYield: a pr-review finding IS NOT an escaped defect when every early gate that recorded an outcome only dismissed (dead challenger, nothing adjudicated)', function () {
+  const context = harness.boot()
+  const results = [
+    {
+      issue: 9,
+      gate_findings: {
+        approach: gate(0, {}, { dismissed: 1 }),
+        'pr-review': gate(2, { major: 2 }, { accepted: 1 }),
+      },
+    },
+  ]
+  const gy = context.computeGateYield(results)
+
+  // The approach challenger died, so it never judged the work. Its zero finding
+  // count is an absence of judgment, not a clean pass, and calling the later
+  // pr-review findings "escaped" would invent a defect out of a dead agent.
+  assert.deepStrictEqual(plain(gy.escaped_defects), [])
+  assert.deepStrictEqual(plain(gy.by_issue), [{ issue: 9, escaped: false }])
+})
+
+test('computeGateYield: a dismissed early gate does not mask a genuine escape when the OTHER early gate adjudicated clean', function () {
+  const context = harness.boot()
+  const results = [
+    {
+      issue: 10,
+      gate_findings: {
+        approach: gate(0, {}, { dismissed: 1 }),
+        plan: gate(0, {}, { accepted: 1 }),
+        'pr-review': gate(2, { major: 2 }, { accepted: 1 }),
+      },
+    },
+  ]
+  const gy = context.computeGateYield(results)
+
+  // plan reached a real disposition and found nothing, so the escape is real.
+  assert.deepStrictEqual(plain(gy.escaped_defects), [{ issue: 10, count: 2 }])
+  assert.deepStrictEqual(plain(gy.by_issue), [{ issue: 10, escaped: true }])
+})
+
 // ---- accepted-vs-dismissed ratio ----
 
 test('computeGateYield: accepted-vs-dismissed ratio sums across issues and ignores non-accepted/dismissed dispositions', function () {
@@ -100,6 +141,26 @@ test('computeGateYield: accepted-vs-dismissed ratio sums across issues and ignor
   assert.strictEqual(approach.accepted, 2)
   assert.strictEqual(approach.dismissed, 1)
   assert.ok(Math.abs(approach.ratio - (2 / 3)) < 1e-9)
+  // ...but it must still be COUNTED, in its own column. The ratio's denominator
+  // stays accepted+dismissed; re-litigated and carried are reported beside it.
+  assert.strictEqual(approach.relitigated, 0)
+  assert.strictEqual(approach.carried, 1)
+  assert.match(gy.markdown, /\| Re-litigated \| Carried \|/)
+})
+
+test('computeGateYield: a gate that only ever re-litigated reports its iterations even though the ratio is null', function () {
+  const context = harness.boot()
+  const results = [
+    { issue: 1, gate_findings: { approach: gate(8, { major: 3, minor: 5 }, { 're-litigated': 2, 'carried-unresolved': 1 }) } },
+  ]
+  const gy = context.computeGateYield(results)
+
+  const approach = plain(gy.by_gate).approach
+  assert.strictEqual(approach.ratio, null)
+  assert.strictEqual(approach.relitigated, 2)
+  assert.strictEqual(approach.carried, 1)
+  // The row an operator most needs to see used to render as a bare em dash.
+  assert.match(gy.markdown, /\| approach \| 8 \| 0 \| 3 \| 5 \| — \| 2 \| 1 \|/)
 })
 
 test('computeGateYield: a gate with zero accepted and zero dismissed findings has a null ratio, rendered as an em dash', function () {

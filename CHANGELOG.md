@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.1.41 (2026-07-27)
+
+Observability. Every gate iteration has always recorded how it resolved, in a
+four-value vocabulary, and the Gate Yield table rendered two of the four. The
+two it dropped are the ones that mean something went wrong.
+
+`recordGateOutcome` writes `accepted`, `dismissed`, `re-litigated` and
+`carried-unresolved`. `computeGateYield` read the first two, and its ratio
+column is `accepted / (accepted + dismissed)`. That denominator is the problem:
+`dismissed` means the challenger agent died, not that a finding was judged and
+rejected, so on any run where every challenger survived the ratio is 1.0 by
+construction no matter how many iterations a gate spent re-litigating. Across
+the five runs in this repository's own ledger the challenger never once died,
+the ratio read 1.0 at every gate, and the dashboard reported that every
+surfaced finding was accepted. Ten of the twenty five recorded gate iterations
+ended in `re-litigated` and two ended in `carried-unresolved`.
+
+Worse at the row that matters most: a gate that fought to its cap has zero
+accepted and zero dismissed, so its ratio is null and rendered as an em dash.
+The two gates that failed to converge were the emptiest cells in the table.
+
+Gate Yield now carries `Re-litigated` and `Carried` columns beside
+`Accepted:Dismissed`, and the ratio keeps its old denominator with a comment at
+the source explaining what `dismissed` actually means. This is a rendering
+change over data already on disk, so it recomputes across every archived run
+with no engine execution.
+
+Three further record-level gaps closed in the same pass:
+
+The consolidation challenge is a full capped contrarian gate, but it runs at
+batch scope before any per-issue `ctx` exists, so `recordGateOutcome` had
+nowhere to write and the gate's entire finding and disposition history was
+discarded. It now records into a module-level singleton in the shape
+`recordGateOutcome` expects, surfaced on the run record as `consolidation_gate`.
+It is deliberately not folded into the `by_gate` rollup: that reducer is keyed
+per issue and this gate adjudicates a group, so a synthetic row there would
+corrupt `by_issue` and the escaped-defect pass.
+
+`ctx.settled`, the adjudicated-decisions ledger, appeared in none of the three
+result serializers, so it never outlived the issue that built it. It is now
+persisted on all three.
+
+The escaped-defect flag counted a pr-review finding as escaped whenever the
+early gates carried no findings. An early gate that only ever dismissed never
+adjudicated anything, so its zero count is an absence of judgment rather than a
+clean pass, and treating it as a miss invents an escaped defect out of a dead
+agent. Escaped-defect count is the one signal in this engine with plausible
+coupling to what actually ships, and it was failing in the direction that
+flatters the run. The fix is narrow on purpose: it suppresses only when every
+early gate that recorded an outcome recorded nothing but dismissals. An early
+gate with no record at all stays ambiguous and keeps the old behaviour, because
+absence of a record does not distinguish a gate that ran clean under an older
+schema from one that never ran.
+
+Three tests added, covering the dead-challenger suppression, the case where a
+second early gate adjudicated clean so the escape is real, and the
+re-litigated-only row that used to render as a bare em dash. The suite is 599
+tests.
+
 ## 0.1.40 (2026-07-26)
 
 Documentation only. Two files had grown into things nobody reads end to end:

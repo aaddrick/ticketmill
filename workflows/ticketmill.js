@@ -1596,6 +1596,17 @@ function applyRealRunCollapseGuard(units, lanes, concurrency, serializeGlobs) {
 // from "we stopped BEFORE spending more, on purpose, before anything failed".
 const STOP = { tripped: false, reason: '', kind: null }
 const BATCH = { failures: 0, consecutiveDeaths: 0 }
+// CONSOLIDATION_GATE: the consolidation challenge is a full capped contrarian
+// gate (challengeConsolidationGroup) but it runs at BATCH scope, before any
+// per-issue ctx exists, so recordGateOutcome had nowhere to write and this
+// gate's entire finding/disposition history was discarded. Module-level
+// singleton in the same shape recordGateOutcome expects, mirroring STOP/BATCH
+// here (plain literal, sandbox-safe). Surfaced on the run record as
+// `consolidation_gate` and deliberately NOT folded into computeGateYield's
+// by_gate rollup: that reducer is keyed per ISSUE and this gate adjudicates a
+// GROUP, so a synthetic row there would corrupt by_issue and the escaped-defect
+// pass. Record first, decide where it belongs in the rollup second.
+const CONSOLIDATION_GATE = { gate_findings: {} }
 // STAGE_TOKENS: region-boundary token buckets for Select-phase orchestration
 // spend that has no per-issue ctx to attribute to (see aggregateTokens' byStage
 // param above). Populated by addStage() (below, near spentTokens()) bracketing
@@ -2720,7 +2731,7 @@ async function fail(ctx, status, stageKey, error) {
   await postNote(ctx, stageKey, status, error)
   BATCH.failures++
   if (BATCH.failures >= MAX_BATCH_FAILURES) tripStop('circuit breaker: ' + BATCH.failures + ' issues failed')
-  return Object.assign({ issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx), changed_files: (ctx && ctx.changed_files) || null, added_files: (ctx && ctx.added_files) || null, touch_counts: (ctx && ctx.touch_counts) || {}, gate_findings: (ctx && ctx.gate_findings) || {} }, frictionFields(ctx, status))
+  return Object.assign({ issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx), changed_files: (ctx && ctx.changed_files) || null, added_files: (ctx && ctx.added_files) || null, touch_counts: (ctx && ctx.touch_counts) || {}, gate_findings: (ctx && ctx.gate_findings) || {}, settled: (((ctx && ctx.settled) || []).slice()) }, frictionFields(ctx, status))
 }
 
 // =============================================================================
@@ -3836,17 +3847,23 @@ async function challengeConsolidationGroup(group, settledCarrier) {
     ].filter(Boolean).join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
 
     if (!ch) {
+      recordGateOutcome(CONSOLIDATION_GATE, 'consolidation', [], 'dismissed')
       log('consolidation group ' + groupId + ' DISSOLVED — challenge agent died (fails conservatively, not open)')
       return null
     }
     const criticalMajor = (ch.findings || []).filter(function (f) { return f.severity === 'critical' || f.severity === 'major' }).length
     if (ch.verdict === 'sound_with_caveats' && criticalMajor === 0) {
+      recordGateOutcome(CONSOLIDATION_GATE, 'consolidation', ch.findings, 'accepted')
       settleDecision(settledCarrier, 'consolidation group ' + groupId, 'consolidation challenge i' + iter,
         'group primary #' + current.primary + ' <- members ' + current.members.join(','), current.rationale, [])
       return current
     }
     log('consolidation group ' + groupId + ' challenge i' + iter + ': ' + ch.verdict + ', ' + criticalMajor + ' critical/major')
     if (iter === MAX_CONTRARIAN_ITERATIONS) {
+      // Cap here DISSOLVES rather than proceeding with caveats (the deliberate
+      // asymmetry with the per-issue gates), but the disposition is the same
+      // one the vocabulary already names: the cap was reached without a clean pass.
+      recordGateOutcome(CONSOLIDATION_GATE, 'consolidation', ch.findings, 'carried-unresolved')
       log('consolidation group ' + groupId + ' DISSOLVED — contrarian cap (' + MAX_CONTRARIAN_ITERATIONS + ') reached without acceptance: ' + (ch.summary || ''))
       await consolidationAgent(current.members, 'consolidation:dissolve-note-g' + groupId, [
         'Post a GitHub comment on issue #' + current.primary + ' in ' + REPO + ' (gh issue comment).',
@@ -3858,6 +3875,7 @@ async function challengeConsolidationGroup(group, settledCarrier) {
       ].join('\n'), stageOpts('probe'), NOTE_SCHEMA)
       return null
     }
+    recordGateOutcome(CONSOLIDATION_GATE, 'consolidation', ch.findings, 're-litigated')
     // Revise: give the opus gate one more look at just THIS group, with the
     // challenge findings in hand. Reuses CONSOLIDATION_SCHEMA (a single-group
     // response is just groups: [one] — or groups: [] if it now concludes the
@@ -4790,7 +4808,7 @@ async function reviewAndMerge(ctx) {
   if (mar.resolved) ctx.metrics.merge_auto_resolved = (ctx.metrics.merge_auto_resolved || 0) + 1
 
   log('#' + ctx.issue + ' merged PR #' + ctx.pr + (merge.follow_up_issues && merge.follow_up_issues.length ? ' (follow-ups: ' + merge.follow_up_issues.join(', ') + ')' : ''))
-  return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx), changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings }, frictionFields(ctx, 'completed'))
+  return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx), changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings, settled: (ctx.settled || []).slice() }, frictionFields(ctx, 'completed'))
 }
 
 // =============================================================================
@@ -4848,7 +4866,7 @@ async function processIssue(pre) {
     // must NOT count as "shipped into TARGET" — see batchClosesIssues() below,
     // which is the sole reader of this field.
     const merged_into_target = pre.pr_state === 'merged' && pre.pr_base === TARGET
-    return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target, changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings }, frictionFields(ctx, 'skipped'))
+    return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target, changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings, settled: (ctx.settled || []).slice() }, frictionFields(ctx, 'skipped'))
   }
   if (pre.resume_point === 'process_pr') {
     log('#' + ctx.issue + ' healing: open PR #' + ctx.pr + ' found — jumping to review/merge')
@@ -5277,7 +5295,7 @@ function computeGateYield(results) {
 
   const byGate = {}
   function gateBucket(key) {
-    if (!byGate[key]) byGate[key] = { count: 0, severity: { critical: 0, major: 0, minor: 0 }, accepted: 0, dismissed: 0 }
+    if (!byGate[key]) byGate[key] = { count: 0, severity: { critical: 0, major: 0, minor: 0 }, accepted: 0, dismissed: 0, relitigated: 0, carried: 0 }
     return byGate[key]
   }
 
@@ -5298,11 +5316,30 @@ function computeGateYield(results) {
       const disp = g.disposition || {}
       bucket.accepted += Number(disp.accepted) || 0
       bucket.dismissed += Number(disp.dismissed) || 0
+      bucket.relitigated += Number(disp['re-litigated']) || 0
+      bucket.carried += Number(disp['carried-unresolved']) || 0
     }
 
     const escapeCount = Number((gf[ESCAPE_GATE] || {}).count) || 0
     const earlyCount = EARLY_GATES.reduce(function (sum, k) { return sum + (Number((gf[k] || {}).count) || 0) }, 0)
-    const escaped = escapeCount > 0 && earlyCount === 0
+    // 'dismissed' means the challenger AGENT DIED, so that gate never
+    // ADJUDICATED anything and its zero finding count is an absence of judgment,
+    // not a clean pass. Where EVERY early gate that recorded an outcome recorded
+    // only dismissals, calling the later pr-review findings "escaped"
+    // manufactures a defect out of a dead agent — and escaped-defect count is
+    // the one signal in this engine with plausible coupling to what actually
+    // ships, so it fails in the direction that flatters the run. Narrow by
+    // construction: an early gate with NO record at all stays ambiguous and
+    // preserves the original behavior, because absence of a record does not
+    // distinguish "gate ran clean under an older schema" from "gate never ran".
+    const earlyRecorded = EARLY_GATES.filter(function (k) {
+      return Object.keys(((gf[k] || {}).disposition) || {}).length > 0
+    })
+    const earlyOnlyDismissed = earlyRecorded.length > 0 && earlyRecorded.every(function (k) {
+      const d = (gf[k] || {}).disposition || {}
+      return Object.keys(d).every(function (x) { return x === 'dismissed' || !(Number(d[x]) || 0) })
+    })
+    const escaped = escapeCount > 0 && earlyCount === 0 && !earlyOnlyDismissed
     if (escaped) escapedDefects.push({ issue: r && r.issue, count: escapeCount })
     byIssue.push({ issue: r && r.issue, escaped: escaped })
   }
@@ -5310,6 +5347,12 @@ function computeGateYield(results) {
   const gateKeys = Object.keys(byGate).sort()
   for (const key of gateKeys) {
     const b = byGate[key]
+    // NOTE: 'dismissed' means the challenger AGENT DIED, not that a finding was
+    // judged and rejected. So this ratio is "gate iterations that passed clean,
+    // out of those that produced any verdict at all" — on a run where every
+    // challenger survived it is 1.0 by construction, no matter how many
+    // iterations the gate spent re-litigating. Read it with the two columns
+    // beside it, never alone.
     b.ratio = (b.accepted + b.dismissed) > 0 ? b.accepted / (b.accepted + b.dismissed) : null
   }
 
@@ -5321,12 +5364,18 @@ function computeGateYield(results) {
   if (!gateKeys.length) {
     lines.push('No gate findings recorded this run.')
   } else {
-    lines.push('| Gate | Findings | Critical | Major | Minor | Accepted:Dismissed |')
-    lines.push('| --- | --- | --- | --- | --- | --- |')
+    // Re-litigated and Carried are rendered alongside Accepted:Dismissed rather
+    // than folded into it: the ratio's denominator is deliberately
+    // accepted+dismissed only (see below), so a gate that iterated three times
+    // and capped renders a null ratio. Without these two columns that gate —
+    // precisely the one an operator needs to see — is the emptiest row in the
+    // table, and a run whose challengers never died reads as a flawless 1.0.
+    lines.push('| Gate | Findings | Critical | Major | Minor | Accepted:Dismissed | Re-litigated | Carried |')
+    lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |')
     for (const key of gateKeys) {
       const b = byGate[key]
       lines.push('| ' + key + ' | ' + b.count + ' | ' + b.severity.critical + ' | ' + b.severity.major + ' | ' + b.severity.minor + ' | ' +
-        (b.ratio == null ? '—' : b.accepted + ':' + b.dismissed) + ' |')
+        (b.ratio == null ? '—' : b.accepted + ':' + b.dismissed) + ' | ' + b.relitigated + ' | ' + b.carried + ' |')
     }
   }
   if (escapedDefects.length) {
@@ -5543,6 +5592,7 @@ function buildRunRecord(f) {
       escaped_defects: gy.escaped_defects,
     },
     consolidation_groups: f.consolidationGroups,
+    consolidation_gate: f.consolidationGateFindings || {},
     by_issue_shape: buildIssueShapeRows(f.results, f.units, t.by_issue),
     results: f.results,
   }
@@ -7566,7 +7616,8 @@ const runRecord = buildRunRecord({
   stop: STOP, counts: counts, verificationGaps: VERIFY_SKIPS, tokensSpent: spentTokens(),
   tokenAgg: TOKEN_AGG, mergeAgg: MERGE_RESOLVE_AGG, frictionChurnAgg: FRICTION_CHURN_AGG,
   reworkTaxAgg: REWORK_TAX_AGG, gateYieldAgg: GATE_YIELD_AGG,
-  consolidationGroups: finalGroups, results: results, units: units,
+  consolidationGroups: finalGroups, consolidationGateFindings: CONSOLIDATION_GATE.gate_findings,
+  results: results, units: units,
 })
 const resultsJson = JSON.stringify(runRecord, null, 2)
 const report = await agent([
