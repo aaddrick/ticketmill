@@ -3001,7 +3001,14 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
   let runSimplify = !Array.isArray(filesChanged) || filesChanged.length === 0 || filesChanged.some(inScope)
   let approved = false
   let degraded = false
-  for (let iter = 1; !approved && !degraded && iter <= MAX_QUALITY_ITERATIONS; iter++) {
+  // rebutted (issue #167): a third, separate loop-exit flag from `degraded` —
+  // a fix that rebuts every finding and applies none is NOT an agent failure
+  // (degraded stays false, so the rolling degrade window/quality_degrades
+  // below are untouched), but it also cannot approve itself, so the loop must
+  // still stop rather than spend its remaining iterations re-litigating a
+  // dispute only a human/reviewer can adjudicate.
+  let rebutted = false
+  for (let iter = 1; !approved && !degraded && !rebutted && iter <= MAX_QUALITY_ITERATIONS; iter++) {
     if (STOP.tripped) return 'halted'
     ctx.metrics.quality_iters++
     if (iter === 1) ctx.metrics.quality_scopes++
@@ -3066,7 +3073,8 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       break
     }
 
-    recordGateOutcome(ctx, 'quality', revFindings || [], iter === MAX_QUALITY_ITERATIONS ? 'carried-unresolved' : 're-litigated')
+    const bookedDisposition = iter === MAX_QUALITY_ITERATIONS ? 'carried-unresolved' : 're-litigated'
+    recordGateOutcome(ctx, 'quality', revFindings || [], bookedDisposition)
     const fixAgent = pickFixAgent(rev.recommended_fix_agent, null)
     const fix = await stage(ctx, 'quality-fix-' + prefix + '-i' + iter, [
       implementerBlock(fixAgent),
@@ -3080,6 +3088,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       'After committing, post an issue comment "## Quality Fix (' + stepLabel + ', iteration ' + iter + ')" with the',
       'commit SHA and the fixes applied in 2-4 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
       fixesAppliedIdAsk('[quality-task-1-i1-2] tightened the null guard'),
+      revFindings !== null ? FINDING_HYPOTHESIS_ASK : '',
       COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
@@ -3088,6 +3097,42 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
     if (!fix || fix.status === 'error') { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': fix degraded'); break }
     collectNotes(ctx, 'quality-fix', fix)
     collectPostedCommit(ctx, 'quality-fix-' + prefix + '-i' + iter, fix)
+
+    // rebuttal-only exit (issue #167): a fix that rebutted every finding it was
+    // shown and applied none is a DISPUTE, not a resolution — see the
+    // rebuttalOnly comment above runTestLoop's mirror of this block for the
+    // full contract this predicate enforces. Evaluated AFTER collectNotes/
+    // collectPostedCommit above (so handoff notes and the posted-commit ledger
+    // still see this round) but BEFORE tallyTouches just below, which is a
+    // verified no-op here anyway since a true rebuttalOnly round always has an
+    // empty files_changed by construction.
+    const normRebuttals = normalizeRebuttals(fix.rebutted, revFindings || [])
+    const rebuttalOnly = normRebuttals.length > 0 && (fix.fixes_applied || []).length === 0 && (fix.files_changed || []).length === 0
+    if (rebuttalOnly) {
+      rebutted = true
+      retypeGateDisposition(ctx, 'quality', bookedDisposition, 'carried-unresolved')
+      if (!ctx.contested) ctx.contested = []
+      for (const r of normRebuttals) {
+        ctx.contested.push({ gate: 'quality-' + prefix, id: r.finding_id, summary: r.summary, evidence: r.evidence })
+      }
+      pushDecision(ctx, 'Gate: findings contested, none applied', 'Quality fix (' + stepLabel + ', iteration ' + iter + ') rebutted every finding and applied no fix — carried as contested, not resolved.')
+      ctx.metrics.rebuttal_only_rounds++
+      // Rolled up to exactly ONE VERIFY_SKIPS line per issue, mirroring the
+      // quality-cap roll-up just below (runQualityLoop runs once per task plus
+      // once per PR-fix round, so without this a chatty issue would print one
+      // line per rebuttal-only round).
+      if (!ctx.quality_rebuttals) ctx.quality_rebuttals = []
+      ctx.quality_rebuttals.push(stepLabel)
+      const rebutMsg = '#' + ctx.issue + ': quality gate rebuttal-only, no fix applied (' + ctx.quality_rebuttals.join(', ') + ') — findings contested, carried for human review'
+      if (typeof ctx.quality_rebuttal_skip_index === 'number' && ctx.quality_rebuttal_skip_index < VERIFY_SKIPS.length) {
+        VERIFY_SKIPS[ctx.quality_rebuttal_skip_index] = rebutMsg
+      } else {
+        ctx.quality_rebuttal_skip_index = VERIFY_SKIPS.length
+        VERIFY_SKIPS.push(rebutMsg)
+      }
+      break
+    }
+
     tallyTouches(ctx, fix.files_changed)
     if (!runSimplify && (fix.files_changed || []).some(inScope)) runSimplify = true
   }
@@ -3110,7 +3155,12 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
   // exit via the degrade-window halt just below, which both callers
   // (reviewAndMerge, the per-task loop) turn into a hard fail() — so this
   // line must not claim anything merged on a capped-then-halted issue.
-  if (!approved && !degraded) {
+  // Gated to !rebutted too (issue #167): a rebuttal-only exit already pushed
+  // its own rolled-up VERIFY_SKIPS line above and broke the loop before
+  // reaching MAX_QUALITY_ITERATIONS — it must not ALSO be counted as a cap
+  // exhaustion, which would misreport a contested-findings round as the loop
+  // having simply run out of iterations.
+  if (!approved && !degraded && !rebutted) {
     if (!ctx.quality_caps) ctx.quality_caps = []
     ctx.quality_caps.push(stepLabel)
     const capMsg = '#' + ctx.issue + ': quality gate capped at ' + MAX_QUALITY_ITERATIONS + ' iterations without a clean review (' + ctx.quality_caps.join(', ') + ')'
@@ -3579,6 +3629,7 @@ async function runTestLoop(ctx, forced) {
       'After committing, post an issue comment "## Test Quality Fix (iteration ' + iter + ')" with the commit SHA and',
       'what was added/strengthened (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
       fixesAppliedIdAsk('[test-i1-2] added a missing edge-case test'),
+      vFindings !== null ? FINDING_HYPOTHESIS_ASK : '',
       COMMIT_SHA_ASK,
       HANDOFF_ASK,
       'Add missing assertions, remove TODOs, add edge-case tests, etc. Commit. Return status, commit, files_changed, fixes_applied, summary.',
@@ -3586,6 +3637,31 @@ async function runTestLoop(ctx, forced) {
     if (!qfix || qfix.status === 'error') return { ok: false, error: 'test-quality-fix stage failed — halting test loop' }
     collectNotes(ctx, 'test-quality-fix', qfix)
     collectPostedCommit(ctx, 'test-quality-fix-i' + iter, qfix)
+
+    // rebuttal-only exit (issue #167): mirrors runQualityLoop's rebuttalOnly
+    // block above, minus the recordGateOutcome/retypeGateDisposition calls —
+    // this loop books no gate key in ctx.gate_findings today (there is no
+    // 'test-quality' entry to retype) and this issue does not add one. Exits
+    // through this loop's OWN non-clean path (return { ok: true }, never
+    // { ok: false }) so nothing routes through the 'test-loop' stage key that
+    // a merge-block failure would use — a rebuttal-only round here can never
+    // block a merge, only get carried to the next reviewer as contested. No
+    // roll-up index needed (unlike the quality-cap/quality-rebuttal roll-ups
+    // above): runTestLoop runs once per issue, not once per task, so a single
+    // VERIFY_SKIPS.push() here can never produce more than one line.
+    const normRebuttals = normalizeRebuttals(qfix.rebutted, vFindings || [])
+    const rebuttalOnly = normRebuttals.length > 0 && (qfix.fixes_applied || []).length === 0 && (qfix.files_changed || []).length === 0
+    if (rebuttalOnly) {
+      if (!ctx.contested) ctx.contested = []
+      for (const r of normRebuttals) {
+        ctx.contested.push({ gate: 'test-quality', id: r.finding_id, summary: r.summary, evidence: r.evidence })
+      }
+      pushDecision(ctx, 'Gate: findings contested, none applied', 'Test quality fix (iteration ' + iter + ') rebutted every finding and applied no fix — carried as contested, not resolved.')
+      VERIFY_SKIPS.push('#' + ctx.issue + ': test quality fix (iteration ' + iter + ') rebutted every finding and applied no fix — carried as contested, not resolved, for human review')
+      ctx.metrics.rebuttal_only_rounds++
+      return { ok: true }
+    }
+
     tallyTouches(ctx, qfix.files_changed)
     ctx.metrics.test_quality_fix_rounds++
   }
