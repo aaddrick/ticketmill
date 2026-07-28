@@ -4927,6 +4927,10 @@ async function implementIssue(ctx) {
 async function reviewAndMerge(ctx) {
   let approved = false
   let haltReason = null
+  // rebuttalRoundsUsed (issue #167): per-reviewAndMerge-call counter permitting
+  // exactly ONE rebuttal-only pr-fix round before this gate stops giving a
+  // disputing fixer another iteration — see the rebuttalOnly block below.
+  let rebuttalRoundsUsed = 0
   for (let iter = 1; iter <= MAX_PR_REVIEW_ITERATIONS && !approved; iter++) {
     if (STOP.tripped) return fail(ctx, 'halted', 'pr-review', 'stopped: ' + STOP.reason)
     ctx.metrics.pr_review_iters = iter
@@ -5046,6 +5050,7 @@ async function reviewAndMerge(ctx) {
       'After pushing, post a PR comment "## PR Review Fix (iteration ' + iter + ')" with the commit SHA and the fixes',
       'applied in 2-4 lines (gh pr comment ' + ctx.pr + ' --repo ' + REPO + ').',
       fixesAppliedIdAsk('[code-i1-2] tightened the null guard'),
+      (specFindings !== null || codeFindings !== null) ? FINDING_HYPOTHESIS_ASK : '',
       COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
@@ -5056,6 +5061,58 @@ async function reviewAndMerge(ctx) {
     pushDecision(ctx, 'PR Review Fix (i' + iter + ')', fix.summary || 'fixes applied')
     collectNotes(ctx, 'pr-fix', fix)
     collectPostedCommit(ctx, 'pr-fix-i' + iter, fix)
+
+    // rebuttal-only exit (issue #167): mirrors runQualityLoop's/runTestLoop's
+    // rebuttalOnly block, evaluated over the UNION of both reviewers' rendered
+    // finding sets (the fixer saw both blocks in one prompt above) — see
+    // normalizeRebuttals' doc comment for why `findings` must be exactly what
+    // was rendered. Evaluated AFTER pushDecision/collectNotes/
+    // collectPostedCommit above (so the fixer's summary, handoff notes, and
+    // the posted-commit ledger all still see this round) but BEFORE
+    // tallyTouches/runQualityLoop below: tallyTouches is a verified no-op on a
+    // true rebuttal-only round's empty files_changed, but runQualityLoop is
+    // NOT — runSimplify fails open on an empty filesChanged array and would
+    // burn a full quality gate against an untouched tree, so `continue` MUST
+    // precede that call, not follow it.
+    //
+    // Unlike the quality/test loops, this gate does NOT push a second
+    // pushDecision here — the one above already fires for every non-error fix
+    // and renders the fixer's summary; a rebuttal-only round has nothing
+    // further to narrate that recordGateOutcome/retypeGateDisposition and the
+    // contested-block push below don't already carry into the next iteration.
+    //
+    // No id-equality halt: REVIEW_SCHEMA ids are `source + '-' + (i+1)` with
+    // the iteration baked into `source` (see spec/code review call sites
+    // above), so a second round's ids are disjoint from the first round's by
+    // construction — an id-equality check here would be permanently dead code.
+    // Instead, rebuttalRoundsUsed (declared above the loop) permits exactly
+    // ONE rebuttal-only round per reviewAndMerge() call: a second one sets
+    // haltReason and breaks into the existing `if (!approved)` needs_human
+    // path below, same shape as the bothNothingToFix/capReached breaks above.
+    const prFixFindings = (specFindings || []).concat(codeFindings || [])
+    const normRebuttals = normalizeRebuttals(fix.rebutted, prFixFindings)
+    const rebuttalOnly = normRebuttals.length > 0 && (fix.fixes_applied || []).length === 0 && (fix.files_changed || []).length === 0
+    if (rebuttalOnly) {
+      if (rebuttalRoundsUsed >= 1) {
+        haltReason = 'PR #' + ctx.pr + ' review iteration ' + iter + ': a second rebuttal-only PR fix round rebutted every finding and applied no fix — left open for human review'
+        break
+      }
+      rebuttalRoundsUsed++
+      retypeGateDisposition(ctx, 'pr-review', prReviewDisposition, 'carried-unresolved')
+      if (!ctx.contested) ctx.contested = []
+      for (const r of normRebuttals) {
+        ctx.contested.push({ gate: 'pr-review', id: r.finding_id, summary: r.summary, evidence: r.evidence })
+      }
+      ctx.metrics.rebuttal_only_rounds++
+      // A single un-rolled line: bounded at two per issue by construction
+      // (capReached breaks above the fix stage, and pr-fix only runs at
+      // iterations 1 and 2 of MAX_PR_REVIEW_ITERATIONS=3), so unlike the
+      // quality loop's rolled-up VERIFY_SKIPS index this never needs
+      // rewriting in place — it is never retracted.
+      VERIFY_SKIPS.push('#' + ctx.issue + ': PR review fix (iteration ' + iter + ') rebutted every finding and applied no fix — carried as contested, not resolved, for human review')
+      continue
+    }
+
     tallyTouches(ctx, fix.files_changed)
 
     const q = await runQualityLoop(ctx, 'pr-fix-i' + iter, 'post-review fixes for PR #' + ctx.pr, fix.files_changed)

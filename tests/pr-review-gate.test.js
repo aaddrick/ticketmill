@@ -447,3 +447,202 @@ test('reviewAndMerge(): a typed mixed-severity issues array makes gate_findings[
   assert.strictEqual(g.count, 3)
   assert.deepStrictEqual(JSON.parse(JSON.stringify(g.severity)), { critical: 1, major: 1, minor: 1 })
 })
+
+// ---- issue #167: the finding-hypothesis framing and the rebuttal-only exit
+// at the pr-review merge gate — the ONE evaluator-fed gate that CONTINUES
+// (rather than exiting the loop like quality/test) on a rebuttal-only round,
+// because pr-review is a multi-iteration loop with another reviewer pair
+// waiting downstream, not a terminal fix gate. ----
+
+const REBUTTAL_ONLY_FIX = {
+  status: 'success', commit: null, files_changed: [], fixes_applied: [], summary: 'disagree, guard already exists',
+  rebutted: [{ finding_id: 'code-i1-1', evidence: 'ran the reproducer at src/foo.js:12 — the guard already covers this input' }],
+}
+const CODE_FINDING = { result: 'changes_requested', comments: 'fix the guard', issues: [{ severity: 'major', summary: 'missing null check', recommendation: 'add a guard' }], recommended_fix_agent: null, summary: 'one issue' }
+
+test('reviewAndMerge(): a rebuttal-only pr-fix round at i1 continues into i2 (not needs_human), retypes the disposition to "carried-unresolved", records a contested entry, skips runQualityLoop, and a clean i2 approves and merges with the Verification Gaps line still present', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  installScriptedResponder(context, {
+    'spec-review-i1': APPROVED_REVIEW,
+    'code-review-i1': CODE_FINDING,
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
+    'pr-fix-i1': REBUTTAL_ONLY_FIX,
+    // simplify-pr-fix-i1-i1 / quality-review-pr-fix-i1-i1 deliberately
+    // unscripted below — proving runQualityLoop never runs on a rebuttal-only
+    // round (the `continue` must precede that call).
+    'spec-review-i2': APPROVED_REVIEW,
+    'code-review-i2': APPROVED_REVIEW,
+    'gate-state-pr-review-i2': GATE_STATE_POSTED,
+    'changed-files-probe': CHANGED_FILES_PROBE_OK,
+    merge: MERGE_OK,
+  })
+
+  const ctx = harness.makeCtx({ issue: 40, pr: 400 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'completed')
+  assert.strictEqual(ctx.metrics.pr_review_iters, 2)
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 1)
+
+  // Iteration 1 booked 're-litigated' (a real finding, cap not reached), then
+  // the rebuttal-only exit retypes that same bucket to 'carried-unresolved';
+  // iteration 2 books 'accepted'. Never a fresh double-booked entry.
+  const g = ctx.gate_findings['pr-review']
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(g.disposition)), { 'carried-unresolved': 1, accepted: 1 })
+
+  assert.strictEqual(ctx.contested.length, 1)
+  assert.strictEqual(ctx.contested[0].gate, 'pr-review')
+  assert.strictEqual(ctx.contested[0].id, 'code-i1-1')
+  assert.ok(ctx.contested[0].evidence.includes('ran the reproducer'))
+
+  // NO second pushDecision for the rebuttal-only round — the existing "PR
+  // Review Fix (i1)" decision (pushed for every non-error fix) already
+  // renders the fixer's summary.
+  assert.strictEqual(ctx.decisions.filter(function (d) { return d.entry.includes('PR Review Fix (i1)') }).length, 1)
+  assert.ok(!ctx.decisions.some(function (d) { return d.entry.includes('Gate: findings contested') }), 'pr-review must not push a second decision for a rebuttal-only round: ' + JSON.stringify(ctx.decisions))
+
+  const skips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.ok(skips.some(function (s) { return /PR review fix \(iteration 1\)/.test(s) }), 'expected a rebuttal-only VERIFY_SKIPS line: ' + JSON.stringify(skips))
+
+  const keys = context.agent.calls.map(stageKeyOf)
+  assert.deepStrictEqual(keys, [
+    'spec-review-i1', 'code-review-i1', 'gate-state-pr-review-i1', 'pr-fix-i1',
+    'spec-review-i2', 'code-review-i2', 'gate-state-pr-review-i2',
+    'changed-files-probe', 'merge',
+  ])
+  for (const shouldNotRun of ['simplify-pr-fix-i1-i1', 'quality-review-pr-fix-i1-i1']) {
+    assert.ok(!keys.includes(shouldNotRun), 'stage "' + shouldNotRun + '" must not run on a rebuttal-only round; ran: ' + keys.join(', '))
+  }
+
+  // The i2 reviewer prompts must carry the contested block so both i2
+  // reviewers see the disputed finding.
+  const spec2 = context.agent.calls.find(function (c) { return stageKeyOf(c) === 'spec-review-i2' })
+  const code2 = context.agent.calls.find(function (c) { return stageKeyOf(c) === 'code-review-i2' })
+  assert.ok(String(spec2.prompt).includes('Contested findings'), 'expected the contested block in the i2 spec-review prompt')
+  assert.ok(String(code2.prompt).includes('Contested findings'), 'expected the contested block in the i2 code-review prompt')
+
+  // The pr-fix-i1 prompt itself must carry FINDING_HYPOTHESIS_ASK, and NOT
+  // any gate-specific immediate-exit wording — the framing is deliberately
+  // gate-agnostic since pr-review, unlike quality/test, continues rather
+  // than exiting on a rebuttal-only round.
+  const fix1 = context.agent.calls.find(function (c) { return stageKeyOf(c) === 'pr-fix-i1' })
+  const fixPrompt = String(fix1.prompt)
+  assert.ok(fixPrompt.includes('HYPOTHESIS the reviewer formed'), 'expected FINDING_HYPOTHESIS_ASK in the pr-fix prompt')
+  assert.ok(!fixPrompt.includes('ends this gate immediately'), 'the framing must stay gate-agnostic (no immediate-exit wording): ' + fixPrompt.slice(0, 2000))
+  assert.ok(!fixPrompt.includes('no further fix round'), 'the framing must stay gate-agnostic (no immediate-exit wording): ' + fixPrompt.slice(0, 2000))
+})
+
+test('reviewAndMerge(): a second rebuttal-only pr-fix round halts needs_human with the PR left open — only ONE rebuttal-only round is permitted per issue', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  function rebuttalFix(id) {
+    return {
+      status: 'success', commit: null, files_changed: [], fixes_applied: [], summary: 'disagree again',
+      rebutted: [{ finding_id: id, evidence: 'ran the reproducer, guard already covers this input' }],
+    }
+  }
+
+  installScriptedResponder(context, {
+    'spec-review-i1': APPROVED_REVIEW,
+    'code-review-i1': CODE_FINDING,
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
+    'pr-fix-i1': rebuttalFix('code-i1-1'),
+    'spec-review-i2': APPROVED_REVIEW,
+    'code-review-i2': CODE_FINDING,
+    'gate-state-pr-review-i2': GATE_STATE_POSTED,
+    'pr-fix-i2': rebuttalFix('code-i2-1'),
+    // spec-review-i3/code-review-i3/merge deliberately unscripted below —
+    // proving the halt happens without a third review iteration or a merge.
+  })
+
+  const ctx = harness.makeCtx({ issue: 41, pr: 410 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'needs_human')
+  assert.strictEqual(result.stage, 'pr-review')
+  assert.match(result.error || '', /second rebuttal-only/)
+  assert.strictEqual(ctx.metrics.pr_review_iters, 2)
+  // Only the FIRST rebuttal-only round counts — the second is a halt, not a
+  // recorded round.
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 1)
+
+  const keys = context.agent.calls.map(stageKeyOf)
+  assert.deepStrictEqual(keys, [
+    'spec-review-i1', 'code-review-i1', 'gate-state-pr-review-i1', 'pr-fix-i1',
+    'spec-review-i2', 'code-review-i2', 'gate-state-pr-review-i2', 'pr-fix-i2',
+    'halt-note-pr-review',
+  ])
+  assert.ok(!keys.includes('merge'), 'merge must never run — the PR is left open; ran: ' + keys.join(', '))
+})
+
+test('reviewAndMerge(): FINDING_HYPOTHESIS_ASK renders in the pr-fix prompt when only ONE reviewer returned structured findings (the other approved via prose, `issues` omitted)', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  const SPEC_FINDING = { result: 'changes_requested', comments: 'goal not fully met', issues: [{ severity: 'major', summary: 'missing acceptance criterion', recommendation: 'implement it' }], recommended_fix_agent: null, summary: 'one spec finding' }
+  // `issues` deliberately omitted (not `[]`) — codeFindings normalizes to
+  // null, isolating the `specFindings !== null || codeFindings !== null` OR.
+  const CODE_APPROVED_NO_ISSUES_KEY = { result: 'approved', comments: '', recommended_fix_agent: null, summary: 'looks fine' }
+
+  installScriptedResponder(context, {
+    'spec-review-i1': SPEC_FINDING,
+    'code-review-i1': CODE_APPROVED_NO_ISSUES_KEY,
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
+    'pr-fix-i1': FIX_OK,
+    'simplify-pr-fix-i1-i1': SIMPLIFY_OK,
+    'quality-review-pr-fix-i1-i1': QUALITY_REVIEW_APPROVED,
+    'spec-review-i2': APPROVED_REVIEW,
+    'code-review-i2': APPROVED_REVIEW,
+    'gate-state-pr-review-i2': GATE_STATE_POSTED,
+    'commit-sha-probe': COMMIT_PROBE_OK,
+    'changed-files-probe': CHANGED_FILES_PROBE_OK,
+    merge: MERGE_OK,
+  })
+
+  const ctx = harness.makeCtx({ issue: 42, pr: 420 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'completed')
+  const fixCall = context.agent.calls.find(function (c) { return stageKeyOf(c) === 'pr-fix-i1' })
+  assert.ok(fixCall, 'pr-fix-i1 must have run')
+  assert.ok(String(fixCall.prompt).includes('HYPOTHESIS the reviewer formed'), 'expected FINDING_HYPOTHESIS_ASK to render when even one reviewer returned structured findings: ' + String(fixCall.prompt).slice(0, 2000))
+})
+
+test('reviewAndMerge(): a pr-fix response that omits `rebutted` entirely never triggers the rebuttal-only exit, even with empty fixes_applied/files_changed — byte-identical to pre-#167 behavior', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  // No `rebutted` key at all — mirrors every fixer response before issue #167.
+  const NO_REBUTTED_FIX = { status: 'success', commit: 'deadbeef', files_changed: [], fixes_applied: [], summary: 'looked into it, nothing needed changing' }
+
+  installScriptedResponder(context, {
+    'spec-review-i1': APPROVED_REVIEW,
+    'code-review-i1': CODE_FINDING,
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
+    'pr-fix-i1': NO_REBUTTED_FIX,
+    'simplify-pr-fix-i1-i1': SIMPLIFY_OK,
+    'quality-review-pr-fix-i1-i1': QUALITY_REVIEW_APPROVED,
+    'commit-sha-probe': COMMIT_PROBE_OK,
+    'spec-review-i2': APPROVED_REVIEW,
+    'code-review-i2': APPROVED_REVIEW,
+    'gate-state-pr-review-i2': GATE_STATE_POSTED,
+    'changed-files-probe': CHANGED_FILES_PROBE_OK,
+    merge: MERGE_OK,
+  })
+
+  const ctx = harness.makeCtx({ issue: 43, pr: 430 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'completed')
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 0)
+  assert.ok(!ctx.contested || ctx.contested.length === 0)
+
+  // runQualityLoop DID run — proves the loop fell through to the normal path,
+  // not the rebuttal-only `continue` branch.
+  const keys = context.agent.calls.map(stageKeyOf)
+  assert.ok(keys.includes('simplify-pr-fix-i1-i1'), 'runQualityLoop must run when `rebutted` is omitted; ran: ' + keys.join(', '))
+  assert.ok(keys.includes('quality-review-pr-fix-i1-i1'), 'runQualityLoop must run when `rebutted` is omitted; ran: ' + keys.join(', '))
+})
