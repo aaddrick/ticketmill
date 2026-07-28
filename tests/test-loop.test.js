@@ -120,3 +120,103 @@ test('runTestLoop: ctx.metrics.test_quality_fix_rounds increments once per test-
   // read 2, proving both counters actually advanced together, not just one.
   assert.strictEqual(ctx.touch_counts['tests/foo.test.js'], 2)
 })
+
+// ---- issue #162: a present-and-empty `issues` array is treated as nothing-to-fix ----
+
+test('runTestLoop: a changes_requested test-validate with issues: [] is treated as clean — no test-quality-fix stage runs, ok:true, findings_empty_exits increments', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {}, TEST_CMD: 'npm test' })
+
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':test-run-') !== -1) return { result: 'passed', summary: 'all green', total_tests: 3, passed_tests: 3, failed_tests: 0, failures: [] }
+    if (label.indexOf(':test-validate-') !== -1) return { result: 'changes_requested', comments: 'nothing actionable', issues: [], summary: 'nothing to fix' }
+    // test-quality-fix must never be reached on this leg — a live throw here
+    // (not a returned null/error) proves the loop itself never asked for it.
+    throw new Error('test-quality-fix must not run when issues is a present, empty array: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 46 })
+  const result = await context.runTestLoop(ctx)
+
+  assert.strictEqual(result.ok, true)
+  assert.strictEqual(ctx.metrics.findings_empty_exits, 1)
+  const stageKeys = scriptedAgent.calls.map(function (c) { return (c.opts && c.opts.label) || '' })
+  assert.ok(!stageKeys.some(function (k) { return k.indexOf(':test-quality-fix-') !== -1 }), 'test-quality-fix stage key must be absent from recorded stage keys: ' + JSON.stringify(stageKeys))
+
+  // This exit converts a changes_requested verdict to a clean pass with no fix
+  // stage — it must surface in the batch PR's Verification Gaps, not just the
+  // run-record metrics counter above.
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 1)
+  assert.ok(verifySkips[0].includes('#46: test validation'))
+})
+
+// ---- MIRROR IMAGE (issue #162): `issues` omitted entirely must NOT be treated as empty ----
+//
+// Every scripted reviewer in the pre-#162 suite supplies `issues` explicitly. This
+// is the one scenario that catches the plausible call-site slip
+// `normalizeFindings(v.issues || [], source)`, which would collapse an omitted
+// key into an empty array and silently disable the fix loop while passing every
+// other test (including the unit-level normalizeFindings(undefined) -> null test).
+
+test('runTestLoop: MIRROR IMAGE — a changes_requested test-validate that OMITS `issues` entirely still runs the test-quality-fix stage exactly as on main, and findings_empty_exits stays 0', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {}, TEST_CMD: 'npm test' })
+
+  let validateCalls = 0
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':test-run-') !== -1) return { result: 'passed', summary: 'all green', total_tests: 3, passed_tests: 3, failed_tests: 0, failures: [] }
+    if (label.indexOf(':test-validate-') !== -1) {
+      validateCalls++
+      if (validateCalls === 1) {
+        // `issues` deliberately OMITTED from this response object — not [], not ['x'].
+        return { result: 'changes_requested', comments: 'hollow assertion', summary: 'needs work' }
+      }
+      return { result: 'approved', comments: '', issues: [], summary: 'covered now' }
+    }
+    if (label.indexOf(':test-quality-fix-') !== -1) return { status: 'success', summary: 'strengthened tests', commit: 'deadbeef', files_changed: ['tests/foo.test.js'] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 47 })
+  const result = await context.runTestLoop(ctx)
+
+  assert.strictEqual(result.ok, true)
+  assert.strictEqual(ctx.metrics.findings_empty_exits, 0)
+  const stageKeys = scriptedAgent.calls.map(function (c) { return (c.opts && c.opts.label) || '' })
+  assert.ok(stageKeys.some(function (k) { return k.indexOf(':test-quality-fix-i1') !== -1 }), 'test-quality-fix stage must run when `issues` is omitted (degrade to the prose path), not be treated as empty: ' + JSON.stringify(stageKeys))
+
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 0)
+})
+
+// ---- regression: the pre-#162 issues: ['x'] fixtures still trigger test-quality-fix,
+// and the fix prompt now carries the rendered, id-prefixed finding line ----
+
+test('runTestLoop: an existing issues: ["x"] fixture still runs test-quality-fix, and the fix prompt renders the id-prefixed finding line', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {}, TEST_CMD: 'npm test' })
+
+  let validateCalls = 0
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':test-run-') !== -1) return { result: 'passed', summary: 'all green', total_tests: 3, passed_tests: 3, failed_tests: 0, failures: [] }
+    if (label.indexOf(':test-validate-') !== -1) {
+      validateCalls++
+      if (validateCalls === 1) return { result: 'changes_requested', comments: 'hollow assertion', issues: ['x'], summary: 'needs work' }
+      return { result: 'approved', comments: '', issues: [], summary: 'covered now' }
+    }
+    if (label.indexOf(':test-quality-fix-') !== -1) return { status: 'success', summary: 'strengthened tests', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 48 })
+  const result = await context.runTestLoop(ctx)
+
+  assert.strictEqual(result.ok, true)
+  const fixCall = scriptedAgent.calls.find(function (c) { return ((c.opts && c.opts.label) || '').indexOf(':test-quality-fix-') !== -1 })
+  assert.ok(fixCall, 'test-quality-fix stage must have run for an issues: ["x"] fixture')
+  assert.ok(/- \[test-i1-1\] \[unspecified\] x -> /.test(fixCall.prompt), 'fix prompt must render the id-prefixed finding line: ' + fixCall.prompt.slice(0, 2000))
+})

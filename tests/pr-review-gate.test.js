@@ -66,6 +66,7 @@ const MERGE_OK = { status: 'merged', follow_up_issues: [], error: null }
 const FIX_OK = { status: 'success', commit: 'deadbeef', files_changed: [], fixes_applied: ['addressed review feedback'], summary: 'fixed', error: null }
 const SIMPLIFY_OK = { status: 'success', commit: null, files_changed: [], summary: 'nothing to simplify' }
 const QUALITY_REVIEW_APPROVED = { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'clean' }
+const GATE_STATE_POSTED = { posted: true }
 
 test('reviewAndMerge(): a clean pr-review approval on iteration 1 records an "accepted" disposition in ctx.gate_findings["pr-review"], tallying both reviewers\' issues', async function () {
   const context = harness.boot()
@@ -76,6 +77,7 @@ test('reviewAndMerge(): a clean pr-review approval on iteration 1 records an "ac
     // 'approved' can still carry nit-level issues — the disposition is driven
     // by .result alone, not by issues being empty.
     'code-review-i1': Object.assign({}, APPROVED_REVIEW, { issues: [{ severity: 'minor', summary: 'nit: naming' }] }),
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
     'changed-files-probe': CHANGED_FILES_PROBE_OK,
     merge: MERGE_OK,
   })
@@ -105,12 +107,14 @@ test('reviewAndMerge(): a changes-requested iteration followed by a clean approv
     // ---- iteration 1: code review requests changes (spec is fine) ----
     'spec-review-i1': APPROVED_REVIEW,
     'code-review-i1': { result: 'changes_requested', comments: 'tighten error handling', issues: [{ severity: 'major', summary: 'unhandled rejection' }], recommended_fix_agent: null, summary: 'needs a fix' },
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
     'pr-fix-i1': FIX_OK,
     'simplify-pr-fix-i1-i1': SIMPLIFY_OK,
     'quality-review-pr-fix-i1-i1': QUALITY_REVIEW_APPROVED,
     // ---- iteration 2: both approve ----
     'spec-review-i2': APPROVED_REVIEW,
     'code-review-i2': APPROVED_REVIEW,
+    'gate-state-pr-review-i2': GATE_STATE_POSTED,
     // pr-fix-i1 (FIX_OK) posted a commit, so reviewAndMerge()'s commit-sha
     // probe (issue #79, Layer 2) dispatches once for the whole issue, before
     // changed-files-probe — see the probeCommitShas() call site.
@@ -131,10 +135,13 @@ test('reviewAndMerge(): a changes-requested iteration followed by a clean approv
   // Accumulated, not overwritten: one 're-litigated' (iter 1) + one 'accepted' (iter 2).
   assert.deepStrictEqual(JSON.parse(JSON.stringify(g.disposition)), { 're-litigated': 1, accepted: 1 })
 
+  // One gate-state stage per pr-review iteration (issue #166 task 2), posted
+  // right after each iteration's recordGateOutcome — in this scenario that's
+  // exactly two: 'gate-state-pr-review-i1' then 'gate-state-pr-review-i2'.
   const keys = context.agent.calls.map(stageKeyOf)
   assert.deepStrictEqual(keys, [
-    'spec-review-i1', 'code-review-i1', 'pr-fix-i1', 'simplify-pr-fix-i1-i1', 'quality-review-pr-fix-i1-i1',
-    'spec-review-i2', 'code-review-i2', 'commit-sha-probe', 'changed-files-probe', 'merge',
+    'spec-review-i1', 'code-review-i1', 'gate-state-pr-review-i1', 'pr-fix-i1', 'simplify-pr-fix-i1-i1', 'quality-review-pr-fix-i1-i1',
+    'spec-review-i2', 'code-review-i2', 'gate-state-pr-review-i2', 'commit-sha-probe', 'changed-files-probe', 'merge',
   ])
 })
 
@@ -147,20 +154,24 @@ test('reviewAndMerge(): exhausting MAX_PR_REVIEW_ITERATIONS without approval rec
   installScriptedResponder(context, {
     'spec-review-i1': APPROVED_REVIEW,
     'code-review-i1': CHANGES_REQUESTED,
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
     'pr-fix-i1': FIX_OK,
     'simplify-pr-fix-i1-i1': SIMPLIFY_OK,
     'quality-review-pr-fix-i1-i1': QUALITY_REVIEW_APPROVED,
     'spec-review-i2': APPROVED_REVIEW,
     'code-review-i2': CHANGES_REQUESTED,
+    'gate-state-pr-review-i2': GATE_STATE_POSTED,
     'pr-fix-i2': FIX_OK,
     'simplify-pr-fix-i2-i1': SIMPLIFY_OK,
     'quality-review-pr-fix-i2-i1': QUALITY_REVIEW_APPROVED,
-    // Final iteration: the loop records the outcome and breaks WITHOUT running
-    // a pr-fix/quality-loop stage (see reviewAndMerge()'s
-    // `if (iter === MAX_PR_REVIEW_ITERATIONS) break` right after
-    // recordGateOutcome) — deliberately left unscripted below to prove that.
+    // Final iteration: the loop records the outcome (and its gate-state post)
+    // and breaks WITHOUT running a pr-fix/quality-loop stage (see
+    // reviewAndMerge()'s `if (capReached) break` right after
+    // recordGateOutcome/postGateState) — pr-fix-i3 etc. are deliberately left
+    // unscripted below to prove that.
     'spec-review-i3': APPROVED_REVIEW,
     'code-review-i3': CHANGES_REQUESTED,
+    'gate-state-pr-review-i3': GATE_STATE_POSTED,
   })
 
   const ctx = harness.makeCtx({ issue: 32, pr: 320 })
@@ -186,4 +197,253 @@ test('reviewAndMerge(): exhausting MAX_PR_REVIEW_ITERATIONS without approval rec
   for (const shouldNotRun of ['pr-fix-i3', 'simplify-pr-fix-i3-i1', 'quality-review-pr-fix-i3-i1', 'changed-files-probe', 'merge']) {
     assert.ok(!keys.includes(shouldNotRun), 'stage "' + shouldNotRun + '" must not run once the review cap is exhausted; ran: ' + keys.join(', '))
   }
+})
+
+// ---- issue #162 task 2: the "both reviewers have nothing to fix, but that
+// isn't prReviewClean" early exit (nothingToFix, bothNothingToFix) ----
+
+test('reviewAndMerge(): both reviewers changes_requested with issues:[] breaks early as "carried-unresolved" without ever running pr-fix or merge', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  const EMPTY_CHANGES_REQUESTED = { result: 'changes_requested', comments: 'not quite right, but nothing concrete to name', issues: [], recommended_fix_agent: null, summary: 'needs work, no specifics' }
+
+  installScriptedResponder(context, {
+    'spec-review-i1': EMPTY_CHANGES_REQUESTED,
+    'code-review-i1': EMPTY_CHANGES_REQUESTED,
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
+    // pr-fix-i1/merge deliberately unscripted below — proving neither runs.
+  })
+
+  const ctx = harness.makeCtx({ issue: 33, pr: 330 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'needs_human')
+  assert.strictEqual(result.stage, 'pr-review')
+  assert.strictEqual(ctx.metrics.pr_review_iters, 1)
+  assert.strictEqual(ctx.metrics.findings_empty_exits, 1)
+
+  const g = ctx.gate_findings['pr-review']
+  assert.strictEqual(g.count, 0)
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(g.disposition)), { 'carried-unresolved': 1 })
+
+  // The gate-state post runs INSIDE the loop, right after recordGateOutcome —
+  // before the bothNothingToFix early break — so it fires here too, even
+  // though pr-fix/merge never run. fail() posts a best-effort halt note
+  // (halt-note-pr-review) after that.
+  const keys = context.agent.calls.map(stageKeyOf)
+  assert.deepStrictEqual(keys, ['spec-review-i1', 'code-review-i1', 'gate-state-pr-review-i1', 'halt-note-pr-review'])
+  for (const shouldNotRun of ['pr-fix-i1', 'merge']) {
+    assert.ok(!keys.includes(shouldNotRun), 'stage "' + shouldNotRun + '" must not run; ran: ' + keys.join(', '))
+  }
+})
+
+// nothingToFix(r, f) = r.result === 'approved' || (f !== null && f.length === 0)
+// — the doc comment above it is explicit that an approval counts as
+// nothing-to-fix "regardless of what issues carries alongside an approval".
+// Every OTHER fixture in this file with an approved reviewer also happens to
+// carry issues: [], which independently satisfies the function's second
+// branch, so none of them can isolate the `r.result === 'approved' ||` half
+// of the OR: deleting it would not change their outcome. This scenario gives
+// the approved reviewer a NON-EMPTY issues array (a nit alongside the
+// approval) specifically so only the 'approved' branch can explain
+// nothingToFix returning true for it — a mutant deleting that branch would
+// flip bothNothingToFix to false here and send the loop into pr-fix instead
+// of halting early.
+test('reviewAndMerge(): spec approved-with-a-nit + code changes_requested-with-issues:[] still breaks early as "carried-unresolved" (isolates the approved branch of nothingToFix from the empty-array branch)', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  const APPROVED_WITH_NIT = Object.assign({}, APPROVED_REVIEW, { issues: [{ severity: 'minor', summary: 'nit: naming' }] })
+  const EMPTY_CHANGES_REQUESTED = { result: 'changes_requested', comments: 'not quite right, but nothing concrete to name', issues: [], recommended_fix_agent: null, summary: 'needs work, no specifics' }
+
+  installScriptedResponder(context, {
+    'spec-review-i1': APPROVED_WITH_NIT,
+    'code-review-i1': EMPTY_CHANGES_REQUESTED,
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
+    // pr-fix-i1/merge deliberately unscripted below — proving neither runs.
+  })
+
+  const ctx = harness.makeCtx({ issue: 39, pr: 390 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'needs_human')
+  assert.strictEqual(result.stage, 'pr-review')
+  assert.strictEqual(ctx.metrics.pr_review_iters, 1)
+  assert.strictEqual(ctx.metrics.findings_empty_exits, 1)
+
+  const g = ctx.gate_findings['pr-review']
+  // The spec reviewer's nit still tallies (recordGateOutcome runs regardless
+  // of disposition) — only the DISPOSITION is under test here.
+  assert.strictEqual(g.count, 1)
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(g.disposition)), { 'carried-unresolved': 1 })
+
+  const keys = context.agent.calls.map(stageKeyOf)
+  assert.deepStrictEqual(keys, ['spec-review-i1', 'code-review-i1', 'gate-state-pr-review-i1', 'halt-note-pr-review'])
+  for (const shouldNotRun of ['pr-fix-i1', 'merge']) {
+    assert.ok(!keys.includes(shouldNotRun), 'stage "' + shouldNotRun + '" must not run; ran: ' + keys.join(', '))
+  }
+})
+
+test('reviewAndMerge(): one reviewer with issues:[] and the other with real findings still runs pr-fix-i1, carrying both the rendered finding and the empty reviewer\'s explicit no-findings line plus prose', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  const EMPTY_CHANGES_REQUESTED = { result: 'changes_requested', comments: 'vague unease, nothing concrete', issues: [], recommended_fix_agent: null, summary: 'needs work, no specifics' }
+  const CONCRETE_FINDING = { result: 'changes_requested', comments: 'see the finding below', issues: [{ severity: 'major', summary: 'unhandled null path', recommendation: 'add a guard' }], recommended_fix_agent: null, summary: 'one concrete issue' }
+
+  installScriptedResponder(context, {
+    'spec-review-i1': EMPTY_CHANGES_REQUESTED,
+    'code-review-i1': CONCRETE_FINDING,
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
+    'pr-fix-i1': FIX_OK,
+    'simplify-pr-fix-i1-i1': SIMPLIFY_OK,
+    'quality-review-pr-fix-i1-i1': QUALITY_REVIEW_APPROVED,
+    'spec-review-i2': APPROVED_REVIEW,
+    'code-review-i2': APPROVED_REVIEW,
+    'gate-state-pr-review-i2': GATE_STATE_POSTED,
+    'commit-sha-probe': COMMIT_PROBE_OK,
+    'changed-files-probe': CHANGED_FILES_PROBE_OK,
+    merge: MERGE_OK,
+  })
+
+  const ctx = harness.makeCtx({ issue: 34, pr: 340 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'completed')
+  // bothNothingToFix must be false (spec had nothing, code had a real finding),
+  // so the loop fell through to the fix stage, not the early carried-unresolved exit.
+  assert.strictEqual(ctx.metrics.findings_empty_exits, 0)
+
+  const prFixCall = context.agent.calls.find(function (c) { return stageKeyOf(c) === 'pr-fix-i1' })
+  assert.ok(prFixCall, 'pr-fix-i1 must have run')
+  const prompt = String(prFixCall.prompt)
+  // The code reviewer's real finding is rendered as a work-list line (id + severity + summary).
+  assert.ok(/\[code-i1-1\] \[major\] unhandled null path -> add a guard/.test(prompt), 'expected the rendered code-review finding line in the pr-fix prompt:\n' + prompt)
+  // The spec reviewer's empty findings array still renders its explicit no-findings line...
+  assert.ok(prompt.includes('(reviewer named no structured findings)'), 'expected the empty-reviewer no-findings line in the pr-fix prompt')
+  // ...and its prose comment stays present underneath, as context.
+  assert.ok(prompt.includes('vague unease, nothing concrete'), 'expected the empty reviewer\'s prose comment preserved as context in the pr-fix prompt')
+})
+
+test('reviewAndMerge(): both reviewers changes_requested with `issues` omitted entirely still runs pr-fix-i1 (prose-only fallback), not the empty-findings exit', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  // `issues` is deliberately absent from these objects (not `[]`) — the third
+  // leg of the null-versus-empty pin: normalizeFindings(undefined, ...) must
+  // return null, not [], so nothingToFix treats an omitted key as NOT
+  // "nothing to fix" (prose-only changes_requested still routes to a fix).
+  const OMITTED_ISSUES = { result: 'changes_requested', comments: 'please revisit the error handling', recommended_fix_agent: null, summary: 'needs work' }
+
+  installScriptedResponder(context, {
+    'spec-review-i1': OMITTED_ISSUES,
+    'code-review-i1': OMITTED_ISSUES,
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
+    'pr-fix-i1': FIX_OK,
+    'simplify-pr-fix-i1-i1': SIMPLIFY_OK,
+    'quality-review-pr-fix-i1-i1': QUALITY_REVIEW_APPROVED,
+    'spec-review-i2': APPROVED_REVIEW,
+    'code-review-i2': APPROVED_REVIEW,
+    'gate-state-pr-review-i2': GATE_STATE_POSTED,
+    'commit-sha-probe': COMMIT_PROBE_OK,
+    'changed-files-probe': CHANGED_FILES_PROBE_OK,
+    merge: MERGE_OK,
+  })
+
+  const ctx = harness.makeCtx({ issue: 35, pr: 350 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'completed')
+  assert.strictEqual(ctx.metrics.findings_empty_exits, 0)
+
+  const keys = context.agent.calls.map(stageKeyOf)
+  assert.ok(keys.includes('pr-fix-i1'), 'pr-fix-i1 must run for an omitted-issues prose-only changes_requested; ran: ' + keys.join(', '))
+  assert.ok(keys.includes('merge'), 'merge must eventually run; ran: ' + keys.join(', '))
+
+  const prFixCall = context.agent.calls.find(function (c) { return stageKeyOf(c) === 'pr-fix-i1' })
+  // findingsBlock's null branch: byte-identical to the pre-#162 prose-only prompt.
+  assert.ok(String(prFixCall.prompt).includes('please revisit the error handling'), 'expected the omitted-issues reviewer\'s prose to flow through byte-identically')
+})
+
+// ---- issue #162 task 2: a dead reviewer at REVIEW_SCHEMA's tightened call site ----
+
+test('reviewAndMerge(): a null spec reviewer fails needs_human at stage "pr-review" without ever running merge', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  installScriptedResponder(context, {
+    'spec-review-i1': null,
+    'code-review-i1': APPROVED_REVIEW,
+    'gate-state-pr-review-i1-aborted': GATE_STATE_POSTED,
+  })
+
+  const ctx = harness.makeCtx({ issue: 36, pr: 360 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'needs_human')
+  assert.strictEqual(result.stage, 'pr-review')
+  const keys = context.agent.calls.map(stageKeyOf)
+  assert.ok(!keys.includes('merge'), 'merge must never run when the spec reviewer died; ran: ' + keys.join(', '))
+  // A dead reviewer is exactly the "aborted" gate-state boundary (issue #166
+  // task 2, site 4) — this is the resume-covering post, distinct from the
+  // in-loop 'gate-state-pr-review-i1' post that only fires after a clean
+  // spec+code pair.
+  assert.ok(keys.includes('gate-state-pr-review-i1-aborted'), 'expected the aborted gate-state boundary to post; ran: ' + keys.join(', '))
+  assert.ok(!keys.includes('gate-state-pr-review-i1'), 'the non-aborted in-loop boundary must not also fire; ran: ' + keys.join(', '))
+})
+
+test('reviewAndMerge(): a null code reviewer fails needs_human at stage "pr-review" without ever running merge', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  installScriptedResponder(context, {
+    'spec-review-i1': APPROVED_REVIEW,
+    'code-review-i1': null,
+    'gate-state-pr-review-i1-aborted': GATE_STATE_POSTED,
+  })
+
+  const ctx = harness.makeCtx({ issue: 37, pr: 370 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'needs_human')
+  assert.strictEqual(result.stage, 'pr-review')
+  const keys = context.agent.calls.map(stageKeyOf)
+  assert.ok(!keys.includes('merge'), 'merge must never run when the code reviewer died; ran: ' + keys.join(', '))
+  assert.ok(keys.includes('gate-state-pr-review-i1-aborted'), 'expected the aborted gate-state boundary to post; ran: ' + keys.join(', '))
+})
+
+// ---- issue #162 task 2: severity is no longer permanently zero ----
+
+test('reviewAndMerge(): a typed mixed-severity issues array makes gate_findings["pr-review"].severity report real, non-zero counts', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  installScriptedResponder(context, {
+    'spec-review-i1': { result: 'changes_requested', comments: '', issues: [
+      { severity: 'critical', summary: 'auth bypass' },
+      { severity: 'minor', summary: 'typo in error message' },
+    ], recommended_fix_agent: null, summary: 'two spec findings' },
+    'code-review-i1': { result: 'changes_requested', comments: '', issues: [
+      { severity: 'major', summary: 'missing input validation', recommendation: 'validate before use' },
+    ], recommended_fix_agent: null, summary: 'one code finding' },
+    'gate-state-pr-review-i1': GATE_STATE_POSTED,
+    'pr-fix-i1': FIX_OK,
+    'simplify-pr-fix-i1-i1': SIMPLIFY_OK,
+    'quality-review-pr-fix-i1-i1': QUALITY_REVIEW_APPROVED,
+    'spec-review-i2': APPROVED_REVIEW,
+    'code-review-i2': APPROVED_REVIEW,
+    'gate-state-pr-review-i2': GATE_STATE_POSTED,
+    'commit-sha-probe': COMMIT_PROBE_OK,
+    'changed-files-probe': CHANGED_FILES_PROBE_OK,
+    merge: MERGE_OK,
+  })
+
+  const ctx = harness.makeCtx({ issue: 38, pr: 380 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'completed')
+  const g = ctx.gate_findings['pr-review']
+  assert.strictEqual(g.count, 3)
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(g.severity)), { critical: 1, major: 1, minor: 1 })
 })

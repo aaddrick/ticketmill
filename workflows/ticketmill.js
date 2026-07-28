@@ -318,6 +318,12 @@ const MAX_TOUCH_FILES = 100
 // comment already sets for gating efficiency metrics; not a correctness input,
 // only a display/trust-flag threshold.
 const MAX_RECONCILE_ERROR_FOR_TRUST = 0.05
+// gate-state read (issue #166 task 3): fetchGateStateBlocks issues ONE agent
+// call per chunk of at most this many issues (belt-and-braces — a dead chunk's
+// agent call only takes its own chunk's issues down with it; surviving chunks
+// still report). Not a correctness input: the per-issue jq command inside a
+// chunk is fully independent of every other issue in it.
+const MAX_GATE_STATE_PROBE_CHUNK = 5
 // churn analytics (issue #89): a file appearing in >= this many DISTINCT
 // issues' ctx.changed_files within one run is a cross-issue hotspot (computeChurn) —
 // 2 is the smallest number that actually means "more than one issue collided on
@@ -408,6 +414,27 @@ let VERIFY_SKIPS = []           // human-visible verification gaps -> batch PR b
 // PROFILE.engine_owned_globs, and PROFILE.lockstep_installed_paths respectively.
 let ENGINE_OWNED = []
 let LOCKSTEP_INSTALLED_PATHS = []
+// RUN_EPOCH (issue #166): populated at Select from a probe-returned `date -u`
+// string via the pure deriveRunEpoch/toEpochMs (below the TICKETMILL-TEST-
+// HARNESS-SPLIT marker) -- the sandbox has no Date.now()/argless `new Date()`,
+// so this is the run's only wall-clock anchor. null until Select assigns it;
+// selectGateState treats a null run epoch as unknown age, which reads as
+// stale, never as fresh (see gateStateEpochStale).
+let RUN_EPOCH = null
+// GATE_STATE_WRITE_SEQ (issue #166 PR #177 review): a per-run, module-level
+// monotonic write counter -- NOT a clock and NOT Date.now()/Math.random() (a
+// plain incrementing int is deterministic across a resume/replay the same way
+// every other module-level counter in this file is). RUN_EPOCH is assigned
+// ONCE at Select and is therefore IDENTICAL across every boundary a run
+// posts, so it cannot order two same-run writes against each other --
+// diffGateStateIntent's 'superseded' verdict needs something that varies
+// write to write. postGateState() increments this once per call and embeds
+// it on the payload as `write_seq`; call order is write order, since a given
+// issue's boundaries always post sequentially within that issue's own await
+// chain. Never reset mid-run. diffGateStateIntent still gates supersession on
+// `intent.run === actual.run` first, since two payloads from different runs
+// never share counter provenance.
+let GATE_STATE_WRITE_SEQ = 0
 
 function stageOpts(key) {
   const base = M[key] || { model: 'sonnet' }
@@ -507,6 +534,20 @@ const PREFLIGHT_SCHEMA = {
     // and deriveUnits() for how they're threaded onto the unit shape.
     predicted_files: { type: 'array', items: { type: 'string' } },
     depends_on: { type: 'array', items: { type: 'integer' } },
+    // OPTIONAL gate-state read (issue #166, Task 3's fetchGateStateBlocks probe):
+    // fail-open the same way predicted_files/depends_on do -- attachGateStateBlocks
+    // (below the TICKETMILL-TEST-HARNESS-SPLIT marker) normalizes a preflight
+    // missing any of these four to their fail-open default so selectGateState never
+    // sees an undefined key. gate_state_blocks carries raw verbatim comment bodies
+    // (most recent last); gate_state_read_ok is whether the probe's gh call exited
+    // 0; gate_state_total_comments is the issue's gate-state comment count (the
+    // SAME title-gated filter `gate_state_blocks` uses, never every comment on
+    // the issue -- feeds the falsifiable-absent cross-check); gate_state_trust is set at Select from the
+    // probe's self_login, never by the agent itself.
+    gate_state_blocks: { type: 'array', items: { type: 'string' } },
+    gate_state_read_ok: { type: 'boolean' },
+    gate_state_total_comments: { type: 'integer' },
+    gate_state_trust: { type: 'string' },
   },
 }
 const SETUP_SCHEMA = {
@@ -592,11 +633,17 @@ const CHALLENGE_SCHEMA = {
   // Only verdict+summary are hard-required: opus challengers demonstrably drop the
   // findings array under long output, and control flow stays correct without it
   // (missing findings => 0 critical/major).
+  // recommendation joined findings.items' optional set in #164: requiring a fix
+  // proposal is prompt elaboration of the finding shape, not a control-flow need,
+  // and a published measurement tied that elaboration to rejecting correct code
+  // 26.2% -> 73.2% of the time. A required proposal also makes a finding cheaper
+  // to emit than to withhold, fighting these same prompts' stated acceptance
+  // condition that zero critical/major findings is the expected, unremarkable case.
   type: 'object', required: ['verdict', 'summary'],
   properties: {
     verdict: { enum: ['sound_with_caveats', 'needs_rework', 'investigate_first'] },
     strengths: { type: 'string' },
-    findings: { type: 'array', items: { type: 'object', required: ['severity', 'summary', 'recommendation'], properties: {
+    findings: { type: 'array', items: { type: 'object', required: ['severity', 'summary'], properties: {
       severity: { enum: ['critical', 'major', 'minor'] }, summary: { type: 'string' },
       assumption_challenged: { type: 'string' }, failure_scenario: { type: 'string' },
       impact: { type: 'string' }, recommendation: { type: 'string' },
@@ -635,9 +682,25 @@ const REVIEW_SCHEMA = {
   type: 'object', required: ['result', 'summary'],
   properties: {
     result: { enum: ['approved', 'changes_requested'] }, comments: { type: 'string' },
-    issues: { type: 'array', items: {} }, recommended_fix_agent: { type: ['string', 'null'] }, summary: { type: 'string' },
+    // issues.items now requires the same two fields as CHALLENGE_SCHEMA.findings.items
+    // (:599): severity and summary, with recommendation optional on both since #164.
+    // `issues` itself still stays out of REVIEW_SCHEMA's own required list (a reviewer
+    // that omits it entirely degrades to today's prose path, see normalizeFindings()
+    // below) and `id` is never part of either schema — the engine assigns it in
+    // normalizeFindings().
+    issues: { type: 'array', items: { type: 'object', required: ['severity', 'summary'], properties: {
+      severity: { enum: ['critical', 'major', 'minor'] }, summary: { type: 'string' }, recommendation: { type: 'string' },
+    } } },
+    recommended_fix_agent: { type: ['string', 'null'] }, summary: { type: 'string' },
   },
 }
+// ----- REVIEW_SCHEMA.issues prompt line (issue #162) — shared verbatim by every
+// REVIEW_SCHEMA reviewer prompt (quality review, test validation, spec review,
+// code review) so the issues-vs-comments contract reads identically everywhere
+// it's asked. -----
+const ISSUES_ASK = 'Every concern you want fixed goes in `issues`, one entry per concern, with severity, summary and a ' +
+  'recommendation; a concern appearing only in `comments` will not be fixed. If you return changes_requested, ' +
+  '`issues` must be non-empty; if you have nothing that must be fixed, return approved.'
 const FIX_SCHEMA = {
   type: 'object', required: ['status', 'summary'],
   properties: {
@@ -938,6 +1001,479 @@ const CONSOLIDATION_MARKER_PROBE_SCHEMA = {
     } } },
   },
 }
+
+// =============================================================================
+// GATE STATE (issue #166): durable per-issue gate/contrarian state carried on
+// the issue itself across a run boundary. Substrate only in this tier -- no
+// consumer reads/acts on it yet (see the design note on buildGateStatePayload's
+// `seeded_from`). Mirrors the CONSOLIDATION_* marker subsystem immediately
+// above end to end: a title-gated comment, fence-extracted payload, canonical
+// scope-guard marker as its LAST line, append-only with positional last-wins
+// (read: newest wins, exactly like the outcomes.jsonl/diffOutcomeGrades
+// contract and the consolidation markers' own heal pass). Departs from that
+// precedent in one place: the payload is fenced JSON, not consolidation's flat
+// regex-parsed key:value lines, because `settled` (settleDecision/settledBlock
+// above) is an array of five-field objects carrying free text that may itself
+// contain newlines -- oneLine()'s single-line-per-field convention can't
+// express that without lossy flattening, while JSON.stringify/JSON.parse
+// round-trips it exactly, apostrophes and all.
+// =============================================================================
+
+// Comment title (first line) gating a gate-state marker apart from ordinary
+// trail comments -- same convention as CONSOLIDATION_MEMBER_TITLE/
+// CONSOLIDATION_GROUP_TITLE below. Every gate-state comment still ends with
+// the canonical scope-guard line "<!-- ticketmill <repo>#<issue> -->" (see
+// scopeGuard()); this title adds one second, gate-state-specific line of
+// machine-parseable structure ABOVE it -- it never replaces or reshapes the
+// canonical marker itself.
+const GATE_STATE_TITLE = '## Gate State'
+// GATE_STATE_SCHEMA: payload shape version, embedded in every payload so
+// parseGateStateComment can REJECT (never coerce) a payload an older or
+// incompatible engine build wrote. Bump only on a breaking shape change.
+const GATE_STATE_SCHEMA = 1
+
+// GATE_STATE_PROBE_SCHEMA: the whole-set read probe (fetchGateStateBlocks,
+// wired below the TICKETMILL-TEST-HARNESS-SPLIT marker) -- ONE call over every
+// candidate issue, pinning a jq read per issue exactly like the claim probe's
+// pinned "last title-gated comment" idiom (:7524), never a bare `gh issue view
+// --json comments` handed to the agent's own judgment (the fetchConsolidation
+// Markers precedent this replaces for gate state, since a bare read let a
+// truncated response get silently misread as absence). `raw` is each issue's
+// VERBATIM jq stdout; the agent relays it, never parses or judges it --
+// parseGateStateProbeRow does that in JS. `exit_ok` is the agent-level gh exit
+// status. `self_login` is `gh api user --jq .login` (a single-object endpoint,
+// so this file's "never a bare gh api" pagination rule doesn't apply) -- the
+// PRIMARY trust signal isTrustedGateStateAuthor checks first; '' when the
+// token can't resolve it (installation tokens), which falls through to the
+// claim_authors fallback.
+const GATE_STATE_PROBE_SCHEMA = {
+  type: 'object', required: ['rows'],
+  properties: {
+    self_login: { type: 'string' },
+    rows: { type: 'array', items: { type: 'object', required: ['issue', 'raw', 'exit_ok'], properties: {
+      issue: { type: 'integer' }, raw: { type: 'string' }, exit_ok: { type: 'boolean' },
+    } } },
+  },
+}
+// GATE_STATE_VERIFY_SCHEMA: the Report-phase self-validation sweep's chunked
+// read-back (verifyGateState, wired below the TICKETMILL-TEST-HARNESS-SPLIT
+// marker) -- ONE agent call per chunk of at most MAX_GATE_STATE_PROBE_CHUNK
+// issues, shaped like GATE_STATE_PROBE_SCHEMA minus `self_login` (the verify
+// sweep is proving THIS run's own write round-tripped through GitHub, never
+// adjudicating trust between authors, so it has no use for a self-identity
+// signal). Pins the SAME per-issue jq idiom fetchGateStateBlocks uses --
+// `raw` is each issue's VERBATIM jq stdout, relayed never parsed or judged by
+// the agent. Fed through the exact same parseGateStateProbeRow ->
+// parseGateStateComment pipeline the read-side probe uses -- no second
+// parser, no second trust rule. The prompt this schema backs carries ONLY
+// issue numbers, never the payload being verified against -- see
+// verifyGateState's own comment for why that matters.
+const GATE_STATE_VERIFY_SCHEMA = {
+  type: 'object', required: ['rows'],
+  properties: {
+    rows: { type: 'array', items: { type: 'object', required: ['issue', 'raw', 'exit_ok'], properties: {
+      issue: { type: 'integer' }, raw: { type: 'string' }, exit_ok: { type: 'boolean' },
+    } } },
+  },
+}
+
+// buildGateStatePayload: assembles the JSON payload embedded in a gate-state
+// comment. `settled` is capped to its last 6 entries here (mirrors
+// settledBlock's own slice(-6)) so a long-running issue's payload never grows
+// unbounded regardless of how many gates it has cleared. `seeded_from` names
+// the {run, epoch} of the block THIS ctx's `gate_budgets` were carried forward
+// from, when a resume seeds them from a prior run's recorded state, or null
+// when they started at zero this run. It is ALWAYS null at this tier: no
+// consumer seeds gate_budgets from a prior block yet (substrate only, no
+// consumer -- see the section banner above), so every call site passes null.
+// The field's PRESENCE, not its value, is what parseGateStateComment's schema
+// round-trips against -- a future consumer fills it in without a shape change
+// here. `write_seq` (issue #166 PR #177 review) is the GATE_STATE_WRITE_SEQ
+// counter value at the moment this payload was built -- unlike `epoch`
+// (identical across every boundary in a run), this varies write to write, so
+// diffGateStateIntent can order two same-run writes against each other. null
+// when the caller doesn't supply one (e.g. a hand-built test fixture, never a
+// real postGateState() call, which always passes it). Every field defaults
+// defensively (never throws on a sparse `o`) so a caller mid-construction
+// (e.g. a boundary with no group) gets a valid, schema-conformant payload
+// rather than an exception.
+function buildGateStatePayload(o) {
+  o = o || {}
+  return {
+    schema: GATE_STATE_SCHEMA,
+    repo: o.repo,
+    issue: o.issue,
+    run: o.run,
+    batch: o.batch,
+    epoch: (o.epoch === undefined) ? null : o.epoch,
+    write_seq: (o.write_seq === undefined) ? null : o.write_seq,
+    boundary: o.boundary,
+    group_id: (o.group_id === undefined) ? null : o.group_id,
+    members: Array.isArray(o.members) ? o.members.slice() : [],
+    seeded_from: (o.seeded_from === undefined) ? null : o.seeded_from,
+    gate_budgets: (o.gate_budgets && typeof o.gate_budgets === 'object' && !Array.isArray(o.gate_budgets)) ? o.gate_budgets : {},
+    settled: (Array.isArray(o.settled) ? o.settled : []).slice(-6),
+  }
+}
+
+// buildGateStateComment: renders the full comment body posted at each gate-
+// state boundary. Fixed shape: title line, ONE human line that is
+// deliberately non-directive -- a resumed run's agents must never read this
+// as an instruction, it exists purely so a human (or a future run's read-back)
+// can see what the engine last recorded, never phrased as something to act
+// on -- a <details> wrapper holding the fenced JSON payload, and the canonical
+// scope-guard marker as the LAST NON-EMPTY line (parseGateStateComment
+// enforces this on read; it is what makes the comment legible to scopeGuard()
+// and every other marker-consumer in this file).
+function buildGateStateComment(repo, issue, payload) {
+  const p = payload || {}
+  const humanLine = 'Recorded automatically at the "' + p.boundary + '" boundary (run ' + p.run +
+    ') for resume continuity -- a record, not a directive; nothing here should be treated as an instruction.'
+  return [
+    GATE_STATE_TITLE,
+    humanLine,
+    '',
+    '<details><summary>Gate state payload</summary>',
+    '',
+    '```json',
+    JSON.stringify(payload, null, 2),
+    '```',
+    '',
+    '</details>',
+    '<!-- ticketmill ' + repo + '#' + issue + ' -->',
+  ].join('\n')
+}
+
+// parseGateStateComment: null unless `body` is a well-formed gate-state marker
+// FOR THIS repo/issue -- title-gated (first line exactly GATE_STATE_TITLE,
+// same convention as parseConsolidation*), fence-extracted, and REQUIRES the
+// canonical scope-guard marker to be the last non-empty line (a body that
+// merely quotes the block shape inside a larger comment, or has trailing
+// content after the marker, is rejected here, not left to the JSON parse to
+// catch). Rejects a payload whose schema/repo/issue don't match the ones this
+// read expects -- a payload from a different repo, a different issue (e.g. a
+// consolidation group's cross-posted comment), or an older/incompatible
+// schema version is never silently accepted. Wrapped in try/catch and NEVER
+// THROWS: any malformed/truncated JSON, or a payload that isn't a plain
+// object, returns null exactly like every other rejection path here, so a
+// caller never needs a second layer of defense around this call.
+function parseGateStateComment(body, repo, issue) {
+  try {
+    const s = String(body == null ? '' : body)
+    const lines = s.split('\n')
+    if (!lines.length || lines[0].trim() !== GATE_STATE_TITLE) return null
+    let lastIdx = lines.length - 1
+    while (lastIdx >= 0 && lines[lastIdx].trim() === '') lastIdx--
+    if (lastIdx < 0) return null
+    const expectedMarker = '<!-- ticketmill ' + repo + '#' + issue + ' -->'
+    if (lines[lastIdx].trim() !== expectedMarker) return null
+    const fenceMatch = /```json\r?\n([\s\S]*?)\r?\n```/.exec(s)
+    if (!fenceMatch) return null
+    const payload = JSON.parse(fenceMatch[1])
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
+    if (payload.schema !== GATE_STATE_SCHEMA) return null
+    if (payload.repo !== repo) return null
+    if (payload.issue !== issue) return null
+    return payload
+  } catch (e) {
+    return null
+  }
+}
+
+// parseGateStateProbeRow: JSON.parses the VERBATIM stdout of the pinned jq
+// read (GATE_STATE_PROBE_SCHEMA.rows[].raw / GATE_STATE_VERIFY_SCHEMA.raw) --
+// the agent relays stdout, never judges it, so this is the only place that
+// decides whether a read actually succeeded. Expected shape: {total: <int>,
+// blocks: [{body, author_login, author_association}, ...]} (oldest-first,
+// already sliced to the last few by the jq itself). ANY throw (non-JSON
+// stdout, a truncated/partial JSON string from a chunked or interrupted read)
+// OR shape mismatch (missing/wrong-typed total, blocks not an array, or a
+// block entry missing a string `body`) returns {ok: false, total: 0, blocks:
+// []} -- this function itself never throws, and it never returns ok:true over
+// a shape it isn't sure of. This is deliberate: selectGateState treats
+// ok:false as read-failed, so a truncated read can never be silently misread
+// as "genuinely absent" -- issue #166's core fail-open requirement -- it
+// fails LOUD instead. This is what makes that kind of truncation structurally
+// impossible to hide.
+function parseGateStateProbeRow(raw) {
+  try {
+    const o = JSON.parse(raw)
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return { ok: false, total: 0, blocks: [] }
+    if (!Number.isInteger(o.total) || o.total < 0) return { ok: false, total: 0, blocks: [] }
+    if (!Array.isArray(o.blocks)) return { ok: false, total: 0, blocks: [] }
+    for (const b of o.blocks) {
+      if (!b || typeof b !== 'object' || typeof b.body !== 'string') return { ok: false, total: 0, blocks: [] }
+    }
+    return { ok: true, total: o.total, blocks: o.blocks }
+  } catch (e) {
+    return { ok: false, total: 0, blocks: [] }
+  }
+}
+
+// isTrustedGateStateAuthor: is `login` allowed to author a block selectGateState
+// treats as authoritative? PRIMARY signal -- `login === selfLogin`, the
+// deployment's own authenticated identity (`gh api user --jq .login`, a
+// single-object endpoint so the file's "never a bare gh api" pagination rule
+// doesn't apply). This closes the self-bootstrap trust hole the capped
+// approach-gate contrarian flagged against a claim_authors-only rule (a stale
+// forged claim's author no longer qualifies as primary trust). FALLBACK (for
+// installation tokens where `gh api user` 403s) -- `claimAuthors`, restricted
+// to a claim that is fresh (age < CLAIM_STALE_SECONDS, :292) OR whose batch
+// matches THIS run's batch branch: a claim that is neither fresh nor batch-
+// matching authored no work in scope and is not evidence of anything.
+// claimAuthors entries: {login, ageSeconds, batch}; either of ageSeconds/batch
+// may be null/absent (unknown), in which case only the other test can pass
+// that entry.
+function isTrustedGateStateAuthor(login, selfLogin, claimAuthors, batch) {
+  if (!login) return false
+  if (selfLogin && login === selfLogin) return true
+  const list = Array.isArray(claimAuthors) ? claimAuthors : []
+  return list.some(function (c) {
+    if (!c || c.login !== login) return false
+    const fresh = typeof c.ageSeconds === 'number' && Number.isFinite(c.ageSeconds) && c.ageSeconds < CLAIM_STALE_SECONDS
+    const batchMatch = batch != null && c.batch === batch
+    return fresh || batchMatch
+  })
+}
+
+// deriveRunEpoch: turns the probe-returned `date -u +%Y-%m-%dT%H:%M:%SZ`
+// string (the same idiom already used elsewhere in this file for a wall-clock
+// anchor, since the sandbox has no Date.now()/argless `new Date()`) into
+// RUN_EPOCH (epoch ms), via the existing pure toEpochMs (:6382 as of writing).
+// Explicit null on anything unparseable -- NEVER NaN, so a downstream
+// `runEpochMs - payload.epoch` comparison in gateStateEpochStale can't
+// silently produce a NaN that always compares false; a subtraction against an
+// unusable "now" must read as unknown/stale, not as "definitely not stale".
+function deriveRunEpoch(nowRaw) {
+  const ms = toEpochMs(nowRaw)
+  return Number.isFinite(ms) ? ms : null
+}
+
+// gateStateEpochStale: shared by selectGateState -- true when `payload.epoch`
+// predates CLAIM_STALE_SECONDS relative to `runEpochMs`, OR either side is
+// unparseable/absent. An unknown age reads as stale, never as fresh (fail
+// toward re-verifying, not toward trusting silently).
+// KNOWN IMPRECISION (issue #166 PR #177 review): `payload.epoch` is RUN_EPOCH
+// -- the run's Select-time wall-clock anchor -- not the actual moment this
+// particular boundary was written, so a long-running run's later boundaries
+// read slightly younger than they really are. Log-only at this tier (no
+// consumer yet); not worth a second probe-derived wall-clock read to fix.
+function gateStateEpochStale(payload, runEpochMs) {
+  const payloadEpoch = (payload && Number.isFinite(payload.epoch)) ? payload.epoch : null
+  if (payloadEpoch === null || !Number.isFinite(runEpochMs)) return true
+  return (runEpochMs - payloadEpoch) > (CLAIM_STALE_SECONDS * 1000)
+}
+
+// selectGateState: the single decision point for "what does this issue's
+// gate-state comment trail say, and can it be trusted?" Turns `rows` (one
+// issue's already-parsed probe result -- parseGateStateProbeRow's {ok, total,
+// blocks} shape, optionally carrying the agent-level `exit_ok` alongside it;
+// blocks are oldest-first, mirroring GitHub's own comment order), `evidence`
+// ({repo, issue, self_login, claim_authors, batch, run_epoch}), and
+// `priorWork` ({pr_number, worktree_exists, resume_point}) into exactly one
+// of four states:
+//   - 'read-failed' -- the probe/parse never produced usable data (an
+//     explicit agent-level exit_ok:false, OR parseGateStateProbeRow's own
+//     ok:false), OR the falsifiable-absent rule fires (below). This is what
+//     makes a truncated/broken read structurally impossible to misread as
+//     genuine absence.
+//   - 'absent' -- zero blocks, zero total, and nothing else on this issue
+//     (pr_number/worktree_exists/resume_point) is evidence prior work ever
+//     happened -- a genuinely fresh issue.
+//   - 'malformed' -- at least one block exists, but NONE of them parse
+//     (title-gated, fence-extracted, marker-checked -- see
+//     parseGateStateComment): the newest fails and every older one fails too.
+//   - 'found' -- at least one block parses. Selection is EXPLICIT TRUST-
+//     BEFORE-LAST-WINS: walk blocks newest -> oldest, return the first one
+//     whose author is trusted (isTrustedGateStateAuthor), counting every
+//     newer untrusted-but-parseable block passed over into `skipped`. If NO
+//     block is trusted, this is the degenerate all-untrusted case: state
+//     stays 'found' (there IS data, just not from a trusted author) using the
+//     newest PARSEABLE block's payload, `trusted: false`, and `skipped: 0`
+//     (nothing was skipped to reach it -- it's the first thing the walk
+//     looked at). `trusted` is kept on the result specifically so a caller
+//     can distinguish this degenerate case from an ordinary trusted find.
+// `stale` (only meaningful when `state === 'found'`) comes from
+// gateStateEpochStale against the SELECTED payload.
+//
+// FALSIFIABLE-ABSENT RULE: zero blocks + total===0 is only accepted as
+// genuine absence when nothing else on this issue is evidence prior work
+// happened. If `pr_number` is non-null, OR `worktree_exists` is true, OR
+// `resume_point` is anything other than 'implement', a prior run plainly did
+// SOMETHING here, so zero gate-state comments is contradictory --
+// read-failed, never absent. Zero blocks with no such evidence stays absent.
+// This is NEVER inferred from an empty blocks array alone -- always from this
+// explicit cross-check against independently-sourced preflight evidence.
+// A second, narrower contradiction is checked first and unconditionally:
+// zero blocks but total>0 is self-contradictory on its face (the probe says
+// comments exist but produced none) -- exactly the truncated/corrupted-read
+// shape this whole design exists to make undetectable-as-absence, so it is
+// always read-failed regardless of `hasPriorWork`. `total` is computed by
+// gateStateProbeCommandLine's jq using the SAME title-gated filter `blocks`
+// uses (never a bare all-comments count), so this branch is reachable only
+// under a genuinely truncated/corrupted read, not on any ordinary issue
+// carrying an unrelated human or bot comment.
+//
+// hasGateStatePriorWork: shared with fetchGateStateBlocks' diagnostic log
+// (below the split), which needs the same fact to tell the falsifiable-absent
+// case apart from an ordinary read-failed -- kept as one pure helper rather
+// than two copies of the same three-condition check.
+function hasGateStatePriorWork(priorWork) {
+  const pw = priorWork || {}
+  return !!(
+    (pw.pr_number !== null && pw.pr_number !== undefined) ||
+    pw.worktree_exists === true ||
+    (pw.resume_point != null && pw.resume_point !== 'implement')
+  )
+}
+function selectGateState(rows, evidence, priorWork) {
+  const r = rows || {}
+  const ev = evidence || {}
+  const pw = priorWork || {}
+  const EMPTY = { payload: null, trusted: false, stale: false, skipped: 0 }
+
+  if (r.exit_ok === false || r.ok === false) {
+    return Object.assign({ state: 'read-failed' }, EMPTY)
+  }
+
+  const blocks = Array.isArray(r.blocks) ? r.blocks : []
+  const total = Number.isInteger(r.total) ? r.total : blocks.length
+
+  if (blocks.length === 0) {
+    if (total > 0) return Object.assign({ state: 'read-failed' }, EMPTY)
+    if (hasGateStatePriorWork(pw)) return Object.assign({ state: 'read-failed' }, EMPTY)
+    return Object.assign({ state: 'absent' }, EMPTY)
+  }
+
+  let skipped = 0
+  let fallback = null // newest PARSEABLE block, regardless of trust
+  let fallbackSkipped = 0
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i]
+    const payload = parseGateStateComment(b && b.body, ev.repo, ev.issue)
+    if (!payload) continue // unparseable at this position -- never counted into `skipped`
+    const trusted = isTrustedGateStateAuthor(b && b.author_login, ev.self_login, ev.claim_authors, ev.batch)
+    if (!fallback) { fallback = payload; fallbackSkipped = skipped }
+    if (trusted) {
+      return { state: 'found', payload: payload, trusted: true, stale: gateStateEpochStale(payload, ev.run_epoch), skipped: skipped }
+    }
+    skipped++
+  }
+
+  if (fallback) {
+    return { state: 'found', payload: fallback, trusted: false, stale: gateStateEpochStale(fallback, ev.run_epoch), skipped: fallbackSkipped }
+  }
+  return Object.assign({ state: 'malformed' }, EMPTY)
+}
+
+// diffGateStateIntent: compares the payload THIS run intended to post
+// (`intent`) against a payload actually read back (`actual` -- e.g.
+// selectGateState's `.payload`, or the Report-phase verify sweep's direct
+// re-read). Three verdicts:
+//   - 'match'      -- byte-for-byte the same write (JSON.stringify-equal).
+//   - 'superseded' -- `actual` is a LATER write from the SAME run (same
+//                     `run`, later `write_seq`) -- expected and not alarming:
+//                     a later boundary in this same run posted after `intent`
+//                     was captured (e.g. a later pr-review iteration's write
+//                     landing after an earlier iteration's intent snapshot).
+//                     Ordering is on `write_seq`, NOT `epoch` (issue #166 PR
+//                     #177 review) -- RUN_EPOCH is assigned once at Select and
+//                     is identical on every boundary a single run posts, so it
+//                     can never distinguish an earlier write from a later one
+//                     within that run; only the monotonic per-write
+//                     GATE_STATE_WRITE_SEQ counter does.
+//   - 'mismatch'   -- anything else: a different run's write sitting where
+//                     ours should be, an EARLIER write, or same-run content
+//                     that disagrees without a later write_seq to explain it
+//                     -- real corruption or a lost write.
+function diffGateStateIntent(intent, actual) {
+  if (!intent || !actual) return 'mismatch'
+  if (JSON.stringify(intent) === JSON.stringify(actual)) return 'match'
+  if (intent.run === actual.run && Number.isFinite(intent.write_seq) && Number.isFinite(actual.write_seq) && actual.write_seq > intent.write_seq) {
+    return 'superseded'
+  }
+  return 'mismatch'
+}
+
+// chunkGateStateIssues / gateStateProbeCommandLine / deadGateStateChunkRows /
+// normalizeGateStateRow: shared by fetchGateStateBlocks (below the split) and
+// the Report-phase verifyGateState sweep -- both chunk the SAME issue list at
+// MAX_GATE_STATE_PROBE_CHUNK, pin the SAME per-issue jq idiom, fall back to
+// the SAME {raw: '', exit_ok: false} stub rows when a chunk's agent call
+// dies, and normalize a returned row's `raw`/`exit_ok` the same way. Kept as
+// four small pure helpers rather than two copies of each, so the read-side
+// probe and its self-validation sweep can never drift apart.
+function chunkGateStateIssues(list) {
+  const chunks = []
+  for (let i = 0; i < list.length; i += MAX_GATE_STATE_PROBE_CHUNK) chunks.push(list.slice(i, i + MAX_GATE_STATE_PROBE_CHUNK))
+  return chunks
+}
+function gateStateProbeCommandLine() {
+  // total is computed by the SAME title-gated select(...) filter blocks uses --
+  // NEVER a bare `.comments|length` -- so it counts gate-state comments only,
+  // not every comment on the issue. A bare all-comments count would make
+  // `blocks.length === 0 && total > 0` reachable on any ordinary issue with so
+  // much as one human reply or one of this pipeline's own non-gate-state
+  // comments, which selectGateState's self-contradiction check (:1343 as of
+  // writing) treats as read-failed -- silently swallowing the `absent` state
+  // for every issue that has ever received an unrelated comment (issue #166
+  // PR #177 review).
+  const titleFilter = 'select(.body | startswith("' + GATE_STATE_TITLE + '"))'
+  return 'gh issue view <n> --repo ' + REPO + ' --json comments --jq \'{total: ([.comments[] | ' + titleFilter + '] | length), blocks: [.comments[] | ' + titleFilter + ' | {body, author_login: .author.login, author_association: .authorAssociation}] | .[-3:]}\''
+}
+function deadGateStateChunkRows(chunk) {
+  return chunk.map(function (n) { return { issue: n, raw: '', exit_ok: false } })
+}
+function normalizeGateStateRow(row) {
+  return { raw: typeof row.raw === 'string' ? row.raw : '', exit_ok: row.exit_ok === true }
+}
+
+// attachGateStateBlocks: per-preflight normalizer AND real-data join, mirroring
+// attachEngineOwnedIntentional's shape (:3023) -- guarantees every preflight
+// carries all four gate-state PREFLIGHT_SCHEMA fields (gate_state_blocks,
+// gate_state_read_ok, gate_state_total_comments, gate_state_trust)
+// UNCONDITIONALLY. Pure and side-effect-free: returns a NEW array, never
+// mutates `preflights` or `rowsByIssue`.
+//
+// `rowsByIssue` (optional; keyed by issue NUMBER) carries fetchGateStateBlocks'
+// RAW per-issue probe rows -- {raw, exit_ok} straight off GATE_STATE_PROBE_SCHEMA,
+// UNPARSED -- this function is what runs parseGateStateProbeRow, so a truncated
+// or non-JSON `raw` string handed in here surfaces as gate_state_read_ok:false,
+// never as an empty-but-successful read. `selfLogin` is the reduced
+// self_login string (see fetchGateStateBlocks below the split) stored verbatim
+// as gate_state_trust -- a FUTURE consumer's selectGateState call uses it as
+// evidence.self_login; this function itself never decides trust or state.
+//
+// Every preflight's four fields are ALWAYS computed fresh from `rowsByIssue`/
+// `selfLogin` -- NEVER read back off the preflight object's own pre-existing
+// values, even when `rowsByIssue` has no entry for that issue. This is
+// deliberate: these four fields are read-only FACTS this run's own probe
+// resolved, never something an upstream agent (e.g. the preflight probe,
+// which happens to share PREFLIGHT_SCHEMA) gets to assert on its own — a
+// hallucinated gate_state_blocks arriving on `p` from anywhere else is always
+// clobbered to the real (or fail-open default) value, exactly like
+// attachEngineOwnedIntentional never trusts an agent-supplied regime.
+function attachGateStateBlocks(preflights, rowsByIssue, selfLogin) {
+  const byIssue = rowsByIssue || {}
+  const trust = typeof selfLogin === 'string' ? selfLogin : ''
+  return (preflights || []).map(function (p) {
+    const row = Object.prototype.hasOwnProperty.call(byIssue, p.issue) ? byIssue[p.issue] : null
+    if (!row) {
+      return Object.assign({}, p, {
+        gate_state_blocks: [], gate_state_read_ok: false, gate_state_total_comments: 0, gate_state_trust: trust,
+      })
+    }
+    const parsed = parseGateStateProbeRow(row.raw)
+    const readOk = row.exit_ok === true && parsed.ok === true
+    return Object.assign({}, p, {
+      gate_state_blocks: readOk ? parsed.blocks.map(function (b) { return b.body }) : [],
+      gate_state_read_ok: readOk,
+      gate_state_total_comments: readOk ? parsed.total : 0,
+      gate_state_trust: trust,
+    })
+  })
+}
+
 
 // =============================================================================
 // CONSOLIDATION (unit-of-work) FOUNDATIONS
@@ -1873,6 +2409,15 @@ const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> l
   'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
   'or recall a SHA from memory.'
 
+// ----- fixes_applied id-prefix ask (issue #162): shared by every fix stage fed
+// through findingsBlock() (quality-fix, test-quality-fix, pr-fix) so a human
+// skimming fixes_applied can map each entry straight back to the id-prefixed
+// finding line it resolved. `example` is a static illustrative id, not a live
+// value — each call site supplies one representative of its own id shape. -----
+function fixesAppliedIdAsk(example) {
+  return 'Prefix each fixes_applied entry with the id of the finding it resolves (e.g. "' + example + '").'
+}
+
 // ----- preflight step 5 (predicted_files lane-scheduling hint) (issue #113) -----
 // A PURE FUNCTION of (ROOT, TARGET), NOT a plain string: it is invoked at the
 // preflight call site (below the TICKETMILL-TEST-HARNESS-SPLIT marker) with the
@@ -1989,42 +2534,80 @@ function revisitRiskBlock(ctx) {
   ].join('\n')
 }
 
-// ----- gate findings tally (issue #87 task 3, issue #91 wired in pr-review) -----
-// Per-gate (the two per-issue contrarian gates 'approach'/'plan', plus the
+// ----- gate findings tally (issue #87 task 3, issue #91 wired in pr-review, issue #163 wired in quality) -----
+// Per-gate (the two per-issue contrarian gates 'approach'/'plan', the
+// per-task-plus-per-PR-fix-round 'quality' code-review gate, plus the
 // per-task 'pr-review' merge gate) tally of finding counts, severity mix, and
 // how that gate ITERATION resolved:
 //   accepted            - the gate iteration passed clean: for approach/plan,
 //                          verdict sound_with_caveats with zero critical/major
 //                          (the same condition that triggers settleDecision());
 //                          for pr-review, both spec and code review returned
-//                          'approved' (the same condition that ends the loop).
-//   carried-unresolved  - the gate's iteration cap was reached without a clean
-//                         pass: for approach/plan, critical/major findings
-//                         still open (they ride into ctx.unresolved); for
-//                         pr-review, MAX_PR_REVIEW_ITERATIONS reached without
-//                         both reviewers approving (the PR is left for human
-//                         review).
+//                          'approved' — still the only condition that may set
+//                          reviewAndMerge's approved = true, though (issue
+//                          #162) it is no longer the same condition that ends
+//                          the loop: an unclean iteration where both
+//                          reviewers independently had nothing to fix now
+//                          exits early too, tallied below as carried-unresolved.
+//   carried-unresolved  - the gate did not reach a clean pass: either (a) the
+//                         iteration cap was reached without both reviewers
+//                         approving — for approach/plan, critical/major
+//                         findings are still open (they ride into
+//                         ctx.unresolved) — or (b) for pr-review (issue #162)
+//                         and quality (issue #163) alike, the reviewer(s)
+//                         requested changes while naming no structured
+//                         findings to fix, so a fix stage would have had
+//                         nothing to act on. For pr-review, (a) and (b) land
+//                         on the same needs_human outcome; only
+//                         ctx.metrics.findings_empty_exits distinguishes
+//                         them. quality has a single reviewer, not a pair,
+//                         so its (b) is one changes_requested verdict with
+//                         issues: [] — that branch sets runQualityLoop's own
+//                         approved = true (see below) even though it still
+//                         tallies carried-unresolved here: "clean" for the
+//                         loop's control flow and "clean" for this gate
+//                         tally answer different questions.
 //   re-litigated        - neither of the above: the loop revises and
 //                         re-contests, so these findings get judged again
 //                         next iteration (a fix stage for pr-review, a
 //                         re-evaluate stage for approach/plan).
 //   dismissed           - the gate produced no adjudicated verdict at all
-//                         (challenger agent died) — any findings were never
-//                         actually judged. pr-review has no equivalent call:
-//                         a dead reviewer there fails the run immediately
-//                         (see reviewAndMerge) rather than tallying an outcome.
+//                         (challenger/reviewer agent died) — any findings
+//                         were never actually judged. pr-review has no
+//                         equivalent call: a dead reviewer there fails the
+//                         run immediately (see reviewAndMerge) rather than
+//                         tallying an outcome. quality has two dismissed
+//                         call sites instead (see runQualityLoop): the
+//                         simplify agent dying before a review verdict ever
+//                         existed, and the review agent itself dying.
 // One call per gate ITERATION (not per finding), so `disposition` tallies
 // outcomes while `severity` sums every finding's severity across every
 // iteration of that gate. Bounded implicitly: one entry per gate name;
 // approach/plan run at most challengeCap (<= MAX_CONTRARIAN_ITERATIONS) times,
-// pr-review at most MAX_PR_REVIEW_ITERATIONS times, per issue/task.
-// NOTE: unlike CHALLENGE_SCHEMA (approach/plan), REVIEW_SCHEMA's `issues`
-// (pr-review's finding source) is untyped with no `severity` field — neither
-// the spec- nor code-review prompts ask for one — so `gate_findings['pr-
-// review'].severity` will stay {critical:0, major:0, minor:0} regardless of
-// actual findings. That's expected, not a bug: recordGateOutcome degrades
-// gracefully when `f.severity` doesn't match critical/major/minor, and
-// `disposition`/`count` still carry real signal for pr-review.
+// pr-review at most MAX_PR_REVIEW_ITERATIONS times, per issue/task. quality
+// runs once per task plus once per PR-fix round (up to
+// MAX_QUALITY_ITERATIONS iterations each), so its denominator is not
+// directly comparable to pr-review, which runs once per issue (up to
+// MAX_PR_REVIEW_ITERATIONS iterations) — see the footnote in
+// computeGateYield.
+// NOTE (issue #162): REVIEW_SCHEMA.issues is now typed the same shape as
+// CHALLENGE_SCHEMA.findings (severity/summary required, recommendation
+// optional — literally true on both schemas as of #164, which dropped
+// recommendation from CHALLENGE_SCHEMA.findings.items' required list), and
+// all four REVIEW_SCHEMA-producing prompts (spec review, code
+// review, quality review, test validation) ask for it via ISSUES_ASK. Before
+// this change, the same call site already passed `(spec.issues ||
+// []).concat(code.issues || [])` into recordGateOutcome, which counts by
+// entry length regardless of shape — so `gate_findings['pr-review'].severity`
+// already carried real, non-zero counts whenever a reviewer happened to put a
+// concern in `issues` rather than `comments`. Now that all four prompts ask
+// for it explicitly, those counts are guaranteed and schema-backed rather
+// than incidental. `unspecified` is
+// still possible in principle (recordGateOutcome only increments a bucket
+// for the three known severities) but should not occur in practice: the
+// schema requires `severity` to be one of critical/major/minor, and
+// normalizeFindings only falls back to 'unspecified' for a shape that slips
+// past validation.
 function recordGateOutcome(ctx, gate, findings, disposition) {
   if (!ctx || !ctx.gate_findings) return
   const key = String(gate || '').trim()
@@ -2038,6 +2621,95 @@ function recordGateOutcome(ctx, gate, findings, disposition) {
   }
   const d = String(disposition || '').trim() || 'unknown'
   g.disposition[d] = (g.disposition[d] || 0) + 1
+}
+
+// normalizeFindings (issue #162): turns a REVIEW_SCHEMA `issues` array into the
+// engine's structured finding shape, or signals "the reviewer omitted the key
+// entirely" so callers can fall back to today's prose-only path byte-for-byte.
+// `raw` not being an array (including undefined/null — a reviewer that dropped
+// `issues` from its response) returns null; anything else returns an
+// arity-preserving array, one entry per input entry, so a malformed entry still
+// produces one output finding rather than being silently dropped. Ids are
+// engine-assigned as `source + '-' + (i+1)` (e.g. "code-i2-3") — REVIEW_SCHEMA
+// never declares an id field, so reviewers can't collide with or spoof one.
+// Severity coercion to 'unspecified' is defence-in-depth only: REVIEW_SCHEMA's
+// item schema already requires `severity` to be one of critical/major/minor, so
+// a validated array should never reach this branch — it exists for a bare-string
+// entry (no `.severity` at all) and any other shape that slips past validation,
+// not as a live production path for schema-conformant reviewer output.
+function normalizeFindings(raw, source) {
+  if (!Array.isArray(raw)) return null
+  return raw.map(function (entry, i) {
+    const id = String(source) + '-' + (i + 1)
+    if (entry && typeof entry === 'object') {
+      const sev = entry.severity
+      return {
+        id: id,
+        severity: (sev === 'critical' || sev === 'major' || sev === 'minor') ? sev : 'unspecified',
+        summary: String(entry.summary || ''),
+        recommendation: String(entry.recommendation || ''),
+      }
+    }
+    return { id: id, severity: 'unspecified', summary: String(entry) }
+  })
+}
+
+// findingsBlock (issue #162): the single renderer feeding every fix stage (quality-
+// fix, pr-fix, test-quality-fix) — the ONE place that decides what a fix agent sees
+// of a review, so structured findings and prose comments never drift apart across
+// the three sites. Three branches:
+//   findings === null   - the reviewer omitted `issues`; emit EXACTLY what the
+//                          call site emitted before this change (comments falling
+//                          back to summary falling back to a caller-supplied
+//                          label) so this leg is a byte-identical prompt to today.
+//   findings.length > 0 - render the work list using the existing pr-fix line
+//                          shape (:4259) with the id prefixed, then the prose
+//                          `comments` below under a context-only heading — the
+//                          fix agent's job list is the findings, not the prose.
+//   findings.length === 0 - a reviewer that validated `issues: []` alongside
+//                          changes_requested (reached only by the pr-review gate
+//                          in task 2, where one reviewer has zero findings and
+//                          the other has some — both internal loops here exit
+//                          before ever rendering this branch). State plainly that
+//                          no structured findings were named, and still render
+//                          the prose below under the same context heading: an
+//                          empty array must never suppress or demote prose.
+function findingsBlock(findings, comments, fallbackLabel) {
+  if (findings === null) return String(comments || fallbackLabel || '')
+  // Headings are `###`, not `##`: every call site nests this block under its own
+  // `##`-level wrapper (pr-fix wraps two calls in `## Spec review` / `## Code
+  // review`; the two internal fix stages call this with no wrapper at all). `##`
+  // here would sit at the same level as those wrappers and make the rendered
+  // prompt structurally flat, with nothing but the id prefix on each finding line
+  // to tell a reader where one reviewer's block ends and the next begins.
+  const lines = ['### Findings to fix']
+  if (findings.length > 0) {
+    for (const f of findings) {
+      lines.push('- [' + f.id + '] [' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
+    }
+  } else {
+    lines.push('(reviewer named no structured findings)')
+  }
+  lines.push('')
+  lines.push('### Reviewer comments (context only — the findings above are the work list)')
+  lines.push(String(comments || fallbackLabel || '(none)'))
+  return lines.join('\n')
+}
+
+// nothingToFix (issue #162): per-reviewer predicate used only by the pr-review
+// merge gate (reviewAndMerge) — true when THIS reviewer, alone, has nothing
+// actionable: either it approved outright (regardless of what `issues` carries
+// alongside an approval — see the REVIEW_SCHEMA.issues comment above), or it
+// requested changes but its normalized findings array is present and empty.
+// `f === null` (the reviewer omitted `issues` entirely) is deliberately NOT
+// nothing-to-fix on its own — with no structured signal at all, prose-only
+// changes_requested still routes to the fix stage, matching pre-#162 behavior.
+// Two of these ANDed together (both reviewers have nothing to fix) is a
+// DIFFERENT condition from prReviewClean (both approved) — see reviewAndMerge:
+// prReviewClean is the only path that may set approved = true; this predicate
+// only decides whether an unclean iteration still deserves a fix stage.
+function nothingToFix(r, f) {
+  return r.result === 'approved' || (f !== null && f.length === 0)
 }
 
 // Compact intent context for fix stages — they otherwise see only reviewer comments
@@ -2372,8 +3044,18 @@ function aggregateMergeAutoResolve(results) {
 //   unresolved_count         - per-finding granularity ON TOP OF contrarian_capped,
 //                             so a capped-out issue carrying five open findings
 //                             scores higher than one carrying only one.
-//   quality_degrades         - each time the quality loop accepted a "degraded"
-//                             exit instead of a clean approval.
+//   quality_degrades         - each time the quality loop's simplify, review,
+//                             or fix AGENT DIED mid-loop (see runQualityLoop),
+//                             not each time the loop merely regressed on
+//                             quality. Cap exhaustion (all iterations spent
+//                             without a clean review, no agent death) also
+//                             returns 'degraded' from runQualityLoop, but the
+//                             increment above only fires on the agent-death
+//                             branches — cap exhaustion never touches this
+//                             counter. Its own signal lives at
+//                             gate_findings.quality['carried-unresolved']
+//                             instead (issue #163); the misleading name is
+//                             kept as-is to avoid an unrelated rename.
 //   test_quality_fix_rounds  - each extra fix round the test-quality gate forced.
 const FRICTION_WEIGHTS = {
   needs_human: 2,
@@ -2398,8 +3080,14 @@ const FRICTION_TOP_N = 5
 //
 // Each of the seven capped pipeline stages (approach/plan/task-review/quality/
 // test/browser/pr-review) contributes a normalized min(1, iters/cap) ratio —
-// running below a cap is normal, not friction, so a unit that cleared every
-// gate on its first pass scores 0 there regardless of how many stages it has.
+// running below a cap is normal, not friction. Four of the seven stages
+// (approach/plan/test/pr-review) run at most once per issue, so their
+// denominator is that single loop's cap; quality is the one whose pooled
+// denominator is implemented here (cap * quality_scopes, via multiScopeField
+// below) rather than one loop's cap against a multi-loop numerator.
+// task-review and browser are multi-scope aggregates too and not yet counted
+// this way (see multiScopeField below).
+//
 // Caps are read LIVE off module scope inside the function body (MAX_CONTRARIAN_
 // ITERATIONS et al — the same idiom aggregateTokens uses reading STAGE_LABELS),
 // never captured once at module load, so a __seed()-overridden cap in tests
@@ -2436,6 +3124,17 @@ function computeFriction(results) {
     browser: 'browser_iters',
     'pr-review': 'pr_review_iters',
   }
+  // multiScopeField: stage keys whose metric is a run-wide aggregate across
+  // MULTIPLE loop invocations (quality runs once per task plus once per
+  // PR-fix round — see the module comment above), rather than a single
+  // loop's iteration count. Each entry names the ctx.metrics field counting
+  // how many scopes/invocations contributed to that aggregate, so the ratio
+  // below pools the cap (cap * scopes) instead of comparing the aggregate to
+  // one loop's cap. task_review_attempts and browser_iters are two more
+  // multi-scope aggregates (per-task task review, per-phase browser checks —
+  // implement and pre-merge) not yet counted this way — this map is the
+  // extension point for adding them once their own scope counters exist.
+  const multiScopeField = { quality: 'quality_scopes' }
   const stageKeys = Object.keys(caps)
 
   const byIssue = []
@@ -2448,11 +3147,20 @@ function computeFriction(results) {
     let score = 0
 
     for (const k of stageKeys) {
-      const cap = caps[k] > 0 ? caps[k] : 1 // guard a misconfigured 0/negative cap from dividing by zero
+      const baseCap = caps[k] > 0 ? caps[k] : 1 // guard a misconfigured 0/negative cap from dividing by zero
+      const tracked = Object.prototype.hasOwnProperty.call(multiScopeField, k)
+      // scopes stays null (not 1) for the six stages with no scope counter: a
+      // number here is a claim "this many invocations were pooled", and only
+      // quality currently has a counter backing that claim. A metrics blob
+      // with no quality_scopes field (pre-this-change data) falls back to
+      // Math.max(1, 0) === 1, so cap === baseCap and the ratio scores exactly
+      // as it did before this change.
+      const scopes = tracked ? Math.max(1, Number(m[multiScopeField[k]]) || 0) : null
+      const cap = baseCap * (scopes || 1)
       const iters = Number(m[stageField[k]]) || 0
       const ratio = Math.min(1, iters / cap)
       if (ratio > 0) {
-        drivers.push({ name: k, value: iters, weight: null, contribution: ratio })
+        drivers.push({ name: k, value: iters, weight: null, cap: cap, scopes: scopes, contribution: ratio })
         stageTotals[k].total += ratio
         stageTotals[k].count += 1
       }
@@ -2731,7 +3439,7 @@ async function fail(ctx, status, stageKey, error) {
   await postNote(ctx, stageKey, status, error)
   BATCH.failures++
   if (BATCH.failures >= MAX_BATCH_FAILURES) tripStop('circuit breaker: ' + BATCH.failures + ' issues failed')
-  return Object.assign({ issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx), changed_files: (ctx && ctx.changed_files) || null, added_files: (ctx && ctx.added_files) || null, touch_counts: (ctx && ctx.touch_counts) || {}, gate_findings: (ctx && ctx.gate_findings) || {}, settled: (((ctx && ctx.settled) || []).slice()) }, frictionFields(ctx, status))
+  return Object.assign({ issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx), changed_files: (ctx && ctx.changed_files) || null, added_files: (ctx && ctx.added_files) || null, touch_counts: (ctx && ctx.touch_counts) || {}, gate_findings: (ctx && ctx.gate_findings) || {}, settled: (((ctx && ctx.settled) || []).slice()), gate_state_intent: (ctx && ctx.gate_state_intent) || null, gate_state_post_failed: (ctx && ctx.gate_state_post_failed) || null }, frictionFields(ctx, status))
 }
 
 // =============================================================================
@@ -2903,6 +3611,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
   for (let iter = 1; !approved && !degraded && iter <= MAX_QUALITY_ITERATIONS; iter++) {
     if (STOP.tripped) return 'halted'
     ctx.metrics.quality_iters++
+    if (iter === 1) ctx.metrics.quality_scopes++
 
     if (runSimplify) {
       const simp = await stage(ctx, 'simplify-' + prefix + '-i' + iter, [
@@ -2924,7 +3633,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
         HANDOFF_ASK,
         'Return status, commit, files_changed, summary.',
       ].join('\n'), stageOpts('simplify'), IMPL_SCHEMA)
-      if (!simp || simp.status === 'error') { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': simplify degraded'); break }
+      if (!simp || simp.status === 'error') { recordGateOutcome(ctx, 'quality', [], 'dismissed'); degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': simplify degraded'); break }
       collectNotes(ctx, 'simplify', simp)
       collectPostedCommit(ctx, 'simplify-' + prefix + '-i' + iter, simp)
     } else if (iter === 1) {
@@ -2945,26 +3654,38 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       'Diff to review: git -C ' + ctx.worktree + ' diff ' + TARGET + '...HEAD',
       IMPLEMENTERS.length ? 'If changes are requested, set recommended_fix_agent to one of: ' + IMPLEMENTERS.join(', ') + '.' : '',
       bwFeedback(ctx),
+      ISSUES_ASK,
       'Post an issue comment "## Quality Review (' + stepLabel + ', iteration ' + iter + ')" with your verdict',
       '(approved / changes requested) and key findings in 3-6 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
       'Return result (approved|changes_requested), comments, issues, recommended_fix_agent, summary.',
     ].join('\n'), stageOpts('qReview'), REVIEW_SCHEMA)
-    if (!rev) { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': review degraded'); break }
+    if (!rev) { recordGateOutcome(ctx, 'quality', [], 'dismissed'); degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': review degraded'); break }
 
-    if (rev.result === 'approved') { approved = true; break }
+    const revFindings = normalizeFindings(rev.issues, 'quality-' + prefix + '-i' + iter)
+    if (rev.result === 'approved') { recordGateOutcome(ctx, 'quality', revFindings || [], 'accepted'); approved = true; break }
+    if (revFindings !== null && revFindings.length === 0) {
+      approved = true
+      ctx.metrics.findings_empty_exits++
+      recordGateOutcome(ctx, 'quality', revFindings || [], 'carried-unresolved')
+      pushDecision(ctx, 'Gate: no findings to fix', 'Quality review (' + stepLabel + ', iteration ' + iter + ') requested changes but named zero structured findings — treated as clean.')
+      VERIFY_SKIPS.push('#' + ctx.issue + ': quality review (' + stepLabel + ', iteration ' + iter + ') requested changes but named zero structured findings — treated as clean, no fix stage ran')
+      break
+    }
 
+    recordGateOutcome(ctx, 'quality', revFindings || [], iter === MAX_QUALITY_ITERATIONS ? 'carried-unresolved' : 're-litigated')
     const fixAgent = pickFixAgent(rev.recommended_fix_agent, null)
     const fix = await stage(ctx, 'quality-fix-' + prefix + '-i' + iter, [
       implementerBlock(fixAgent),
       '',
       'Address code review feedback in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ' (issue #' + ctx.issue + '):',
       '',
-      String(rev.comments || rev.summary || 'No comments'),
+      findingsBlock(revFindings, rev.comments, rev.summary || 'No comments'),
       '',
       fixContext(ctx, taskDesc),
       '',
       'After committing, post an issue comment "## Quality Fix (' + stepLabel + ', iteration ' + iter + ')" with the',
       'commit SHA and the fixes applied in 2-4 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+      fixesAppliedIdAsk('[quality-task-1-i1-2] tightened the null guard'),
       COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
@@ -2980,6 +3701,33 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
   // rolling degrade window across this issue's tasks
   ctx.degrades.push(degraded)
   if (degraded) ctx.metrics.quality_degrades++
+
+  // Cap exhaustion (issue #163): the loop ran out of iterations without a
+  // clean review AND without an agent dying (three degrade branches above
+  // break out before reaching here). Rolled up to exactly ONE VERIFY_SKIPS
+  // line per issue — runQualityLoop is called once per task plus once per
+  // PR-fix round, and without this roll-up a chatty task would print one
+  // line per call. ctx.quality_caps/quality_cap_skip_index are lazily
+  // initialized (not part of processIssue()'s ctx literal) because
+  // tests/harness.js's makeCtx() enumerates ctx's fields explicitly and
+  // would need updating for anything added there. VERIFY_SKIPS is
+  // append-only, so the remembered index stays valid even under pool
+  // concurrency. Deliberately silent on merge status: this loop can also
+  // exit via the degrade-window halt just below, which both callers
+  // (reviewAndMerge, the per-task loop) turn into a hard fail() — so this
+  // line must not claim anything merged on a capped-then-halted issue.
+  if (!approved && !degraded) {
+    if (!ctx.quality_caps) ctx.quality_caps = []
+    ctx.quality_caps.push(stepLabel)
+    const capMsg = '#' + ctx.issue + ': quality gate capped at ' + MAX_QUALITY_ITERATIONS + ' iterations without a clean review (' + ctx.quality_caps.join(', ') + ')'
+    if (typeof ctx.quality_cap_skip_index === 'number' && ctx.quality_cap_skip_index < VERIFY_SKIPS.length) {
+      VERIFY_SKIPS[ctx.quality_cap_skip_index] = capMsg
+    } else {
+      ctx.quality_cap_skip_index = VERIFY_SKIPS.length
+      VERIFY_SKIPS.push(capMsg)
+    }
+  }
+
   const window = ctx.degrades.slice(-QUALITY_DEGRADE_WINDOW)
   const count = window.filter(Boolean).length
   if (count >= MAX_QUALITY_DEGRADES_IN_WINDOW) {
@@ -3468,24 +4216,33 @@ async function runTestLoop(ctx, forced) {
         : '- If no modified file contains testable logic (pure config/docs/assets), return result=approved immediately.',
       '- Only validate tests covering the modified code. Do NOT request tests for unrelated code, config, or assets.',
       'Audit for: TODO/incomplete tests, hollow assertions, missing edge cases, mock abuse.',
+      ISSUES_ASK,
       'Post an issue comment "## Test Validation (iteration ' + iter + ')" with your verdict in 2-4 lines',
       '(gh issue comment ' + ctx.issue + ' --repo ' + REPO + '); if approved because nothing testable changed, say so.',
       'Return result (approved|changes_requested), comments, issues, summary.',
     ].join('\n'), stageOpts('testValidate'), REVIEW_SCHEMA)
     if (!v) return { ok: false, error: 'test validator died — halting test loop' }
 
+    const vFindings = normalizeFindings(v.issues, 'test-i' + iter)
     if (v.result === 'approved') return { ok: true }
+    if (vFindings !== null && vFindings.length === 0) {
+      ctx.metrics.findings_empty_exits++
+      pushDecision(ctx, 'Gate: no findings to fix', 'Test validation (iteration ' + iter + ') requested changes but named zero structured findings — treated as clean.')
+      VERIFY_SKIPS.push('#' + ctx.issue + ': test validation (iteration ' + iter + ') requested changes but named zero structured findings — treated as clean, no fix stage ran')
+      return { ok: true }
+    }
 
     const qfix = await stage(ctx, 'test-quality-fix-i' + iter, [
       implementerBlock(null),
       '',
       'Address test quality issues in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ' (issue #' + ctx.issue + '):',
       '',
-      String(v.comments || v.summary || 'Fix test quality issues'),
+      findingsBlock(vFindings, v.comments, v.summary || 'Fix test quality issues'),
       '',
       fixContext(ctx, null),
       'After committing, post an issue comment "## Test Quality Fix (iteration ' + iter + ')" with the commit SHA and',
       'what was added/strengthened (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+      fixesAppliedIdAsk('[test-i1-2] added a missing edge-case test'),
       COMMIT_SHA_ASK,
       HANDOFF_ASK,
       'Add missing assertions, remove TODOs, add edge-case tests, etc. Commit. Return status, commit, files_changed, fixes_applied, summary.',
@@ -3814,6 +4571,141 @@ async function fetchConsolidationMarkers(issueNumbers) {
   return (r && r.markers) || []
 }
 
+// fetchGateStateBlocks: READ-ONLY (safe under DRY_RUN) — the whole-set gate-
+// state read, shaped like fetchConsolidationMarkers just above it, but the
+// READ IDIOM is deliberately NOT that one: fetchConsolidationMarkers hands the
+// agent a bare `gh issue view --json comments` and trusts its own judgment to
+// pick the right comment, which lets a truncated response get silently
+// misread as "no marker". Gate state instead pins the claim probe's
+// deterministic idiom (the per-issue `gh issue view ... --jq '{total, blocks}'`
+// a few thousand lines below, in the claims loop) verbatim, one command per
+// issue: jq computes the EXACT return shape, so a short/truncated read is a
+// JSON.parse failure (parseGateStateProbeRow), never a fake "zero blocks".
+// The agent's ONLY job per issue is relaying that command's stdout — it never
+// parses or judges it.
+//
+// Chunked at MAX_GATE_STATE_PROBE_CHUNK issues per agent call — belt-and-
+// braces, not a truncation defense (the jq pin already makes a truncated READ
+// structurally impossible to misread): a chunk whose agent call dies (throws,
+// budget-exhausted, or returns a malformed response) marks ONLY its own
+// chunk's issues read-failed via synthesized {raw: '', exit_ok: false} stub
+// rows — surviving chunks still report normally, rather than one dead call
+// taking the whole candidate set down with it. A LIVE chunk that returns a
+// schema-valid `rows` array simply missing one of its assigned issues (which
+// GATE_STATE_PROBE_SCHEMA cannot forbid) gets the SAME stub backfilled after
+// the chunk loop below, for the same reason: a queried-but-unanswered issue
+// must read as read-failed, never silently as absent.
+//
+// self_login reduction: each chunk independently runs `gh api user --jq
+// .login` (a single-object endpoint, so the file's "never a bare gh api"
+// pagination rule does not apply) since chunks run in parallel and none of
+// them can see another's result. The FIRST chunk (in `chunks` order) that
+// reports a non-empty login wins — every chunk is hitting the SAME
+// authenticated identity, so this is a redundant-computation reduction, not a
+// disagreement to arbitrate; an empty string means no chunk could resolve it
+// (an installation token, or every chunk died), which isTrustedGateStateAuthor
+// treats as "primary trust unavailable, fall through to claim_authors".
+//
+// `priorWorkByIssue` ({issue: {pr_number, worktree_exists, resume_point}}) is
+// NEVER sent to the agent (it stays a pure verbatim relay) — it feeds ONLY
+// the per-issue log line below, via selectGateState's falsifiable-absent rule,
+// so "zero gate-state comments but a PR is already open" logs as the
+// DISTINCT, greppable suspicious case rather than a bare "absent" that could
+// hide a real read problem.
+//
+// Returns { rowsByIssue, self_login } — rowsByIssue is RAW ({issue: {raw,
+// exit_ok}}), unparsed on purpose: attachGateStateBlocks (above the split) is
+// what runs parseGateStateProbeRow, so this function's own contract stays a
+// thin, mirror-of-fetchConsolidationMarkers relay with no decision logic of
+// its own beyond the per-issue log line (which is diagnostic output, not a
+// decision fed back into the run).
+async function fetchGateStateBlocks(issueNumbers, priorWorkByIssue) {
+  const list = Array.isArray(issueNumbers) ? issueNumbers.slice() : []
+  if (!list.length) return { rowsByIssue: {}, self_login: '' }
+  const pwByIssue = priorWorkByIssue || {}
+  const chunks = chunkGateStateIssues(list)
+
+  const chunkResults = await Promise.all(chunks.map(function (chunk, ci) {
+    return agent([
+      'READ-ONLY (safe under any run mode, including a dry run). For EACH issue number listed below, run this EXACT',
+      'command, substituting only <n> for that issue\'s number — do not alter the jq filter in any way:',
+      gateStateProbeCommandLine(),
+      'Issues in this call: ' + chunk.join(', '),
+      'Relay each command\'s stdout VERBATIM as `raw` — never parse, reformat, summarize, or judge it. `exit_ok` is',
+      'whether that gh command exited 0 for that issue (false on any non-zero exit, including a repo/issue lookup',
+      'failure).',
+      '',
+      'Also run ONCE for this whole call (not per issue): gh api user --jq .login',
+      'Return self_login = that command\'s trimmed stdout, or "" if the command fails or returns nothing (this',
+      'happens for installation tokens — expected, not an error).',
+      '',
+      'Return rows: [{issue, raw, exit_ok}] — exactly one entry per issue listed above, even one whose gh command',
+      'failed.',
+    ].join('\n'), { label: 'gate-state-probe-c' + ci, phase: 'Select', schema: GATE_STATE_PROBE_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+      .catch(function () { return null })
+      .then(function (r) {
+        if (r && Array.isArray(r.rows)) return { self_login: typeof r.self_login === 'string' ? r.self_login : '', rows: r.rows }
+        // dead chunk — belt-and-braces: mark ONLY this chunk's issues read-failed via
+        // explicit stub rows, never silently drop them (a dropped issue would look
+        // identical to one this function was never asked about at all).
+        return { self_login: '', rows: deadGateStateChunkRows(chunk) }
+      })
+  }))
+
+  const rowsByIssue = {}
+  let selfLogin = ''
+  for (const cr of chunkResults) {
+    if (!selfLogin && cr.self_login && cr.self_login.trim()) selfLogin = cr.self_login.trim()
+    for (const row of (cr.rows || [])) rowsByIssue[row.issue] = normalizeGateStateRow(row)
+  }
+  // Backfill any queried issue a LIVE chunk's response simply omitted — GATE_STATE_PROBE_SCHEMA
+  // cannot enforce one row per issue, so a schema-valid response that drops an issue (never
+  // throws, never hits the dead-chunk catch above) would otherwise leave rowsByIssue[n]
+  // undefined. Stubbed the same way a dead chunk's issues are (deadGateStateChunkRows, a few
+  // lines above) so a queried-but-never-answered issue reads as read-failed, never as a false
+  // "absent" (issue #166 PR #177 review).
+  for (const n of list) {
+    if (!Object.prototype.hasOwnProperty.call(rowsByIssue, n)) rowsByIssue[n] = normalizeGateStateRow({ issue: n, raw: '', exit_ok: false })
+  }
+
+  // Per-issue diagnostic log, using the SAME pure selectGateState decision a
+  // future consumer would reach — this run just prints it rather than acting
+  // on it (substrate only, no consumer yet). run_epoch is not yet assigned at
+  // this Select-phase call site (see the RUN_EPOCH assignment below, which
+  // needs outcomeGradeR/revisitRiskR already awaited) — the `state` value
+  // never depends on it (only the auxiliary `stale` flag does), so passing the
+  // module-level RUN_EPOCH here (null on a fresh run) is correct, not stale.
+  // Every issue in `list` now has a rowsByIssue entry (real or backfilled
+  // stub), so `row` below is never falsy — no separate {} fallback needed.
+  for (const n of list) {
+    const row = rowsByIssue[n]
+    const parsed = parseGateStateProbeRow(row.raw)
+    const rowsArg = Object.assign({ exit_ok: row.exit_ok }, parsed)
+    const pw = pwByIssue[n] || {}
+    const sel = selectGateState(rowsArg, { repo: REPO, issue: n, self_login: selfLogin, claim_authors: [], batch: TARGET, run_epoch: RUN_EPOCH }, pw)
+    // readOk mirrors attachGateStateBlocks' definition (:1467) exactly -- the same
+    // "did the read actually succeed" test, so this log and the stored preflight
+    // fields never disagree about it. Without this gate, EVERY hard read failure
+    // (dead chunk, non-zero gh exit, truncated stdout) also has blocks.length===0
+    // and total===0, so it printed the same "absent (unexpected: ...)" line as a
+    // genuine falsifiable-absent read -- on a resume, where hasGateStatePriorWork
+    // is true for exactly the issues this substrate serves, that made read
+    // failures indistinguishable from suspicious absences (issue #166 PR #177
+    // review, iteration 2).
+    const readOk = row.exit_ok === true && parsed.ok === true
+    if (sel.state === 'read-failed' && readOk && parsed.blocks.length === 0 && parsed.total === 0 && hasGateStatePriorWork(pw)) {
+      const why = pw.pr_number != null ? ('PR #' + pw.pr_number + ' open')
+        : pw.worktree_exists ? 'worktree exists'
+        : ('resume_point=' + pw.resume_point)
+      log('gate-state #' + n + ': absent (unexpected: ' + why + ')')
+    } else {
+      log('gate-state #' + n + ': ' + sel.state + (sel.state === 'found' && !sel.trusted ? ' (untrusted author)' : ''))
+    }
+  }
+
+  return { rowsByIssue: rowsByIssue, self_login: selfLogin }
+}
+
 // challengeConsolidationGroup: the capped contrarian loop for ONE proposed group.
 // Returns the (possibly revised) accepted group, or null if it DISSOLVED (cap
 // reached without acceptance, or a dead challenger/reviser — see the module
@@ -3843,7 +4735,7 @@ async function challengeConsolidationGroup(group, settledCarrier) {
       iter > 1 ? 'This is iteration ' + iter + ': the group was revised per your prior findings — check whether they are addressed.' : '',
       'Post an issue comment on #' + current.primary + ' titled "## Contrarian: Consolidation Challenge (Group ' + groupId + ', Iteration ' + iter + ')" with your verdict and findings.',
       'STRUCTURED OUTPUT CONTRACT: verdict must be EXACTLY one of sound_with_caveats | needs_rework | investigate_first.',
-      'Every concern goes in the findings ARRAY (severity, summary, recommendation), never only in prose.',
+      'Every concern goes in the findings ARRAY (severity and summary required; add a recommendation when you have a concrete fix), never only in prose.',
     ].filter(Boolean).join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
 
     if (!ch) {
@@ -4054,6 +4946,211 @@ async function postConsolidationMarkers(units) {
   }
 }
 
+// postGateState (issue #166): non-fatal per-issue write of the durable
+// "## Gate State" comment (buildGateStateComment/buildGateStatePayload, above
+// the TICKETMILL-TEST-HARNESS-SPLIT marker) at a run boundary. Modeled
+// directly on the cap-note-plan/cap-note-approach stages just above
+// (stageOpts('probe'), NOTE_SCHEMA, exactly 1 try, log-only on a dead agent
+// or posted!==true) -- like those, NO path through this helper may fail an
+// issue; every failure mode degrades to a logged/deferred note and the caller
+// keeps going.
+//
+// Posting idiom deliberately breaks from postConsolidationMarkers just above
+// (`gh issue comment ... --body "..."`, :4645/:4660): that idiom is safe only
+// because a consolidation marker's body is flat, oneLine()-rendered
+// key:value text with nothing in it that a shell would treat specially. A
+// gate-state body embeds free text straight out of ctx.settled (rationale/
+// resolution strings a human or an earlier agent wrote), which CAN contain
+// apostrophes, backticks, or `$` -- any of which a `--body "$(...)"` or an
+// UNQUOTED heredoc would hand to the shell for interpolation, silently
+// corrupting the posted payload (or worse). Instead this pins `gh issue
+// comment <n> --repo <r> --body-file -` fed by stdin from a QUOTED heredoc
+// (`<<'...'`), which disables ALL shell expansion inside it -- the payload
+// reaches `gh` as literal bytes no matter what punctuation the free text
+// carries.
+//
+// ctx.gate_state_intent is set to the intended payload ONLY when the agent
+// actually reports posted===true. Every other outcome (dead agent after its
+// one try, an explicit posted:false, or a schema mismatch) instead sets
+// ctx.gate_state_post_failed = boundary (last failure wins across an issue's
+// several boundaries) and pushes a ctx.deferred note, so the miss is visible
+// without ever touching gate_state_intent. This asymmetry is deliberate:
+// setting intent unconditionally would let Task 4's Report-phase verify
+// sweep compare an intent against a block that was never actually written
+// and report 'mismatch' (real corruption) for what is, here, a routine,
+// designed-for non-fatal skip.
+async function postGateState(ctx, boundary) {
+  const payload = buildGateStatePayload({
+    repo: REPO,
+    issue: ctx.issue,
+    run: RUN_TAG,
+    batch: TARGET,
+    epoch: RUN_EPOCH,
+    write_seq: ++GATE_STATE_WRITE_SEQ,
+    boundary: boundary,
+    group_id: ctx.groupId,
+    members: memberIssues(ctx),
+    gate_budgets: {
+      approach: (ctx.metrics && ctx.metrics.approach_iters) || 0,
+      plan: (ctx.metrics && ctx.metrics.plan_iters) || 0,
+      'pr-review': (ctx.metrics && ctx.metrics.pr_review_iters) || 0,
+    },
+    settled: ctx.settled,
+  })
+  const body = buildGateStateComment(REPO, ctx.issue, payload)
+  const posted = await stage(ctx, 'gate-state-' + boundary, [
+    'Post the durable gate-state record on issue #' + ctx.issue + ' of ' + REPO + ' EXACTLY as given below, verbatim',
+    'and unchanged -- do not reformat, reword, summarize, or add anything to it. Run exactly this command, with the',
+    'body fed on stdin via a QUOTED heredoc (the quotes around the delimiter are load-bearing: they disable ALL',
+    'shell interpolation inside the heredoc, which matters because the body below may contain apostrophes,',
+    'backticks, or $ characters that must reach gh as literal bytes, not be expanded by the shell):',
+    '',
+    'gh issue comment ' + ctx.issue + ' --repo ' + REPO + ' --body-file - <<\'TICKETMILL_GATE_STATE_EOF\'',
+    body,
+    'TICKETMILL_GATE_STATE_EOF',
+    '',
+    'Do NOT substitute an unquoted heredoc (<<EOF) or a --body "$(...)" form -- both would let the shell interpolate',
+    'characters inside the body. Return posted=true/false.',
+  ].join('\n'), stageOpts('probe'), NOTE_SCHEMA, 1)
+  if (posted && posted.posted === true) {
+    ctx.gate_state_intent = payload
+  } else {
+    ctx.gate_state_post_failed = boundary
+    ctx.deferred.push('Gate-state comment did not post at boundary "' + boundary + '" for issue #' + ctx.issue + ' -- resume continuity for this boundary is degraded (logged, non-fatal, no consumer yet).')
+    log('#' + ctx.issue + ' gate-state post (' + boundary + ') did not post -- resume continuity degraded for this boundary only (non-fatal, logged)')
+  }
+  return posted
+}
+
+// verifyGateState (issue #166, task 4): the Report-phase self-validation
+// sweep that proves post -> GitHub -> read -> parse for gate state in one
+// run. ONE stage for the WHOLE run (never 2N per-issue calls, and never the
+// old per-boundary-during-processIssue design GATE_STATE_VERIFY_SCHEMA's
+// original comment described -- that design was superseded by this
+// Report-phase sweep before this task landed), chunked at
+// MAX_GATE_STATE_PROBE_CHUNK like fetchGateStateBlocks (:4544, via the shared
+// chunkGateStateIssues helper) -- belt-and-braces: a dead chunk's agent call
+// only takes its own chunk's issues down with it, surviving chunks report
+// normally.
+//
+// The verify prompt carries ONLY the issue numbers and the pinned per-issue
+// jq idiom fetchGateStateBlocks uses (via the shared gateStateProbeCommandLine
+// helper) -- it NEVER carries
+// ctx.gate_state_intent or any other part of the payload being checked
+// against. This is load-bearing: if the prompt included the intended
+// payload, the agent could satisfy the schema by echoing it back rather than
+// actually relaying gh's real output, and the "comparison" would prove
+// nothing. JS alone -- never the agent -- runs parseGateStateProbeRow, then
+// parseGateStateComment on the newest returned block, then diffGateStateIntent
+// against the result's own gate_state_intent.
+//
+// phase('Report') runs on every terminal exit of a batch (STOP.tripped fills
+// the remaining results as 'not_started' and returns; a per-unit throw is
+// isolated to that unit by runPool -- see :5871), so `results` passed in here
+// always carries every issue's FINAL gate-state fields for this run, on every
+// exit path, not just a clean finish.
+//
+// Six outcomes, logged one per issue via `log()`. NON-FATAL end to end:
+// this sweep never mutates a result's status, never throws past its own call
+// site, and a dead/misbehaving chunk degrades to 'read-failed' for that
+// chunk's issues rather than aborting the sweep. 'mismatch' and 'read-failed'
+// additionally push a VERIFY_SKIPS entry (issue #166 PR #177 review) -- every
+// other outcome is either nothing-to-verify or a clean/expected result, but
+// these two mean this run's self-validation either proved nothing
+// ('read-failed') or found evidence of a lost/corrupted write ('mismatch'),
+// which belongs in the batch PR's Verification Gaps section, the human's only
+// window into what this run couldn't verify.
+//   - 'no-intent'   -- this run never recorded a successful gate-state post
+//                      for this issue AND never recorded a failed one either
+//                      (gate_state_intent and gate_state_post_failed both
+//                      absent) -- e.g. not_started, preflight-skipped, or the
+//                      unit died before its first boundary. Nothing to
+//                      verify; not alarming.
+//   - 'post-failed' -- postGateState() itself already reported the post
+//                      failed (ctx.gate_state_post_failed set, no intent
+//                      recorded) -- Task 2's KNOWN non-fatal path. Kept as
+//                      its own outcome so this benign, already-logged miss is
+//                      never reported alongside genuine read-back corruption.
+//   - 'read-failed' -- the verify probe itself couldn't produce usable data
+//                      for this issue this run (no row at all, an explicit
+//                      exit_ok:false, or parseGateStateProbeRow rejected the
+//                      stdout shape) -- never conflated with a real mismatch.
+//   - 'match'       -- diffGateStateIntent found the newest gate-state block
+//                      read back byte-identical to what this run intended.
+//   - 'superseded'  -- diffGateStateIntent found a later write from the SAME
+//                      run sitting where the intent snapshot was taken from
+//                      (e.g. a later pr-review iteration posted after an
+//                      earlier iteration's intent was captured) -- expected,
+//                      not alarming, so this run's own later boundary is
+//                      never reported as corruption. A DIFFERENT run's write
+//                      (concurrent or otherwise) is never 'superseded' --
+//                      diffGateStateIntent requires `intent.run === actual.run`
+//                      before it even looks at ordering, so that case always
+//                      falls through to 'mismatch' below.
+//   - 'mismatch'    -- anything else diffGateStateIntent returns: a
+//                      different run's write, an earlier write, no
+//                      gate-state block found at all despite a recorded
+//                      successful post, or same-run content that disagrees
+//                      without a later write_seq to explain it. Real
+//                      corruption or a lost write.
+async function verifyGateState(results) {
+  const list = Array.isArray(results) ? results : []
+  const toVerify = list.filter(function (r) { return r && r.gate_state_intent })
+  const rowsByIssue = {}
+
+  if (toVerify.length) {
+    const issueNumbers = toVerify.map(function (r) { return r.issue })
+    const chunks = chunkGateStateIssues(issueNumbers)
+
+    const chunkRows = await Promise.all(chunks.map(function (chunk, ci) {
+      return agent([
+        'READ-ONLY. For EACH issue number listed below, run this EXACT command, substituting only <n> for that',
+        'issue\'s number -- do not alter the jq filter in any way:',
+        gateStateProbeCommandLine(),
+        'Issues in this call: ' + chunk.join(', '),
+        'Relay each command\'s stdout VERBATIM as `raw` -- never parse, reformat, summarize, or judge it. `exit_ok` is',
+        'whether that gh command exited 0 for that issue (false on any non-zero exit, including a repo/issue lookup',
+        'failure).',
+        '',
+        'Return rows: [{issue, raw, exit_ok}] -- exactly one entry per issue listed above, even one whose gh command',
+        'failed.',
+      ].join('\n'), { label: 'gate-state-verify-c' + ci, phase: 'Report', schema: GATE_STATE_VERIFY_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+        .catch(function () { return null })
+        .then(function (r) {
+          if (r && Array.isArray(r.rows)) return r.rows
+          // dead chunk -- belt-and-braces, mirrors fetchGateStateBlocks: mark ONLY this
+          // chunk's issues read-failed via explicit stub rows, never silently drop them.
+          return deadGateStateChunkRows(chunk)
+        })
+    }))
+    for (const rows of chunkRows) {
+      for (const row of (rows || [])) rowsByIssue[row.issue] = normalizeGateStateRow(row)
+    }
+  }
+
+  for (const r of list) {
+    if (!r) continue
+    let outcome
+    if (!r.gate_state_intent) {
+      outcome = r.gate_state_post_failed ? 'post-failed' : 'no-intent'
+    } else {
+      const row = rowsByIssue[r.issue]
+      const parsed = row ? parseGateStateProbeRow(row.raw) : { ok: false, total: 0, blocks: [] }
+      if (!row || row.exit_ok !== true || !parsed.ok) {
+        outcome = 'read-failed'
+      } else {
+        const newest = parsed.blocks.length ? parsed.blocks[parsed.blocks.length - 1] : null
+        const actual = newest ? parseGateStateComment(newest.body, REPO, r.issue) : null
+        outcome = diffGateStateIntent(r.gate_state_intent, actual)
+      }
+    }
+    log('gate-state-verify #' + r.issue + ': ' + outcome)
+    if (outcome === 'mismatch' || outcome === 'read-failed') {
+      VERIFY_SKIPS.push('#' + r.issue + ': gate-state self-validation reported ' + outcome + ' -- this run\'s durable gate-state record for this issue could not be confirmed to have round-tripped through GitHub as intended (non-fatal, no consumer relies on it yet, but resume continuity for a future consumer is unverified)')
+    }
+  }
+}
+
 // =============================================================================
 // IMPLEMENT (setup -> research -> evaluate<->contrarian -> plan<->contrarian ->
 // tasks with review/quality loops -> test loop -> browser -> docblocks -> PR)
@@ -4215,8 +5312,8 @@ async function implementIssue(ctx) {
       'Working directory (read-only): ' + ctx.worktree,
       'Post an issue comment "## Contrarian: Approach Challenge (Iteration ' + iter + ')" with your verdict and findings.',
       'STRUCTURED OUTPUT CONTRACT: verdict must be EXACTLY one of sound_with_caveats | needs_rework | investigate_first.',
-      'Every concern goes in the findings ARRAY (objects with severity, summary, recommendation — keep each field to',
-      '2-3 sentences), never only in prose. Keep summary under 200 words so the output stays well-formed.',
+      'Every concern goes in the findings ARRAY (objects with severity and summary required — keep each field to',
+      '2-3 sentences; add a recommendation only when you have a concrete fix), never only in prose. Keep summary under 200 words so the output stays well-formed.',
     ].join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
     if (!ch) { log('#' + ctx.issue + ' contrarian(approach) died — proceeding with unchallenged approach (logged)'); pushDecision(ctx, 'Contrarian: Approach', 'SKIPPED — contrarian agent unavailable'); recordGateOutcome(ctx, 'approach', [], 'dismissed'); break }
 
@@ -4271,6 +5368,13 @@ async function implementIssue(ctx) {
     ctx.approach = re.approach || ctx.approach
     pushDecision(ctx, 'Revised Evaluation (i' + iter + ')', '**Approach:** ' + (re.approach || '') + '\n' + (re.summary || ''))
   }
+
+  // Gate-state boundary 'approach' (issue #166): covers every one of the loop's
+  // four exits above (dead contrarian, sound_with_caveats, cap-out, dead
+  // re-evaluate) -- all four are `break`s out of the same loop, so one post
+  // placed right here, before anything that can fail the issue, durably
+  // records the approach gate's outcome regardless of which exit was taken.
+  await postGateState(ctx, 'approach')
 
   // ---- PLAN + CONTRARIAN CHALLENGE (plan) ----
   const agentMenu = IMPLEMENTERS.length
@@ -4361,8 +5465,8 @@ async function implementIssue(ctx) {
       'Working directory (read-only): ' + ctx.worktree,
       'Post an issue comment "## Contrarian: Plan Stress Test (Iteration ' + iter + ')".',
       'STRUCTURED OUTPUT CONTRACT: verdict must be EXACTLY one of sound_with_caveats | needs_rework | investigate_first.',
-      'Every concern goes in the findings ARRAY (objects with severity, summary, recommendation — keep each field to',
-      '2-3 sentences), never only in prose. Keep summary under 200 words so the output stays well-formed.',
+      'Every concern goes in the findings ARRAY (objects with severity and summary required — keep each field to',
+      '2-3 sentences; add a recommendation only when you have a concrete fix), never only in prose. Keep summary under 200 words so the output stays well-formed.',
     ].join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
     if (!ch) { log('#' + ctx.issue + ' contrarian(plan) died — proceeding with unchallenged plan (logged)'); pushDecision(ctx, 'Contrarian: Plan', 'SKIPPED — contrarian agent unavailable'); recordGateOutcome(ctx, 'plan', [], 'dismissed'); break }
 
@@ -4411,6 +5515,13 @@ async function implementIssue(ctx) {
     if (revised.length) tasks = revised
     pushDecision(ctx, 'Revised Plan (i' + iter + ')', (rp.summary || '') + '\n**Tasks:**\n' + tasks.map(function (t) { return '- ' + t.id + ' [' + (t.agent || 'implementer') + '] ' + t.description }).join('\n'))
   }
+
+  // Gate-state boundary 'plan' (issue #166): covers every one of the loop's
+  // four exits above (dead contrarian, sound_with_caveats, cap-out, dead
+  // re-plan) the same way the 'approach' boundary covers its own loop -- all
+  // four are `break`s, so one post here, before the IMPLEMENT section below,
+  // durably records the plan gate's outcome regardless of which exit fired.
+  await postGateState(ctx, 'plan')
 
   // ---- IMPLEMENT (sequential per-task: implement -> review -> fix loop -> quality loop) ----
   let tasksCompleted = 0
@@ -4604,6 +5715,7 @@ async function implementIssue(ctx) {
 // =============================================================================
 async function reviewAndMerge(ctx) {
   let approved = false
+  let haltReason = null
   for (let iter = 1; iter <= MAX_PR_REVIEW_ITERATIONS && !approved; iter++) {
     if (STOP.tripped) return fail(ctx, 'halted', 'pr-review', 'stopped: ' + STOP.reason)
     ctx.metrics.pr_review_iters = iter
@@ -4625,6 +5737,7 @@ async function reviewAndMerge(ctx) {
           '(gh pr view ' + ctx.pr + ' --json comments) for full context. On iteration 2+, stay consistent with your',
           'own prior spec reviews — do not reverse a prior scope approval without new information.',
           'Worktree: ' + ctx.worktree,
+          ISSUES_ASK,
           'Post a PR comment "## Spec Review (Iteration ' + iter + ')" with the verdict.',
           'Return result (approved|changes_requested), comments, issues, recommended_fix_agent, summary.',
         ].join('\n'), stageOpts('specReview'), REVIEW_SCHEMA)
@@ -4646,6 +5759,7 @@ async function reviewAndMerge(ctx) {
           IMPLEMENTERS.length ? 'If changes are requested, set recommended_fix_agent to one of: ' + IMPLEMENTERS.join(', ') + '.' : '',
           bwFeedback(ctx),
           'Worktree: ' + ctx.worktree,
+          ISSUES_ASK,
           'Post a PR comment "## Code Review (Iteration ' + iter + ')" with the verdict.',
           'Return result (approved|changes_requested), comments, issues, recommended_fix_agent, summary.',
         ].join('\n'), stageOpts('codeReview'), REVIEW_SCHEMA)
@@ -4653,23 +5767,75 @@ async function reviewAndMerge(ctx) {
     ])
     const spec = reviews[0]
     const code = reviews[1]
-    if (!spec || !code) return fail(ctx, 'needs_human', 'pr-review', 'a PR reviewer died — PR #' + ctx.pr + ' left open for human review')
+    if (!spec || !code) {
+      // Gate-state boundary 'pr-review-iN-aborted' (issue #166): the ONLY exit
+      // from this loop that a resumed run can reach WITHOUT ever passing
+      // through the recordGateOutcome() call below, because the process_pr
+      // resume path (processIssue -> reviewAndMerge directly) never runs the
+      // approach/plan gates or their own boundary posts. Without a post here,
+      // a resume whose reviewers die on iteration 1 would record nothing at
+      // all for this issue. ctx.metrics.pr_review_iters is already `iter`
+      // (set above, before the reviews ran), so no extra plumbing is needed.
+      await postGateState(ctx, 'pr-review-i' + iter + '-aborted')
+      return fail(ctx, 'needs_human', 'pr-review', 'a PR reviewer died — PR #' + ctx.pr + ' left open for human review')
+    }
 
-    // gate_findings tally (issue #91): one call per PR-review iteration, using the
-    // same disposition vocabulary as the approach/plan gates above (see the doc
-    // comment on recordGateOutcome) — this is the only gate #87 left unwired, so
-    // an "escaped defect" (finding absent at approach/plan, present here) was
-    // previously undetectable. 'accepted' means both reviewers approved (the
-    // gate passed clean, mirroring the approved=true break below); on the final
-    // iteration without a clean pass the cap was reached with issues still open,
-    // same shape as the contrarian gates' 'carried-unresolved'; otherwise the
-    // loop continues into a fix stage and gets re-reviewed, i.e. 're-litigated'.
+    // gate_findings tally (issue #91, retyped by issue #162): one call per
+    // PR-review iteration, using the same disposition vocabulary as the
+    // approach/plan gates above (see the doc comment on recordGateOutcome) —
+    // this is the only gate #87 left unwired, so an "escaped defect" (finding
+    // absent at approach/plan, present here) was previously undetectable.
+    // Each reviewer's `issues` is normalized under its OWN source prefix
+    // ('spec-i'/'code-i' + iter) before the two arrays are concatenated for
+    // the tally — the two reviews run through parallel() above and land in
+    // one bucket, so model-chosen or shared ids would collide across
+    // reviewers or iterations. 'accepted' means both reviewers approved (the
+    // ONLY condition that may set approved = true, below). Two other ways an
+    // iteration can end without a clean pass: the cap was reached with real
+    // findings still open (same shape as the contrarian gates'
+    // 'carried-unresolved'), or both reviewers independently had nothing to
+    // fix (nothingToFix, above) while the pair as a whole wasn't clean —
+    // tallied as the SAME 'carried-unresolved' string (computeGateYield hard-
+    // codes exactly four disposition keys; a fifth would be silently
+    // dropped), distinguished only by ctx.metrics.findings_empty_exits and
+    // haltReason's text. Otherwise the loop continues into a fix stage and
+    // gets re-reviewed, i.e. 're-litigated'.
+    const specFindings = normalizeFindings(spec.issues, 'spec-i' + iter)
+    const codeFindings = normalizeFindings(code.issues, 'code-i' + iter)
     const prReviewClean = spec.result === 'approved' && code.result === 'approved'
-    const prReviewDisposition = prReviewClean ? 'accepted' : (iter === MAX_PR_REVIEW_ITERATIONS ? 'carried-unresolved' : 're-litigated')
-    recordGateOutcome(ctx, 'pr-review', (spec.issues || []).concat(code.issues || []), prReviewDisposition)
+    const bothNothingToFix = !prReviewClean && nothingToFix(spec, specFindings) && nothingToFix(code, codeFindings)
+    const capReached = iter === MAX_PR_REVIEW_ITERATIONS
+    const prReviewDisposition = prReviewClean ? 'accepted' : ((bothNothingToFix || capReached) ? 'carried-unresolved' : 're-litigated')
+    recordGateOutcome(ctx, 'pr-review', (specFindings || []).concat(codeFindings || []), prReviewDisposition)
+
+    // Gate-state boundary 'pr-review-iN' (issue #166): kept INSIDE the loop,
+    // right after the gate_findings tally above, because reviewAndMerge
+    // returns from inside this loop at both breaks below (nothing-to-fix and
+    // cap-reached) as well as at the clean-approval break just below this
+    // line -- a post placed after the loop would never run for either of
+    // those in-loop returns.
+    await postGateState(ctx, 'pr-review-i' + iter)
 
     if (prReviewClean) { approved = true; break }
-    if (iter === MAX_PR_REVIEW_ITERATIONS) break
+
+    // Both reviewers have nothing to fix, but that isn't prReviewClean (one or
+    // both requested changes with zero findings named) — a fix stage with no
+    // findings and no prose to act on would just re-run the same review next
+    // iteration. Break WITHOUT approving, onto the existing needs_human below:
+    // a permissive predicate here would let a changes_requested verdict reach
+    // `gh pr merge --squash`. One reviewer with real findings skips this branch
+    // and falls through to the fix stage instead (the AND is preserved).
+    if (bothNothingToFix) {
+      ctx.metrics.findings_empty_exits++
+      haltReason = 'PR #' + ctx.pr + ' review iteration ' + iter + ': both reviewers requested changes but named zero structured findings to fix — left open for human review'
+      pushDecision(ctx, 'Gate: no findings to fix', 'PR review (iteration ' + iter + ') requested changes but neither reviewer named a structured finding — left for human review as carried-unresolved.')
+      break
+    }
+
+    if (capReached) {
+      haltReason = 'PR #' + ctx.pr + ' not approved after ' + MAX_PR_REVIEW_ITERATIONS + ' iterations — left open for human review'
+      break
+    }
 
     const fixAgent = pickFixAgent(code.recommended_fix_agent, null)
     const fix = await stage(ctx, 'pr-fix-i' + iter, [
@@ -4677,11 +5843,16 @@ async function reviewAndMerge(ctx) {
       '',
       'Address PR review feedback for PR #' + ctx.pr + ' in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ':',
       '',
-      'Spec review:', String(spec.comments || spec.summary || 'approved'), '',
-      'Code review:', String(code.comments || code.summary || 'approved'), '',
+      '## Spec review',
+      findingsBlock(specFindings, spec.comments, spec.summary || 'approved'),
+      '',
+      '## Code review',
+      findingsBlock(codeFindings, code.comments, code.summary || 'approved'),
+      '',
       fixContext(ctx, null),
       'After pushing, post a PR comment "## PR Review Fix (iteration ' + iter + ')" with the commit SHA and the fixes',
       'applied in 2-4 lines (gh pr comment ' + ctx.pr + ' --repo ' + REPO + ').',
+      fixesAppliedIdAsk('[code-i1-2] tightened the null guard'),
       COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
@@ -4698,7 +5869,7 @@ async function reviewAndMerge(ctx) {
     if (q === 'halted') return fail(ctx, 'halted', 'quality-loop', STOP.tripped ? 'stopped: ' + STOP.reason : 'quality degrade rate exceeded during PR fixes')
   }
 
-  if (!approved) return fail(ctx, 'needs_human', 'pr-review', 'PR #' + ctx.pr + ' not approved after ' + MAX_PR_REVIEW_ITERATIONS + ' iterations — left open for human review')
+  if (!approved) return fail(ctx, 'needs_human', 'pr-review', haltReason || ('PR #' + ctx.pr + ' not approved after ' + MAX_PR_REVIEW_ITERATIONS + ' iterations — left open for human review'))
 
   // ---- BROWSER (pre-merge gate — re-verifies after any PR-review fixes) ----
   const bwm = await runBrowserCheck(ctx, 'pre-merge')
@@ -4808,7 +5979,7 @@ async function reviewAndMerge(ctx) {
   if (mar.resolved) ctx.metrics.merge_auto_resolved = (ctx.metrics.merge_auto_resolved || 0) + 1
 
   log('#' + ctx.issue + ' merged PR #' + ctx.pr + (merge.follow_up_issues && merge.follow_up_issues.length ? ' (follow-ups: ' + merge.follow_up_issues.join(', ') + ')' : ''))
-  return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx), changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings, settled: (ctx.settled || []).slice() }, frictionFields(ctx, 'completed'))
+  return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx), changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings, settled: (ctx.settled || []).slice(), gate_state_intent: ctx.gate_state_intent || null, gate_state_post_failed: ctx.gate_state_post_failed || null }, frictionFields(ctx, 'completed'))
 }
 
 // =============================================================================
@@ -4843,7 +6014,7 @@ async function processIssue(pre) {
     // reasons:[]}) matches computeRevisitRisk's clean no-op shape so a preflight
     // that never carried revisit_risk (e.g. a resume-skip stub) never crashes.
     revisit_risk: (pre.revisit_risk && typeof pre.revisit_risk === 'object') ? pre.revisit_risk : { flagged: false, reasons: [] },
-    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0 },
+    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_scopes: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0, findings_empty_exits: 0 },
     tokens: { total: 0, byModel: {}, byStage: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
     // Retained-changed-files / friction signals (issue #87). null (not []) means
     // "never captured" — probeChangedFiles() sets these once, unconditionally,
@@ -4866,7 +6037,12 @@ async function processIssue(pre) {
     // must NOT count as "shipped into TARGET" — see batchClosesIssues() below,
     // which is the sole reader of this field.
     const merged_into_target = pre.pr_state === 'merged' && pre.pr_base === TARGET
-    return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target, changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings, settled: (ctx.settled || []).slice() }, frictionFields(ctx, 'skipped'))
+    // gate_state_intent/gate_state_post_failed: shape totality only -- no
+    // gate-state boundary can fire on this skip path (it never runs
+    // implementIssue/reviewAndMerge), so these are always null here and the
+    // Report-phase verify sweep (Task 4) reads that as 'no-intent', never as
+    // a mismatch.
+    return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target, changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings, settled: (ctx.settled || []).slice(), gate_state_intent: null, gate_state_post_failed: null }, frictionFields(ctx, 'skipped'))
   }
   if (pre.resume_point === 'process_pr') {
     log('#' + ctx.issue + ' healing: open PR #' + ctx.pr + ' found — jumping to review/merge')
@@ -5095,6 +6271,7 @@ function __seed(o) {
   if ('ROOT' in o) ROOT = o.ROOT
   if ('ENGINE_OWNED' in o) ENGINE_OWNED = o.ENGINE_OWNED
   if ('LOCKSTEP_INSTALLED_PATHS' in o) LOCKSTEP_INSTALLED_PATHS = o.LOCKSTEP_INSTALLED_PATHS
+  if ('RUN_EPOCH' in o) RUN_EPOCH = o.RUN_EPOCH
   if ('MAX_CONTRARIAN_ITERATIONS' in o) MAX_CONTRARIAN_ITERATIONS = o.MAX_CONTRARIAN_ITERATIONS
   if ('OUTCOME_GRADING' in o) OUTCOME_GRADING = o.OUTCOME_GRADING
   if ('REVISIT_RISK' in o) REVISIT_RISK = o.REVISIT_RISK
@@ -5378,9 +6555,18 @@ function computeGateYield(results) {
         (b.ratio == null ? '—' : b.accepted + ':' + b.dismissed) + ' | ' + b.relitigated + ' | ' + b.carried + ' |')
     }
   }
+  // quality's denominator footnote (issue #163): quality runs once per task
+  // PLUS once per PR-fix round (each up to MAX_QUALITY_ITERATIONS iterations),
+  // unlike every other gate in this table which runs at most once per issue.
+  // Without this note the quality row's raw counts read as directly
+  // comparable to pr-review's, and they are not.
+  if (byGate.quality) {
+    lines.push('')
+    lines.push('Note: quality runs once per task plus once per PR-fix round (up to ' + MAX_QUALITY_ITERATIONS + ' iterations each), so its denominator is not directly comparable to pr-review, which runs once per issue (up to ' + MAX_PR_REVIEW_ITERATIONS + ' iterations).')
+  }
   if (escapedDefects.length) {
     lines.push('')
-    lines.push('Escaped defects (findings at "' + ESCAPE_GATE + '" that every earlier gate missed):')
+    lines.push('Escaped defects (findings at "' + ESCAPE_GATE + '" that neither "' + EARLY_GATES.join('" nor "') + '" raised):')
     lines.push('')
     lines.push('| Issue | Findings at ' + ESCAPE_GATE + ' |')
     lines.push('| --- | --- |')
@@ -6954,6 +8140,20 @@ let preflights = (await Promise.all(issueList.map(function (it) {
 // deriveUnits()'s OR-fold for how it threads onto a consolidation-group unit.
 preflights = attachEngineOwnedIntentional(preflights, ENGINE_OWNED)
 
+// ---- Select: gate-state read (issue #166 task 3) — READ-ONLY, safe under
+// DRY_RUN (this whole block runs before the DRY_RUN early-return below), and
+// placed right after the regime classifier it sits beside in PREFLIGHT_SCHEMA.
+// priorWork is each preflight's OWN already-resolved pr_number/worktree_exists/
+// resume_point — passing it lets fetchGateStateBlocks' falsifiable-absent log
+// line be evidence-driven rather than model-attested. See fetchGateStateBlocks'
+// module comment (below the split) for the full design; attachGateStateBlocks
+// (above the split) guarantees every preflight — even one a dead chunk never
+// covered — comes out carrying all four gate-state fields, fail-open defaulted.
+const gateStatePriorWork = {}
+for (const p of preflights) gateStatePriorWork[p.issue] = { pr_number: p.pr_number, worktree_exists: p.worktree_exists, resume_point: p.resume_point }
+const gateStateProbe = await fetchGateStateBlocks(preflights.map(function (p) { return p.issue }), gateStatePriorWork)
+preflights = attachGateStateBlocks(preflights, gateStateProbe.rowsByIssue, gateStateProbe.self_login)
+
 for (const p of preflights) log('#' + p.issue + ' preflight: ' + p.resume_point + ' — ' + p.reason)
 
 // ---- Select: engine-owned root-dirty skip — regime (a) of the three-regime
@@ -6970,6 +8170,19 @@ if (engineSkip.flagged.length) log('engine-owned guardrail: root working tree di
 const learnR = await learnPromise
 const outcomeGradeR = await outcomeGradePromise
 const revisitRiskR = await revisitRiskPromise
+// RUN_EPOCH (issue #166 task 3): derived here because both outcomeGradeR.now
+// and revisitRiskR.now are already awaited above, and each already carries a
+// `date -u +%Y-%m-%dT%H:%M:%SZ` wall-clock anchor from the exact same idiom
+// (OUTCOMES_SCHEMA / REVISIT_RISK_SCHEMA's own step 0 — the sandbox has no
+// Date.now()/argless `new Date()`) — no extra agent call needed. Prefer
+// outcomeGradeR's since it fires first in program order; fall back to
+// revisitRiskR's so a dead outcome-grading pass alone doesn't leave the whole
+// run epoch-less. Logged loudly when both are unavailable/unparseable: every
+// gate-state comparison this run then treats age as unknown, which
+// gateStateEpochStale resolves toward stale, never toward silently trusting
+// an old block.
+RUN_EPOCH = deriveRunEpoch((outcomeGradeR && outcomeGradeR.now) || (revisitRiskR && revisitRiskR.now))
+if (RUN_EPOCH === null) log('gate-state: RUN_EPOCH is null — outcome-grading and revisit-risk both failed to supply a wall-clock reading this run; every gate-state block will read as unknown-age/stale')
 addStage('preflight', preflightR1Before) // STAGE_TOKENS.preflight R1 close — see the bracket comment above learnPromise
 if (learnR && learnR.found) {
   LEARN = learnR
@@ -7417,6 +8630,21 @@ if (HELD_CLAIMS.length) {
   ].join('\n'), { label: 'claims-release', phase: 'Report', schema: NOTE_SCHEMA, model: M.probe.model, effort: M.probe.effort })
     .catch(function () { return null })
   if (!swept || !swept.posted) log('claims-release sweep incomplete — stale "' + CLAIM_LABEL + '" labels expire via the ' + Math.round(CLAIM_STALE_SECONDS / 3600) + 'h staleness window')
+}
+
+// ---- Gate-state self-validation sweep (issue #166, task 4) — proves
+// post -> GitHub -> read -> parse round-tripped for every issue this run
+// wrote a gate-state comment for. Advisory only (log lines, plus a
+// VERIFY_SKIPS entry on mismatch/read-failed — see :5122 — never a result
+// mutation) and non-fatal end to end: wrapped so a bug in the sweep itself
+// can never take the rest of Report down with it. Runs BEFORE the
+// token/friction/rework rollups below on purpose — those are pure
+// JS-computed aggregations over `results` that must never depend on this
+// sweep's (agent-backed, best-effort) outcome. ----
+try {
+  await verifyGateState(results)
+} catch (e) {
+  log('gate-state-verify sweep threw (non-fatal): ' + String((e && e.message) || e).slice(0, 200))
 }
 
 // ---- Token usage: JS-computed aggregation (no LLM math), injected verbatim below ----

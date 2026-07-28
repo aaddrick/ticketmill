@@ -95,3 +95,33 @@ test('fail(): a clean ctx (no unresolved findings, no test-quality-fix rounds) r
   // must track the actual status string, not just "any failure".
   assert.strictEqual(result.needs_human, false)
 })
+
+// ---- issue #163: the quality gate's cap must NOT write to ctx.unresolved ----
+//
+// runQualityLoop records cap exhaustion via gate_findings.quality and a
+// rolled-up VERIFY_SKIPS line (see tests/quality-loop.test.js), deliberately
+// NOT via ctx.unresolved — that field is reserved for critical/major findings
+// carried past a CONTRARIAN gate cap (approach/plan). A capped quality loop
+// must leave frictionFields' contrarian_capped/unresolved_count at their
+// all-clear defaults even though the quality gate itself capped out.
+
+test('frictionFields: a capped quality loop leaves contrarian_capped false and unresolved_count 0 — the quality gate\'s cap writes to gate_findings, never to ctx.unresolved', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) return { result: 'changes_requested', comments: 'still not right', issues: [{ severity: 'major', summary: 'bug' }], recommended_fix_agent: null, summary: 'needs work' }
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 9 })
+  const loopResult = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+  assert.strictEqual(loopResult, 'degraded') // confirms the cap was actually hit, not some other exit
+
+  const ff = context.frictionFields(ctx, 'needs_human')
+  assert.strictEqual(ff.contrarian_capped, false)
+  assert.strictEqual(ff.unresolved_count, 0)
+})

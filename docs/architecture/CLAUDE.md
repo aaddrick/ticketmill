@@ -1,10 +1,11 @@
 # Working on the architecture docs
 
-Read this before editing anything under `docs/architecture/`. These ten files
-used to be one file, `docs/ARCHITECTURE.md`, split into topic-sized pages by
-issue #154. The split is provable: a committed test reconstructs the original
-document from these files and checks it byte for byte against a digest
-recorded when the split happened.
+Read this before editing anything under `docs/architecture/`. Ten of the files
+in this directory used to be one file, `docs/ARCHITECTURE.md`, split into
+topic-sized pages by issue #154; any file added since is new material, not
+part of that split. The split is provable: a committed test reconstructs the
+original document from the ten split-derived files and checks it byte for
+byte against a digest recorded when the split happened.
 
 > **Parity note:** `CLAUDE.md` and `AGENTS.md` in this directory are byte-identical
 > on purpose, so an agent finds the same guidance under whichever name its harness
@@ -67,6 +68,7 @@ to ship.
 | `invocation-and-guardrails.md` | Invocation, the sandbox lint, and the engine-owned path guardrail. |
 | `branching-and-merge.md` | The batch-branch model, release stage, and merge auto-resolve. |
 | `metrics.md` | Friction and churn, rework tax, gate yield, and outcome grading. |
+| `gate-hygiene.md` | Typed review findings, engine-assigned ids, the three loop predicates, gate-outcome tallying (the quality gate's disposition map, its cap, the pooled friction denominator, and its supersession of `metrics.md:13-14` and `:114`), and the durable per-issue "## Gate State" comment (write boundaries, the four-state read contract, and the trust model). Authored text, added after the split; not tracked in the provenance fixture, the same as the `AGENTS.md`/`CLAUDE.md` row below. |
 | `failure-semantics.md` | How the run fails, halts, and resumes (two segments, emitted out of source order: the short bullet list first, the incident-derived-machinery table second). |
 | `cost-and-tokens.md` | Token tracking, cost estimation, and the token_budget guard. |
 | `scheduling.md` | Claims interop, the consolidation gate, and lane scheduling. |
@@ -93,3 +95,57 @@ when the split happened. It has no opinion on new material:
 3. Either way, keep `index.md`'s file map current. It's authored text, so
    the provenance test won't catch a stale row, but a reader following it
    will.
+
+## A frozen passage that is now stale prose
+
+`metrics.md:81-84` ("Completing the gate findings tally", ending
+"`gate_findings['pr-review'].severity` stays zero across the board") is
+moved prose describing the state of the world before issue #162, and it was
+already inaccurate when it shipped: the merge gate already fed real,
+non-zero counts into `gate_findings['pr-review'].severity` whenever a
+reviewer happened to name a concern in `issues` rather than `comments`.
+Issue #162 is what makes the correction worth writing down: severity counts
+are now guaranteed and schema-backed rather than incidental. The sentence
+cannot be corrected in place — it sits inside a tracked segment — so it was
+left exactly as it shipped and superseded by `gate-hygiene.md`, which is
+the correction and the durable source of truth. Read `gate-hygiene.md`'s
+provenance paragraph before trusting anything `metrics.md` says about
+`gate_findings['pr-review'].severity`.
+
+A second, unrelated sentence in the same file goes stale the same way, for
+the same structural reason: `metrics.md:114`, the `computeGateYield(results)`
+lede — "rolls the three gates' `gate_findings` tallies" — describes a world
+where `approach`, `plan`, and `pr-review` were the only gates that ever
+appeared in `gate_findings`. Issue #163 makes that untrue: the quality loop
+now records outcomes through `recordGateOutcome` too, so a fourth gate
+routinely shows up in the same rollup. This sentence cannot be corrected in
+place either, and not merely because it sits inside a tracked segment the
+way `metrics.md:81-84` does — `metrics.md`'s only tracked segment is not
+scoped to a passage within the file, it spans nearly the whole file:
+`tests/fixtures/architecture-split.json` records one segment for
+`metrics.md`, 329 lines starting at its first heading — 328 of them on
+disk, running to the end of the 332-line file, plus one trailing blank
+line stripped when the file was written — everything but the four-line
+synthetic H1 and lede above that heading. `tests/architecture-provenance.test.js` hashes
+that segment verbatim, so it hashes the file from its first heading to the
+end, and there is no partial-credit edit even smaller than the one
+described above. `metrics.md:114`
+stays exactly as it reads, superseded by `gate-hygiene.md`'s "The quality
+gate" section, the same way `metrics.md:81-84` is superseded by the section
+above it.
+
+A third sentence in the same file goes stale the same way, again for the
+same structural reason: `metrics.md:13-14` — "Seven capped pipeline stages
+(approach, plan, task-review, quality, test, browser, pr-review) each
+contribute `min(1, iters/cap)` to that score" — describes a world where
+every capped stage's contribution compares one loop's iteration count to
+that same loop's cap. Issue #165 makes that untrue for one of the seven:
+the quality stage's cap is now pooled across however many calls an issue
+made to `runQualityLoop` (`quality_iters / (MAX_QUALITY_ITERATIONS *
+quality_scopes)`), not compared to a single loop's cap. This sentence
+cannot be corrected in place either, for the same reason `metrics.md:114`
+can't: `metrics.md`'s one tracked segment spans nearly the whole file, and
+`tests/architecture-provenance.test.js` hashes it verbatim from the first
+heading to the end. `metrics.md:13-14` stays exactly as it reads,
+superseded by `gate-hygiene.md`'s "The friction denominator: pooled, not
+worst-scope" section, the same way the two sentences above it already are.
