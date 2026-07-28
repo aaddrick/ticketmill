@@ -191,6 +191,15 @@ test('runQualityLoop: a changes_requested review with issues: [] is treated as c
   const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
   assert.strictEqual(verifySkips.length, 1)
   assert.ok(verifySkips[0].includes('#56: quality review'))
+
+  // issue #163: this clean-but-unfixed exit tallies as 'carried-unresolved' in
+  // gate_findings.quality — it converted a changes_requested verdict to a pass
+  // without ever running a fix, so it is not an 'accepted' outcome.
+  harness.assertVmEqual(ctx.gate_findings.quality, {
+    count: 0,
+    severity: { critical: 0, major: 0, minor: 0 },
+    disposition: { 'carried-unresolved': 1 },
+  })
 })
 
 // ---- MIRROR IMAGE (issue #162): `issues` omitted entirely must NOT be treated as empty ----
@@ -260,4 +269,256 @@ test('runQualityLoop: an existing issues: ["x"] fixture still runs the fix stage
   const fixCall = scriptedAgent.calls.find(function (c) { return ((c.opts && c.opts.label) || '').indexOf(':quality-fix-') !== -1 })
   assert.ok(fixCall, 'fix stage must have run for an issues: ["x"] fixture')
   assert.ok(/- \[quality-task-1-i1-1\] \[unspecified\] x -> /.test(fixCall.prompt), 'fix prompt must render the id-prefixed finding line: ' + fixCall.prompt.slice(0, 2000))
+})
+
+// ---- issue #163: recordGateOutcome(ctx, 'quality', ...) wiring — one test per
+// disposition branch from task 1's map. tests/gate-findings.test.js already
+// proves recordGateOutcome() itself is correct in isolation; these drive the
+// real runQualityLoop() control flow (same rationale as
+// tests/pr-review-gate.test.js's header comment) so the derivation at each
+// call site — not just the pure tally function — is proven end-to-end. ----
+
+test('runQualityLoop: a simplify-stage death records a "dismissed" disposition with zero findings', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {} }) // no simplify_globs -> every file in-scope -> simplify runs
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) return { status: 'error', summary: 'simplify blew up', commit: null, files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 59 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['src/foo.js'])
+
+  assert.strictEqual(result, 'degraded')
+  assert.strictEqual(ctx.metrics.quality_degrades, 1)
+  harness.assertVmEqual(ctx.gate_findings.quality, {
+    count: 0,
+    severity: { critical: 0, major: 0, minor: 0 },
+    disposition: { dismissed: 1 },
+  })
+})
+
+test('runQualityLoop: a review-stage death (agent gives up after retries) records a "dismissed" disposition with zero findings', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } }) // scoped away from the changed file -> simplify skipped
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    // null every attempt -> stage() retries STAGE_TRIES times then gives up (dead).
+    if (label.indexOf(':quality-review-') !== -1) return null
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 60 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'degraded')
+  assert.strictEqual(ctx.metrics.quality_degrades, 1)
+  harness.assertVmEqual(ctx.gate_findings.quality, {
+    count: 0,
+    severity: { critical: 0, major: 0, minor: 0 },
+    disposition: { dismissed: 1 },
+  })
+})
+
+test('runQualityLoop: an approved review records an "accepted" disposition, tallying any nit-level issues alongside the approval', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    // 'approved' can still carry nit-level issues — the disposition is driven
+    // by .result alone, not by issues being empty (mirrors pr-review-gate.test.js:70).
+    if (label.indexOf(':quality-review-') !== -1) return { result: 'approved', comments: '', issues: [{ severity: 'minor', summary: 'nit: naming' }], recommended_fix_agent: null, summary: 'looks good' }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 61 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'approved')
+  harness.assertVmEqual(ctx.gate_findings.quality, {
+    count: 1,
+    severity: { critical: 0, major: 0, minor: 1 },
+    disposition: { accepted: 1 },
+  })
+})
+
+test('runQualityLoop: a changes_requested review before the cap iteration records a "re-litigated" disposition', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  let reviewCalls = 0
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      if (reviewCalls === 1) return { result: 'changes_requested', comments: 'fix this', issues: [{ severity: 'major', summary: 'bug' }], recommended_fix_agent: null, summary: 'needs work' }
+      return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 62 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'approved')
+  const g = ctx.gate_findings.quality
+  assert.strictEqual(g.count, 1)
+  harness.assertVmEqual(g.disposition, { 're-litigated': 1, accepted: 1 })
+})
+
+// ---- issue #163: a typed mixed-severity issues array (mirrors
+// tests/pr-review-gate.test.js:390) ----
+
+test('runQualityLoop: a typed mixed-severity issues array makes gate_findings["quality"].severity report real, non-zero counts', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  let reviewCalls = 0
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      if (reviewCalls === 1) {
+        return {
+          result: 'changes_requested', comments: '', issues: [
+            { severity: 'critical', summary: 'auth bypass' },
+            { severity: 'major', summary: 'missing input validation', recommendation: 'validate before use' },
+            { severity: 'minor', summary: 'typo in error message' },
+          ], recommended_fix_agent: null, summary: 'three findings',
+        }
+      }
+      return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 63 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'approved')
+  const g = ctx.gate_findings.quality
+  assert.strictEqual(g.count, 3)
+  harness.assertVmEqual(g.severity, { critical: 1, major: 1, minor: 1 })
+  harness.assertVmEqual(g.disposition, { 're-litigated': 1, accepted: 1 })
+})
+
+// ---- issue #163: the exact invariant sum(gate_findings.quality.disposition)
+// === ctx.metrics.quality_iters. Every iteration entered (quality_iters++ at
+// the top of the loop body) records exactly one disposition before the
+// iteration can exit, whether it exits clean or by a later death — proven
+// here by ending the loop on a death AFTER a prior re-litigated iteration. ----
+
+test('runQualityLoop: sum(gate_findings.quality.disposition) === ctx.metrics.quality_iters, even when the loop ends on a later death', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  let reviewCalls = 0
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      // iteration 1: changes_requested with a real finding (-> re-litigated,
+      // fix runs and succeeds); iteration 2: the reviewer dies (-> dismissed).
+      if (reviewCalls === 1) return { result: 'changes_requested', comments: 'fix this', issues: [{ severity: 'major', summary: 'bug' }], recommended_fix_agent: null, summary: 'needs work' }
+      return null
+    }
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 64 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'degraded')
+  assert.strictEqual(ctx.metrics.quality_iters, 2)
+  const g = ctx.gate_findings.quality
+  harness.assertVmEqual(g.disposition, { 're-litigated': 1, dismissed: 1 })
+  const sum = Object.keys(g.disposition).reduce(function (acc, k) { return acc + g.disposition[k] }, 0)
+  assert.strictEqual(sum, ctx.metrics.quality_iters)
+})
+
+// ---- issue #163: the bounded cap line — cap exhaustion is `!approved &&
+// !degraded` at the loop tail, rolled up to exactly ONE VERIFY_SKIPS entry. ----
+
+test('runQualityLoop: a fully capped loop (5 changes_requested iterations, no death) records disposition {\'re-litigated\': 4, \'carried-unresolved\': 1}, returns "degraded", leaves quality_degrades at 0, and pushes exactly one VERIFY_SKIPS entry', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) return { result: 'changes_requested', comments: 'still not right', issues: [{ severity: 'major', summary: 'bug' }], recommended_fix_agent: null, summary: 'needs work' }
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 65 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'degraded')
+  assert.strictEqual(ctx.metrics.quality_iters, 5)
+  assert.strictEqual(ctx.metrics.quality_degrades, 0)
+  const g = ctx.gate_findings.quality
+  assert.strictEqual(g.count, 5)
+  harness.assertVmEqual(g.disposition, { 're-litigated': 4, 'carried-unresolved': 1 })
+
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 1)
+  assert.ok(verifySkips[0].includes('#65'), 'expected the single cap line to name this issue: ' + verifySkips[0])
+  assert.ok(verifySkips[0].includes('task 1'), 'expected the single cap line to name the capped scope: ' + verifySkips[0])
+})
+
+test('runQualityLoop: two capped scopes on the same ctx (a task, then a PR-fix round) roll up to exactly one VERIFY_SKIPS entry naming both', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) return { result: 'changes_requested', comments: 'still not right', issues: [{ severity: 'major', summary: 'bug' }], recommended_fix_agent: null, summary: 'needs work' }
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 66 })
+  const firstResult = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+  const secondResult = await context.runQualityLoop(ctx, 'pr-fix-i1', 'fix pr feedback', ['docs/readme.md'])
+
+  assert.strictEqual(firstResult, 'degraded')
+  assert.strictEqual(secondResult, 'degraded')
+
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 1, 'a second capped scope on the same ctx must rewrite the existing entry in place, not append a second one: ' + JSON.stringify(verifySkips))
+  assert.ok(verifySkips[0].includes('task 1'), 'expected the rolled-up entry to still name the first capped scope: ' + verifySkips[0])
+  assert.ok(verifySkips[0].includes('PR-fix round 1'), 'expected the rolled-up entry to also name the second capped scope: ' + verifySkips[0])
+})
+
+test('runQualityLoop: a loop that converges to "approved" pushes no VERIFY_SKIPS entry at all', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {} })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) return { status: 'success', summary: 'nothing to simplify', commit: null, files_changed: [] }
+    if (label.indexOf(':quality-review-') !== -1) return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 67 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['src/foo.js'])
+
+  assert.strictEqual(result, 'approved')
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 0)
 })
