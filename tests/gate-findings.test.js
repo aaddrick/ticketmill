@@ -16,6 +16,30 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const harness = require('./harness')
 
+// ---- CHALLENGE_SCHEMA.findings.items (issue #164) ----
+//
+// A structural assertion, not a behavioral one: tests/harness.js stubs
+// agent() and never validates opts.schema, so no harness test in this suite
+// can exercise the real JSON-schema validator against a live agent call. This
+// reads the schema object straight off the vm context instead, to prove the
+// required list actually changed rather than just trusting the source edit.
+
+test('CHALLENGE_SCHEMA.findings.items: required is exactly [severity, summary], recommendation optional-but-declared (#164)', function () {
+  const context = harness.boot()
+  const schema = harness.readGlobal(context, 'CHALLENGE_SCHEMA')
+
+  // Array.from(): required is a const array literal evaluated inside the vm
+  // context, so it's a different-realm Array — deepEqual (this file's
+  // assert.deepEqual is node:assert/strict, i.e. deepStrictEqual) checks
+  // prototype identity and fails on a cross-realm array even with identical
+  // contents. Array.from() rebuilds it same-realm first. See
+  // tests/engine-owned.test.js:35 for the same hazard against ENGINE_OWNED_GLOBS.
+  const required = Array.from(schema.properties.findings.items.required)
+  assert.deepEqual(required, ['severity', 'summary'])
+
+  assert.strictEqual(schema.properties.findings.items.properties.recommendation.type, 'string')
+})
+
 test('recordGateOutcome: a fresh gate key tallies count and severity mix from its findings', function () {
   const context = harness.boot()
   const ctx = harness.makeCtx({ issue: 1 })
