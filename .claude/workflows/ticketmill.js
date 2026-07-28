@@ -1274,6 +1274,19 @@ function gateStateEpochStale(payload, runEpochMs) {
 // comments exist but produced none) -- exactly the truncated/corrupted-read
 // shape this whole design exists to make undetectable-as-absence, so it is
 // always read-failed regardless of `hasPriorWork`.
+//
+// hasGateStatePriorWork: shared with fetchGateStateBlocks' diagnostic log
+// (below the split), which needs the same fact to tell the falsifiable-absent
+// case apart from an ordinary read-failed -- kept as one pure helper rather
+// than two copies of the same three-condition check.
+function hasGateStatePriorWork(priorWork) {
+  const pw = priorWork || {}
+  return !!(
+    (pw.pr_number !== null && pw.pr_number !== undefined) ||
+    pw.worktree_exists === true ||
+    (pw.resume_point != null && pw.resume_point !== 'implement')
+  )
+}
 function selectGateState(rows, evidence, priorWork) {
   const r = rows || {}
   const ev = evidence || {}
@@ -1286,15 +1299,10 @@ function selectGateState(rows, evidence, priorWork) {
 
   const blocks = Array.isArray(r.blocks) ? r.blocks : []
   const total = Number.isInteger(r.total) ? r.total : blocks.length
-  const hasPriorWork = !!(
-    (pw.pr_number !== null && pw.pr_number !== undefined) ||
-    pw.worktree_exists === true ||
-    (pw.resume_point != null && pw.resume_point !== 'implement')
-  )
 
   if (blocks.length === 0) {
     if (total > 0) return Object.assign({ state: 'read-failed' }, EMPTY)
-    if (hasPriorWork) return Object.assign({ state: 'read-failed' }, EMPTY)
+    if (hasGateStatePriorWork(pw)) return Object.assign({ state: 'read-failed' }, EMPTY)
     return Object.assign({ state: 'absent' }, EMPTY)
   }
 
@@ -4583,8 +4591,7 @@ async function fetchGateStateBlocks(issueNumbers, priorWorkByIssue) {
     const rowsArg = row ? Object.assign({ exit_ok: row.exit_ok }, parsed) : {}
     const pw = pwByIssue[n] || {}
     const sel = selectGateState(rowsArg, { repo: REPO, issue: n, self_login: selfLogin, claim_authors: [], batch: TARGET, run_epoch: RUN_EPOCH }, pw)
-    const hasPriorWork = !!((pw.pr_number !== null && pw.pr_number !== undefined) || pw.worktree_exists === true || (pw.resume_point != null && pw.resume_point !== 'implement'))
-    if (sel.state === 'read-failed' && parsed.blocks.length === 0 && hasPriorWork) {
+    if (sel.state === 'read-failed' && parsed.blocks.length === 0 && hasGateStatePriorWork(pw)) {
       const why = pw.pr_number != null ? ('PR #' + pw.pr_number + ' open')
         : pw.worktree_exists ? 'worktree exists'
         : ('resume_point=' + pw.resume_point)
