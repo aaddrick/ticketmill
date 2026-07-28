@@ -524,12 +524,14 @@ test('contestedBlock: closing contract is INVERTED from settledBlock — it tell
   assert.ok(!/re-litigating.*process failure/i.test(block), 'must NOT carry settledBlock\'s discourage-reopening contract: ' + block)
 })
 
-test('contestedBlock: states a contested finding is not "already addressed" and that the iteration-2+ do-not-re-flag instruction does not apply to it', function () {
+test('contestedBlock: states a contested finding is not "already addressed" and that neither the do-not-re-flag nor the stay-consistent instruction applies to it', function () {
   const context = harness.boot()
   const block = context.contestedBlock({ contested: [{ gate: 'quality', id: 'x-1', summary: 's', evidence: 'e' }] })
 
   assert.ok(/not.*already addressed/i.test(block), 'must state a contested finding is not "already addressed": ' + block)
-  assert.ok(/does not apply|not apply/i.test(block), 'must state the iteration-2+ do-not-re-flag instruction does not apply here: ' + block)
+  assert.ok(/re-flag issues already addressed or accepted/i.test(block), 'must name the code-review do-not-re-flag instruction: ' + block)
+  assert.ok(/stay consistent with/i.test(block), 'must name the spec-review stay-consistent instruction: ' + block)
+  assert.ok(/does not apply|not apply/i.test(block), 'must state neither instruction applies here: ' + block)
 })
 
 test('contestedBlock: renders only the last 6 entries', function () {

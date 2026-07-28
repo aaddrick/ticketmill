@@ -1890,17 +1890,10 @@ function settledBlock(ctx) {
 }
 
 // ----- contested-findings ledger (issue #167) -----
-// A finding a fixer rebutted (FIX_SCHEMA.rebutted, normalized by
-// normalizeRebuttals() below) is a DISPUTE, not a resolution — nobody has
-// judged whether the rebuttal's evidence actually disproves the finding.
-// This renders those disputes back to the NEXT reviewer so it can adjudicate
-// them, deliberately NOT reusing settleDecision()/settledBlock(): a settled
-// entry carries a "don't re-open without new evidence" contract because
-// someone already ruled on it; a contested entry carries the OPPOSITE
-// contract, because no one has — this function never calls settleDecision(),
-// only a reviewer (or eventually a human) closes a contested entry. Mirrors
-// settledBlock's shape (defensive read, last-6 window, per-field slice caps,
-// '' when empty) so both render identically at every site that pairs them.
+// Renders a fixer's unadjudicated rebuttal back to the NEXT reviewer, the
+// opposite trust contract from settledBlock; nothing ever removes an entry
+// from ctx.contested once pushed, a known gap, not a design decision.
+// Full rationale: docs/architecture/gate-hygiene.md#contestedblock-versus-settledblock-a-deliberate-contract-inversion
 function contestedBlock(ctx) {
   const contested = (ctx && ctx.contested) || []
   if (!contested.length) return ''
@@ -1913,9 +1906,9 @@ function contestedBlock(ctx) {
     'A contested finding is NOT resolved: verify the rebuttal\'s evidence yourself. If it holds, say so and drop',
     'the finding. If it does not hold, re-raise it as a finding this iteration — do not let it sit contested',
     'indefinitely with neither outcome.',
-    'A contested finding is NOT "already addressed" — no code changed for it and no one has ruled on it. The',
-    'iteration-2+ instruction elsewhere in this prompt not to re-flag issues already addressed or accepted does',
-    'NOT apply to anything in this block.',
+    'A contested finding is NOT "already addressed" — no code changed for it and no one has ruled on it. Whichever',
+    'instruction this prompt carries elsewhere — not to re-flag issues already addressed or accepted, or to stay consistent with',
+    'your own prior reviews — does NOT apply to anything in this block.',
   ].join('\n')
 }
 
@@ -1930,20 +1923,10 @@ const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> l
   'or recall a SHA from memory.'
 
 // ----- finding-hypothesis framing (issue #167) -----
-// A finding from a reviewer is a HYPOTHESIS to verify, not a command to obey
-// unconditionally — the two contrarian revision stages (approach re-evaluate,
-// plan re-plan) already carry this framing; nothing at the fix stages did,
-// leaving a fixer that disagrees no path but silent compliance or
-// status:'error'. Wired into exactly the three EVALUATOR-FED fix stages
-// (quality-fix, test-quality-fix, pr-fix) — never the two ORACLE-fed ones
-// (test-fix, browser-fix), which already carry a correct anti-rebuttal guard
-// ("fix the real defect — do NOT delete/weaken assertions just to make the
-// failure disappear") that this framing would invert: a failing test or a
-// broken page is ground truth, not a hypothesis. The consequence clause is
-// deliberately GATE-AGNOSTIC (no "ends this gate immediately" / "no further
-// fix round runs" language) so the same string stays true whichever of the
-// three gates renders it, including pr-review, where a rebuttal-only round
-// continues into another review iteration rather than halting on the spot.
+// Wired into exactly the three EVALUATOR-FED fix stages (quality-fix,
+// test-quality-fix, pr-fix) — never the two ORACLE-fed ones (test-fix,
+// browser-fix), whose findings are ground truth, not a judgment call.
+// Full rationale: docs/architecture/gate-hygiene.md#rebuttal-a-finding-is-a-hypothesis-not-a-command-issue-167
 const FINDING_HYPOTHESIS_ASK = [
   'Each finding above is a HYPOTHESIS the reviewer formed, not a command — verify it against the actual code before acting on it.',
   'If a finding is wrong, do NOT change code to satisfy it: record it in `rebutted` with the concrete check you ran ' +
@@ -2104,25 +2087,10 @@ function recordGateOutcome(ctx, gate, findings, disposition) {
 
 // retypeGateDisposition (issue #167): moves exactly ONE count from disposition
 // bucket `from` to bucket `to` within an already-recorded
-// ctx.gate_findings[gate] entry, WITHOUT touching that gate's overall `count`
-// or `severity` mix — both already reflect the findings themselves, which
-// retyping a disposition label does not change. Exists because
-// recordGateOutcome() above books a disposition BEFORE a fix stage runs (e.g.
-// the final quality iteration books 'carried-unresolved' at :2933, then the
-// fix stage's rebuttal is only known after that); this lets a later step
-// correct the label on a bucket that already exists rather than double-count
-// a second recordGateOutcome() call. No-ops (does nothing) when `gate` was
-// never recorded, or when the `from` bucket doesn't exist — there is nothing
-// to move.
-// from === to IS A SUPPORTED, COUNT-PRESERVING NO-OP, not an error case to
-// special-case away: it re-buckets a count into itself (subtract 1, then add
-// 1 back to the same key), netting zero change. This is reachable in
-// practice, not just theoretically — MAX_QUALITY_ITERATIONS is 5 (:46) and
-// the quality gate already books 'carried-unresolved' on iteration 5 before
-// any fix runs (:2933); a rebuttal-only fix on THAT iteration has nothing
-// meaningful to retype the bucket to, so the call site retypes
-// 'carried-unresolved' to itself for symmetry with every other iteration's
-// call, rather than special-casing the last iteration to skip the call.
+// ctx.gate_findings[gate] entry, without touching that gate's `count`/
+// `severity`. from === to is a supported, count-preserving no-op (reachable
+// on a rebuttal-only fix at a loop's final iteration), not an error case.
+// Full rationale: docs/architecture/gate-hygiene.md#the-three-per-gate-exits-and-why-only-pr-review-can-block-a-merge
 function retypeGateDisposition(ctx, gate, from, to) {
   if (!ctx || !ctx.gate_findings) return
   const key = String(gate || '').trim()
@@ -2168,20 +2136,14 @@ function normalizeFindings(raw, source) {
 }
 
 // normalizeRebuttals (issue #167): turns FIX_SCHEMA's `rebutted` array into a
-// validated list the engine can act on, mirroring normalizeFindings()'s
-// fail-toward-existing-behavior contract just above it. `raw` not being an
-// array (including undefined/null — a fixer that never disagreed, i.e. every
-// fixer before this issue) returns [] rather than null: unlike
-// normalizeFindings, there is no prose-fallback distinction worth preserving
-// here — "nothing to act on" is the only meaningful outcome either way. Every
-// drop (blank finding_id, blank evidence, or a finding_id absent from
-// `findings` — the exact, possibly-null array actually rendered to this
-// fixer) fails toward TODAY's behavior: the entry is silently dropped, never
-// trusted, so a fixer cannot fabricate a rebuttal against a finding id it was
-// never shown (FINDING_HYPOTHESIS_ASK's own "only a bracketed id can be
-// rebutted" clause is enforced here, not just asked for in prose). A
-// surviving entry carries the matched finding's `summary` through so
-// contestedBlock() can render a self-contained line without a second lookup.
+// validated list, mirroring normalizeFindings()'s fail-toward-existing-
+// behavior contract just above it: every drop (non-array raw, blank
+// finding_id/evidence, or a finding_id absent from `findings` — the exact
+// array actually rendered to this fixer) fails toward TODAY's behavior, a
+// silently dropped entry, so a fixer can't fabricate a rebuttal against an
+// id it was never shown. The bar enforced here is non-blankness only, not
+// evidence quality — see gate-hygiene.md for that distinction.
+// Full rationale: docs/architecture/gate-hygiene.md#normalizerebuttals-every-drop-fails-toward-todays-behavior
 function normalizeRebuttals(raw, findings) {
   if (!Array.isArray(raw)) return []
   const byId = {}
@@ -3098,14 +3060,10 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
     collectNotes(ctx, 'quality-fix', fix)
     collectPostedCommit(ctx, 'quality-fix-' + prefix + '-i' + iter, fix)
 
-    // rebuttal-only exit (issue #167): a fix that rebutted every finding it was
-    // shown and applied none is a DISPUTE, not a resolution — see the
-    // rebuttalOnly comment above runTestLoop's mirror of this block for the
-    // full contract this predicate enforces. Evaluated AFTER collectNotes/
-    // collectPostedCommit above (so handoff notes and the posted-commit ledger
-    // still see this round) but BEFORE tallyTouches just below, which is a
-    // verified no-op here anyway since a true rebuttalOnly round always has an
-    // empty files_changed by construction.
+    // rebuttal-only exit (issue #167): a fix that rebutted every finding and
+    // applied none is a DISPUTE, not a resolution — stops this loop rather
+    // than spending remaining iterations on it.
+    // Full rationale: docs/architecture/gate-hygiene.md#the-three-per-gate-exits-and-why-only-pr-review-can-block-a-merge
     const normRebuttals = normalizeRebuttals(fix.rebutted, revFindings || [])
     const rebuttalOnly = normRebuttals.length > 0 && (fix.fixes_applied || []).length === 0 && (fix.files_changed || []).length === 0
     if (rebuttalOnly) {
@@ -3638,17 +3596,11 @@ async function runTestLoop(ctx, forced) {
     collectNotes(ctx, 'test-quality-fix', qfix)
     collectPostedCommit(ctx, 'test-quality-fix-i' + iter, qfix)
 
-    // rebuttal-only exit (issue #167): mirrors runQualityLoop's rebuttalOnly
-    // block above, minus the recordGateOutcome/retypeGateDisposition calls —
-    // this loop books no gate key in ctx.gate_findings today (there is no
-    // 'test-quality' entry to retype) and this issue does not add one. Exits
-    // through this loop's OWN non-clean path (return { ok: true }, never
-    // { ok: false }) so nothing routes through the 'test-loop' stage key that
-    // a merge-block failure would use — a rebuttal-only round here can never
-    // block a merge, only get carried to the next reviewer as contested. No
-    // roll-up index needed (unlike the quality-cap/quality-rebuttal roll-ups
-    // above): runTestLoop runs once per issue, not once per task, so a single
-    // VERIFY_SKIPS.push() here can never produce more than one line.
+    // rebuttal-only exit (issue #167): mirrors runQualityLoop's block above,
+    // minus recordGateOutcome/retypeGateDisposition — this loop books no
+    // 'test-quality' gate_findings entry to retype. Exits { ok: true }, never
+    // { ok: false }: a rebuttal-only round here can never block a merge.
+    // Full rationale: docs/architecture/gate-hygiene.md#the-three-per-gate-exits-and-why-only-pr-review-can-block-a-merge
     const normRebuttals = normalizeRebuttals(qfix.rebutted, vFindings || [])
     const rebuttalOnly = normRebuttals.length > 0 && (qfix.fixes_applied || []).length === 0 && (qfix.files_changed || []).length === 0
     if (rebuttalOnly) {
@@ -5063,38 +5015,18 @@ async function reviewAndMerge(ctx) {
     collectPostedCommit(ctx, 'pr-fix-i' + iter, fix)
 
     // rebuttal-only exit (issue #167): mirrors runQualityLoop's/runTestLoop's
-    // rebuttalOnly block, evaluated over the UNION of both reviewers' rendered
-    // finding sets (the fixer saw both blocks in one prompt above) — see
-    // normalizeRebuttals' doc comment for why `findings` must be exactly what
-    // was rendered. Evaluated AFTER pushDecision/collectNotes/
-    // collectPostedCommit above (so the fixer's summary, handoff notes, and
-    // the posted-commit ledger all still see this round) but BEFORE
-    // tallyTouches/runQualityLoop below: tallyTouches is a verified no-op on a
-    // true rebuttal-only round's empty files_changed, but runQualityLoop is
-    // NOT — runSimplify fails open on an empty filesChanged array and would
-    // burn a full quality gate against an untouched tree, so `continue` MUST
-    // precede that call, not follow it.
-    //
-    // Unlike the quality/test loops, this gate does NOT push a second
-    // pushDecision here — the one above already fires for every non-error fix
-    // and renders the fixer's summary; a rebuttal-only round has nothing
-    // further to narrate that recordGateOutcome/retypeGateDisposition and the
-    // contested-block push below don't already carry into the next iteration.
-    //
-    // No id-equality halt: REVIEW_SCHEMA ids are `source + '-' + (i+1)` with
-    // the iteration baked into `source` (see spec/code review call sites
-    // above), so a second round's ids are disjoint from the first round's by
-    // construction — an id-equality check here would be permanently dead code.
-    // Instead, rebuttalRoundsUsed (declared above the loop) permits exactly
-    // ONE rebuttal-only round per reviewAndMerge() call: a second one sets
-    // haltReason and breaks into the existing `if (!approved)` needs_human
-    // path below, same shape as the bothNothingToFix/capReached breaks above.
+    // block, over the UNION of both reviewers' rendered findings. `continue`
+    // MUST precede runQualityLoop below (runSimplify fails open on an empty
+    // filesChanged). rebuttalRoundsUsed permits exactly ONE such round per
+    // reviewAndMerge() call before halting to needs_human.
+    // Full rationale: docs/architecture/gate-hygiene.md#the-three-per-gate-exits-and-why-only-pr-review-can-block-a-merge
     const prFixFindings = (specFindings || []).concat(codeFindings || [])
     const normRebuttals = normalizeRebuttals(fix.rebutted, prFixFindings)
     const rebuttalOnly = normRebuttals.length > 0 && (fix.fixes_applied || []).length === 0 && (fix.files_changed || []).length === 0
     if (rebuttalOnly) {
       if (rebuttalRoundsUsed >= 1) {
         haltReason = 'PR #' + ctx.pr + ' review iteration ' + iter + ': a second rebuttal-only PR fix round rebutted every finding and applied no fix — left open for human review'
+        retypeGateDisposition(ctx, 'pr-review', prReviewDisposition, 'carried-unresolved')
         break
       }
       rebuttalRoundsUsed++

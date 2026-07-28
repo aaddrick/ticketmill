@@ -537,11 +537,15 @@ passing as a resolved gate.
 rendered finding wrong records it here instead of touching code for it.
 `evidence` is not "I disagree" — the shared prompt framing asks for "the
 concrete check you ran that disproves it (a command, a line reference, a
-test result — not just disagreement)," and `normalizeRebuttals` enforces
-the same bar mechanically, not just in prose: an entry with a blank
-`evidence` (or a blank `finding_id`) is silently dropped, so bare
-disagreement can never survive normalization to become a rebuttal the
-engine acts on. A rebuttal can also only target a finding the fixer was
+test result — not just disagreement)." That concrete-evidence bar is
+prompt-only: it cannot be checked mechanically, since the engine has no way
+to judge whether a string is actually a command, a line reference, or a
+test result versus prose that merely looks like one. What `normalizeRebuttals`
+enforces mechanically is narrower — only non-blankness: an entry with a
+blank `evidence` (or a blank `finding_id`) is silently dropped, so literally
+empty disagreement can never survive normalization, but a non-blank
+`evidence: 'I disagree'` passes every mechanical check and becomes a
+rebuttal the engine acts on. A rebuttal can also only target a finding the fixer was
 actually shown with a bracketed id (e.g. `[code-i1-2]`) — the same
 `normalizeFindings`-assigned id `findingsBlock()` prefixes onto every
 rendered finding line. Anything a fixer sees only as prose (`comments`,
@@ -650,8 +654,23 @@ stakes:
   `changes_requested`). So pr-fix does not exit on a rebuttal-only round;
   it `continue`s the review loop into another iteration instead, with the
   disputed findings now carried in `contestedBlock` for the next reviewer
-  to adjudicate. `retypeGateDisposition` still fires here too, moving the
-  iteration's booked disposition to `carried-unresolved`.
+  to adjudicate. `retypeGateDisposition` fires here too, moving the
+  iteration's booked disposition to `carried-unresolved` — on every
+  rebuttal-only round, not just the first, including the halting one below.
+
+A local counter, `rebuttalRoundsUsed`, permits exactly ONE rebuttal-only
+pr-fix round per `reviewAndMerge()` call before this gate stops giving a
+disputing fixer another iteration: a second one in the same call sets
+`haltReason` and breaks into the existing `needs_human` path, the same
+shape as the `bothNothingToFix`/`capReached` breaks above it, rather than
+`continue`-ing indefinitely. There's no id-equality check guarding that
+counter because none is needed: `REVIEW_SCHEMA` ids are
+`source + '-' + (i + 1)` with the iteration baked into `source`, so a
+second round's ids are disjoint from the first round's by construction —
+`rebuttalRoundsUsed` alone is sufficient. Unlike the quality/test loops,
+pr-fix does not push a second `pushDecision` on a rebuttal-only round
+either; the `pushDecision` already fired for every non-error fix, right
+after the stage returns, covers it.
 
 ### `contestedBlock` versus `settledBlock`: a deliberate contract inversion
 
@@ -669,18 +688,28 @@ deliberate, not an oversight to reconcile:
   instruction is the opposite: verify the fixer's evidence yourself, drop
   the finding if it holds, re-raise it as a finding this iteration if it
   doesn't, and never let it sit contested indefinitely with neither
-  outcome. It also carries an explicit override: the iteration-2+
-  instruction elsewhere in the same prompt not to re-flag issues "already
-  addressed or accepted" does NOT apply to anything in this block, because
-  a contested finding is neither — no code changed for it, and no one has
-  ruled on it.
+  outcome. It also carries an explicit override: whichever iteration-2+
+  instruction the same prompt carries elsewhere — code review's "don't
+  re-flag issues already addressed or accepted," spec review's "stay
+  consistent with your own prior reviews" — does NOT apply to anything in
+  this block, because a contested finding is neither already addressed nor
+  previously ruled on.
 
 Reusing `settleDecision()`/`settledBlock()` for a rebuttal would tell the
 next reviewer to treat an unadjudicated dispute as already-settled, which
 is precisely the failure mode this whole framing exists to avoid: a
 fixer's own say-so standing in for a real verdict. `contestedBlock` never
-calls `settleDecision()`; only a reviewer (or eventually a human) closes a
-contested entry, by ruling on it in a later iteration.
+calls `settleDecision()` — and, as of this issue, nothing else removes an
+entry from `ctx.contested` either. There is no code path that closes a
+contested entry: a reviewer's verify-then-drop-or-re-raise ruling is
+advisory prose in that review's own response, not a ledger mutation, so a
+contested entry persists for the life of the issue and keeps re-rendering
+to every later review of that gate — including a quality-review at task N
+re-rendering an entry a task-1 rebuttal-only round contested — no matter
+how many iterations follow the round that contested it, and even after a
+later reviewer has actually ruled on it in prose. Closing the ledger entry
+once a later review rules on it is a known gap left for a follow-up issue,
+not a design decision.
 
 ### `rebuttal_only_rounds`: at `pr-review`, the first increment is a continuation, not an exit
 

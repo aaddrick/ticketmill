@@ -576,6 +576,17 @@ test('reviewAndMerge(): a second rebuttal-only pr-fix round halts needs_human wi
     'halt-note-pr-review',
   ])
   assert.ok(!keys.includes('merge'), 'merge must never run — the PR is left open; ran: ' + keys.join(', '))
+
+  // code-i1-2: the halting iteration must ALSO retype its just-booked
+  // 're-litigated' disposition to 'carried-unresolved' — the same call the
+  // continuing (first) rebuttal-only round makes — so a human reading
+  // gate_findings['pr-review'] for the run this halted on sees the run as
+  // carried-unresolved, not as a still-open re-litigation. Iteration 1 books
+  // 're-litigated' then retypes to 'carried-unresolved' (continuing round);
+  // iteration 2 books 're-litigated' again then must retype it too (halting
+  // round) — leaving NO leftover 're-litigated' count from either iteration.
+  const g = ctx.gate_findings['pr-review']
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(g.disposition)), { 'carried-unresolved': 2 })
 })
 
 test('reviewAndMerge(): FINDING_HYPOTHESIS_ASK renders in the pr-fix prompt when only ONE reviewer returned structured findings (the other approved via prose, `issues` omitted)', async function () {
