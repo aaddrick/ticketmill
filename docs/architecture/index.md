@@ -12,7 +12,7 @@ plain JavaScript; every unit of actual work is a schema-validated subagent call.
 | [invocation-and-guardrails.md](invocation-and-guardrails.md) | Invocation, the sandbox lint, and the engine-owned path guardrail. |
 | [branching-and-merge.md](branching-and-merge.md) | The batch-branch model, release stage, and merge auto-resolve. |
 | [metrics.md](metrics.md) | Friction and churn, rework tax, gate yield, and outcome grading. |
-| [gate-hygiene.md](gate-hygiene.md) | Typed review findings, engine-assigned ids, the absent-vs-empty distinction, the three loop predicates, gate-outcome tallying (the quality gate's disposition map, its cap, the pooled friction denominator, and its supersession of `metrics.md:13-14` and `:114`), and the durable per-issue "## Gate State" comment (write boundaries, the four-state read contract, and the trust model). |
+| [gate-hygiene.md](gate-hygiene.md) | Typed review findings, engine-assigned ids, the absent-vs-empty distinction, the three loop predicates, gate-outcome tallying (the quality gate's disposition map, its cap, the pooled friction denominator, and its supersession of `metrics.md:13-14` and `:114`), rebuttal (a finding as a hypothesis a fixer can verify or disprove, `FIX_SCHEMA.rebutted`, the three per-gate exits, and `contestedBlock`), and the durable per-issue "## Gate State" comment (write boundaries, the four-state read contract, and the trust model). |
 | [failure-semantics.md](failure-semantics.md) | How the run fails, halts, and resumes. |
 | [cost-and-tokens.md](cost-and-tokens.md) | Token tracking, cost estimation, and the token_budget guard. |
 | [scheduling.md](scheduling.md) | Claims interop, the consolidation gate, and lane scheduling. |
