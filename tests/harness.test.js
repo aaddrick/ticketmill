@@ -66,3 +66,28 @@ test('harness teeth meta-test: disabling the stub-task guard fails the real asse
   const realResult = realContext.sanitizeTasks(harness.makeCtx({ issue: 99 }), [{ id: 1, description: 'x' }])
   assert.strictEqual(realResult.length, 0)
 })
+
+// ---- issue #165: freshMetrics() (above) is hand-synced to processIssue()'s
+// ctx.metrics object literal in workflows/ticketmill.js because the harness
+// can't import the engine — this parity test gives that hand-sync contract
+// teeth. It regex-reads the single-line `metrics: { ... },` literal straight
+// out of the engine source and asserts its key set equals
+// Object.keys(harness.freshMetrics()), so a field added/removed on either
+// side without the other fails loudly here instead of silently drifting. ----
+
+test('harness parity: freshMetrics() key set matches the single-line metrics literal in workflows/ticketmill.js', function () {
+  const raw = harness.readEngineSource()
+
+  // Exactly one `metrics: { ... },` literal is expected in the whole file
+  // (processIssue()'s ctx init) — matched on its own line so a second,
+  // unrelated `metrics:` occurrence elsewhere can't be picked up by accident.
+  const matches = raw.match(/^\s*metrics:\s*\{[^\n{}]*\},\s*$/gm) || []
+  assert.strictEqual(matches.length, 1, 'expected exactly one single-line "metrics: { ... }," literal in workflows/ticketmill.js — if it moved, was reformatted across lines, or a second one was added, update this regex and tests/harness.js\'s freshMetrics() together: found ' + matches.length)
+
+  const body = matches[0].replace(/^\s*metrics:\s*\{/, '').replace(/\},\s*$/, '')
+  const engineKeys = body.split(',').map(function (pair) { return pair.trim().split(':')[0].trim() }).filter(Boolean)
+  assert.ok(engineKeys.length > 0, 'expected to parse at least one key out of the metrics literal: ' + matches[0])
+
+  const harnessKeys = Object.keys(harness.freshMetrics())
+  assert.deepStrictEqual(engineKeys.slice().sort(), harnessKeys.slice().sort(), 'freshMetrics() key set has drifted from workflows/ticketmill.js\'s metrics literal')
+})
