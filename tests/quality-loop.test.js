@@ -159,3 +159,95 @@ test('runQualityLoop: each quality-fix round tallies its files_changed into ctx.
   assert.strictEqual(ctx.touch_counts['src/foo.js'], 2)
   assert.strictEqual(ctx.touch_counts['src/bar.js'], 1)
 })
+
+// ---- issue #162: a present-and-empty `issues` array is treated as nothing-to-fix ----
+
+test('runQualityLoop: a changes_requested review with issues: [] is treated as clean — no fix stage runs, result is "approved", quality_degrades stays 0, findings_empty_exits increments', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {} })
+
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) return { status: 'success', summary: 'nothing to simplify', commit: null, files_changed: [] }
+    if (label.indexOf(':quality-review-') !== -1) return { result: 'changes_requested', comments: 'nothing actionable', issues: [], recommended_fix_agent: null, summary: 'nothing to fix' }
+    // The fix stage must never be reached on this leg — a live throw here
+    // (not a returned null/error) proves the loop itself never asked for it,
+    // rather than merely never seeing its result.
+    throw new Error('quality-fix must not run when issues is a present, empty array: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 56 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['src/foo.js'])
+
+  assert.strictEqual(result, 'approved')
+  assert.strictEqual(ctx.metrics.quality_degrades, 0)
+  assert.strictEqual(ctx.metrics.findings_empty_exits, 1)
+  const stageKeys = scriptedAgent.calls.map(function (c) { return (c.opts && c.opts.label) || '' })
+  assert.ok(!stageKeys.some(function (k) { return k.indexOf(':quality-fix-') !== -1 }), 'fix stage key must be absent from recorded stage keys: ' + JSON.stringify(stageKeys))
+})
+
+// ---- MIRROR IMAGE (issue #162): `issues` omitted entirely must NOT be treated as empty ----
+//
+// Every scripted reviewer in the pre-#162 suite supplies `issues` explicitly. This
+// is the one scenario that catches the plausible call-site slip
+// `normalizeFindings(rev.issues || [], source)`, which would collapse an omitted
+// key into an empty array and silently disable the fix loop while passing every
+// other test (including the unit-level normalizeFindings(undefined) -> null test).
+
+test('runQualityLoop: MIRROR IMAGE — a changes_requested review that OMITS `issues` entirely still runs the fix stage exactly as on main, and findings_empty_exits stays 0', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {} })
+
+  let reviewCalls = 0
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) return { status: 'success', summary: 'nothing to simplify', commit: null, files_changed: [] }
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      if (reviewCalls === 1) {
+        // `issues` deliberately OMITTED from this response object — not [], not ['x'].
+        return { result: 'changes_requested', comments: 'fix this', recommended_fix_agent: null, summary: 'needs work' }
+      }
+      return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: ['src/foo.js'] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 57 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['src/foo.js'])
+
+  assert.strictEqual(result, 'approved')
+  assert.strictEqual(ctx.metrics.findings_empty_exits, 0)
+  const stageKeys = scriptedAgent.calls.map(function (c) { return (c.opts && c.opts.label) || '' })
+  assert.ok(stageKeys.some(function (k) { return k.indexOf(':quality-fix-task-1-i1') !== -1 }), 'fix stage must run when `issues` is omitted (degrade to the prose path), not be treated as empty: ' + JSON.stringify(stageKeys))
+})
+
+// ---- regression: the pre-#162 issues: ['x'] fixtures still trigger the fix stage,
+// and the fix prompt now carries the rendered, id-prefixed finding line ----
+
+test('runQualityLoop: an existing issues: ["x"] fixture still runs the fix stage, and the fix prompt renders the id-prefixed finding line', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  let reviewCalls = 0
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      if (reviewCalls === 1) return { result: 'changes_requested', comments: 'fix this', issues: ['x'], recommended_fix_agent: null, summary: 'needs work' }
+      return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 58 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'approved')
+  const fixCall = scriptedAgent.calls.find(function (c) { return ((c.opts && c.opts.label) || '').indexOf(':quality-fix-') !== -1 })
+  assert.ok(fixCall, 'fix stage must have run for an issues: ["x"] fixture')
+  assert.ok(/- \[quality-task-1-i1-1\] \[unspecified\] x -> /.test(fixCall.prompt), 'fix prompt must render the id-prefixed finding line: ' + fixCall.prompt.slice(0, 2000))
+})

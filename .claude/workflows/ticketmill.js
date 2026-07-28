@@ -635,7 +635,15 @@ const REVIEW_SCHEMA = {
   type: 'object', required: ['result', 'summary'],
   properties: {
     result: { enum: ['approved', 'changes_requested'] }, comments: { type: 'string' },
-    issues: { type: 'array', items: {} }, recommended_fix_agent: { type: ['string', 'null'] }, summary: { type: 'string' },
+    // issues is deliberately one field looser than CHALLENGE_SCHEMA.findings (:599):
+    // no `recommendation` in required. `issues` itself stays out of REVIEW_SCHEMA's
+    // required list (a reviewer that omits it entirely degrades to today's prose
+    // path, see normalizeFindings() below) and `id` is never part of the schema —
+    // the engine assigns it in normalizeFindings().
+    issues: { type: 'array', items: { type: 'object', required: ['severity', 'summary'], properties: {
+      severity: { enum: ['critical', 'major', 'minor'] }, summary: { type: 'string' }, recommendation: { type: 'string' },
+    } } },
+    recommended_fix_agent: { type: ['string', 'null'] }, summary: { type: 'string' },
   },
 }
 const FIX_SCHEMA = {
@@ -2040,6 +2048,73 @@ function recordGateOutcome(ctx, gate, findings, disposition) {
   g.disposition[d] = (g.disposition[d] || 0) + 1
 }
 
+// normalizeFindings (issue #162): turns a REVIEW_SCHEMA `issues` array into the
+// engine's structured finding shape, or signals "the reviewer omitted the key
+// entirely" so callers can fall back to today's prose-only path byte-for-byte.
+// `raw` not being an array (including undefined/null — a reviewer that dropped
+// `issues` from its response) returns null; anything else returns an
+// arity-preserving array, one entry per input entry, so a malformed entry still
+// produces one output finding rather than being silently dropped. Ids are
+// engine-assigned as `source + '-' + (i+1)` (e.g. "code-i2-3") — REVIEW_SCHEMA
+// never declares an id field, so reviewers can't collide with or spoof one.
+// Severity coercion to 'unspecified' is defence-in-depth only: REVIEW_SCHEMA's
+// item schema already requires `severity` to be one of critical/major/minor, so
+// a validated array should never reach this branch — it exists for a bare-string
+// entry (no `.severity` at all) and any other shape that slips past validation,
+// not as a live production path for schema-conformant reviewer output.
+function normalizeFindings(raw, source) {
+  if (!Array.isArray(raw)) return null
+  return raw.map(function (entry, i) {
+    const id = String(source) + '-' + (i + 1)
+    if (entry && typeof entry === 'object') {
+      const sev = entry.severity
+      return {
+        id: id,
+        severity: (sev === 'critical' || sev === 'major' || sev === 'minor') ? sev : 'unspecified',
+        summary: String(entry.summary || ''),
+        recommendation: String(entry.recommendation || ''),
+      }
+    }
+    return { id: id, severity: 'unspecified', summary: String(entry) }
+  })
+}
+
+// findingsBlock (issue #162): the single renderer feeding every fix stage (quality-
+// fix, pr-fix, test-quality-fix) — the ONE place that decides what a fix agent sees
+// of a review, so structured findings and prose comments never drift apart across
+// the three sites. Three branches:
+//   findings === null   - the reviewer omitted `issues`; emit EXACTLY what the
+//                          call site emitted before this change (comments falling
+//                          back to summary falling back to a caller-supplied
+//                          label) so this leg is a byte-identical prompt to today.
+//   findings.length > 0 - render the work list using the existing pr-fix line
+//                          shape (:4259) with the id prefixed, then the prose
+//                          `comments` below under a context-only heading — the
+//                          fix agent's job list is the findings, not the prose.
+//   findings.length === 0 - a reviewer that validated `issues: []` alongside
+//                          changes_requested (reached only by the pr-review gate
+//                          in task 2, where one reviewer has zero findings and
+//                          the other has some — both internal loops here exit
+//                          before ever rendering this branch). State plainly that
+//                          no structured findings were named, and still render
+//                          the prose below under the same context heading: an
+//                          empty array must never suppress or demote prose.
+function findingsBlock(findings, comments, fallbackLabel) {
+  if (findings === null) return String(comments || fallbackLabel || '')
+  const lines = ['## Findings to fix']
+  if (findings.length > 0) {
+    for (const f of findings) {
+      lines.push('- [' + f.id + '] [' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
+    }
+  } else {
+    lines.push('(reviewer named no structured findings)')
+  }
+  lines.push('')
+  lines.push('## Reviewer comments (context only — the findings above are the work list)')
+  lines.push(String(comments || '(none)'))
+  return lines.join('\n')
+}
+
 // Compact intent context for fix stages — they otherwise see only reviewer comments
 // or failure lists and optimize for "make the complaint go away" over the issue goal.
 function fixContext(ctx, taskDesc) {
@@ -2945,13 +3020,23 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       'Diff to review: git -C ' + ctx.worktree + ' diff ' + TARGET + '...HEAD',
       IMPLEMENTERS.length ? 'If changes are requested, set recommended_fix_agent to one of: ' + IMPLEMENTERS.join(', ') + '.' : '',
       bwFeedback(ctx),
+      'Every concern you want fixed goes in `issues`, one entry per concern, with severity, summary and a',
+      'recommendation; a concern appearing only in `comments` will not be fixed. If you return changes_requested,',
+      '`issues` must be non-empty; if you have nothing that must be fixed, return approved.',
       'Post an issue comment "## Quality Review (' + stepLabel + ', iteration ' + iter + ')" with your verdict',
       '(approved / changes requested) and key findings in 3-6 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
       'Return result (approved|changes_requested), comments, issues, recommended_fix_agent, summary.',
     ].join('\n'), stageOpts('qReview'), REVIEW_SCHEMA)
     if (!rev) { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': review degraded'); break }
 
+    const revFindings = normalizeFindings(rev.issues, 'quality-' + prefix + '-i' + iter)
     if (rev.result === 'approved') { approved = true; break }
+    if (revFindings !== null && revFindings.length === 0) {
+      approved = true
+      ctx.metrics.findings_empty_exits++
+      pushDecision(ctx, 'Gate: no findings to fix', 'Quality review (' + stepLabel + ', iteration ' + iter + ') requested changes but named zero structured findings — treated as clean.')
+      break
+    }
 
     const fixAgent = pickFixAgent(rev.recommended_fix_agent, null)
     const fix = await stage(ctx, 'quality-fix-' + prefix + '-i' + iter, [
@@ -2959,12 +3044,14 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       '',
       'Address code review feedback in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ' (issue #' + ctx.issue + '):',
       '',
-      String(rev.comments || rev.summary || 'No comments'),
+      findingsBlock(revFindings, rev.comments, rev.summary || 'No comments'),
       '',
       fixContext(ctx, taskDesc),
       '',
       'After committing, post an issue comment "## Quality Fix (' + stepLabel + ', iteration ' + iter + ')" with the',
       'commit SHA and the fixes applied in 2-4 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+      'Prefix each fixes_applied entry with the id of the finding it resolves (e.g. "[quality-task-1-i1-2] tightened',
+      'the null guard").',
       COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
@@ -3468,24 +3555,35 @@ async function runTestLoop(ctx, forced) {
         : '- If no modified file contains testable logic (pure config/docs/assets), return result=approved immediately.',
       '- Only validate tests covering the modified code. Do NOT request tests for unrelated code, config, or assets.',
       'Audit for: TODO/incomplete tests, hollow assertions, missing edge cases, mock abuse.',
+      'Every concern you want fixed goes in `issues`, one entry per concern, with severity, summary and a',
+      'recommendation; a concern appearing only in `comments` will not be fixed. If you return changes_requested,',
+      '`issues` must be non-empty; if you have nothing that must be fixed, return approved.',
       'Post an issue comment "## Test Validation (iteration ' + iter + ')" with your verdict in 2-4 lines',
       '(gh issue comment ' + ctx.issue + ' --repo ' + REPO + '); if approved because nothing testable changed, say so.',
       'Return result (approved|changes_requested), comments, issues, summary.',
     ].join('\n'), stageOpts('testValidate'), REVIEW_SCHEMA)
     if (!v) return { ok: false, error: 'test validator died — halting test loop' }
 
+    const vFindings = normalizeFindings(v.issues, 'test-i' + iter)
     if (v.result === 'approved') return { ok: true }
+    if (vFindings !== null && vFindings.length === 0) {
+      ctx.metrics.findings_empty_exits++
+      pushDecision(ctx, 'Gate: no findings to fix', 'Test validation (iteration ' + iter + ') requested changes but named zero structured findings — treated as clean.')
+      return { ok: true }
+    }
 
     const qfix = await stage(ctx, 'test-quality-fix-i' + iter, [
       implementerBlock(null),
       '',
       'Address test quality issues in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ' (issue #' + ctx.issue + '):',
       '',
-      String(v.comments || v.summary || 'Fix test quality issues'),
+      findingsBlock(vFindings, v.comments, v.summary || 'Fix test quality issues'),
       '',
       fixContext(ctx, null),
       'After committing, post an issue comment "## Test Quality Fix (iteration ' + iter + ')" with the commit SHA and',
       'what was added/strengthened (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
+      'Prefix each fixes_applied entry with the id of the finding it resolves (e.g. "[test-i1-2] added a missing',
+      'edge-case test").',
       COMMIT_SHA_ASK,
       HANDOFF_ASK,
       'Add missing assertions, remove TODOs, add edge-case tests, etc. Commit. Return status, commit, files_changed, fixes_applied, summary.',
@@ -4843,7 +4941,7 @@ async function processIssue(pre) {
     // reasons:[]}) matches computeRevisitRisk's clean no-op shape so a preflight
     // that never carried revisit_risk (e.g. a resume-skip stub) never crashes.
     revisit_risk: (pre.revisit_risk && typeof pre.revisit_risk === 'object') ? pre.revisit_risk : { flagged: false, reasons: [] },
-    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0 },
+    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0, findings_empty_exits: 0 },
     tokens: { total: 0, byModel: {}, byStage: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
     // Retained-changed-files / friction signals (issue #87). null (not []) means
     // "never captured" — probeChangedFiles() sets these once, unconditionally,
