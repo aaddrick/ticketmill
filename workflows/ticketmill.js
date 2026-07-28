@@ -4591,7 +4591,7 @@ async function fetchGateStateBlocks(issueNumbers, priorWorkByIssue) {
     const rowsArg = row ? Object.assign({ exit_ok: row.exit_ok }, parsed) : {}
     const pw = pwByIssue[n] || {}
     const sel = selectGateState(rowsArg, { repo: REPO, issue: n, self_login: selfLogin, claim_authors: [], batch: TARGET, run_epoch: RUN_EPOCH }, pw)
-    if (sel.state === 'read-failed' && parsed.blocks.length === 0 && hasGateStatePriorWork(pw)) {
+    if (sel.state === 'read-failed' && parsed.blocks.length === 0 && parsed.total === 0 && hasGateStatePriorWork(pw)) {
       const why = pw.pr_number != null ? ('PR #' + pw.pr_number + ' open')
         : pw.worktree_exists ? 'worktree exists'
         : ('resume_point=' + pw.resume_point)

@@ -200,19 +200,35 @@ test('fetchGateStateBlocks: a genuinely empty issue (valid read, zero blocks, ze
   assert.ok(line && line.indexOf('absent') !== -1 && line.indexOf('unexpected') === -1, 'expected a plain "absent" line: ' + JSON.stringify(logs))
 })
 
-test('fetchGateStateBlocks: zero blocks WITH prior-work evidence (an open PR) logs the distinct suspicious-absent line, not a bare read-failed', async function () {
+test('fetchGateStateBlocks: zero blocks, zero total, WITH prior-work evidence (an open PR) logs the distinct suspicious-absent line, not a bare read-failed', async function () {
   const context = harness.boot()
   seed(context)
   const logs = []
   context.log = function (msg) { logs.push(String(msg)) }
   harness.installScriptedAgent(context, function () {
-    return { self_login: 'bot', rows: [{ issue: 9, raw: jqRow(3, []), exit_ok: true }] } // total>0, zero gate-state blocks
+    return { self_login: 'bot', rows: [{ issue: 9, raw: jqRow(0, []), exit_ok: true }] } // total===0, zero gate-state blocks -- the falsifiable-absent case
   })
 
   await context.fetchGateStateBlocks([9], { 9: { pr_number: 123, worktree_exists: false, resume_point: 'process_pr' } })
   const line = logs.find(function (l) { return l.indexOf('#9') !== -1 })
   assert.ok(line, 'expected a log line for issue #9: ' + JSON.stringify(logs))
   assert.ok(line.indexOf('unexpected') !== -1 && line.indexOf('PR #123') !== -1, 'expected the distinct greppable suspicious-case string: ' + line)
+})
+
+test('fetchGateStateBlocks: zero blocks but total>0 (a corrupted/truncated read) WITH prior-work evidence still logs a plain read-failed, never the suspicious-absent wording', async function () {
+  const context = harness.boot()
+  seed(context)
+  const logs = []
+  context.log = function (msg) { logs.push(String(msg)) }
+  harness.installScriptedAgent(context, function () {
+    return { self_login: 'bot', rows: [{ issue: 10, raw: jqRow(3, []), exit_ok: true }] } // total>0, zero gate-state blocks -- self-contradictory read
+  })
+
+  await context.fetchGateStateBlocks([10], { 10: { pr_number: 123, worktree_exists: false, resume_point: 'process_pr' } })
+  const line = logs.find(function (l) { return l.indexOf('#10') !== -1 })
+  assert.ok(line, 'expected a log line for issue #10: ' + JSON.stringify(logs))
+  assert.ok(line.indexOf('read-failed') !== -1, 'expected the plain "read-failed" line: ' + line)
+  assert.ok(line.indexOf('unexpected') === -1, 'a total>0 corrupted read must never be logged as "absent (unexpected...)": ' + line)
 })
 
 test('fetchGateStateBlocks: partial coverage -- an issue outside the queried issueNumbers set gets no row and no log line at all', async function () {
