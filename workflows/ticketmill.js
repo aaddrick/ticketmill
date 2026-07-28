@@ -408,6 +408,13 @@ let VERIFY_SKIPS = []           // human-visible verification gaps -> batch PR b
 // PROFILE.engine_owned_globs, and PROFILE.lockstep_installed_paths respectively.
 let ENGINE_OWNED = []
 let LOCKSTEP_INSTALLED_PATHS = []
+// RUN_EPOCH (issue #166): populated at Select from a probe-returned `date -u`
+// string via the pure deriveRunEpoch/toEpochMs (below the TICKETMILL-TEST-
+// HARNESS-SPLIT marker) -- the sandbox has no Date.now()/argless `new Date()`,
+// so this is the run's only wall-clock anchor. null until Select assigns it;
+// selectGateState treats a null run epoch as unknown age, which reads as
+// stale, never as fresh (see gateStateEpochStale).
+let RUN_EPOCH = null
 
 function stageOpts(key) {
   const base = M[key] || { model: 'sonnet' }
@@ -507,6 +514,19 @@ const PREFLIGHT_SCHEMA = {
     // and deriveUnits() for how they're threaded onto the unit shape.
     predicted_files: { type: 'array', items: { type: 'string' } },
     depends_on: { type: 'array', items: { type: 'integer' } },
+    // OPTIONAL gate-state read (issue #166, Task 3's fetchGateStateBlocks probe):
+    // fail-open the same way predicted_files/depends_on do -- attachGateStateBlocks
+    // (below the TICKETMILL-TEST-HARNESS-SPLIT marker) normalizes a preflight
+    // missing any of these four to their fail-open default so selectGateState never
+    // sees an undefined key. gate_state_blocks carries raw verbatim comment bodies
+    // (most recent last); gate_state_read_ok is whether the probe's gh call exited
+    // 0; gate_state_total_comments is the issue's total comment count (feeds the
+    // falsifiable-absent cross-check); gate_state_trust is set at Select from the
+    // probe's self_login, never by the agent itself.
+    gate_state_blocks: { type: 'array', items: { type: 'string' } },
+    gate_state_read_ok: { type: 'boolean' },
+    gate_state_total_comments: { type: 'integer' },
+    gate_state_trust: { type: 'string' },
   },
 }
 const SETUP_SCHEMA = {
@@ -960,6 +980,377 @@ const CONSOLIDATION_MARKER_PROBE_SCHEMA = {
     } } },
   },
 }
+
+// =============================================================================
+// GATE STATE (issue #166): durable per-issue gate/contrarian state carried on
+// the issue itself across a run boundary. Substrate only in this tier -- no
+// consumer reads/acts on it yet (see the design note on buildGateStatePayload's
+// `seeded_from`). Mirrors the CONSOLIDATION_* marker subsystem immediately
+// above end to end: a title-gated comment, fence-extracted payload, canonical
+// scope-guard marker as its LAST line, append-only with positional last-wins
+// (read: newest wins, exactly like the outcomes.jsonl/diffOutcomeGrades
+// contract and the consolidation markers' own heal pass). Departs from that
+// precedent in one place: the payload is fenced JSON, not consolidation's flat
+// regex-parsed key:value lines, because `settled` (settleDecision/settledBlock
+// above) is an array of five-field objects carrying free text that may itself
+// contain newlines -- oneLine()'s single-line-per-field convention can't
+// express that without lossy flattening, while JSON.stringify/JSON.parse
+// round-trips it exactly, apostrophes and all.
+// =============================================================================
+
+// Comment title (first line) gating a gate-state marker apart from ordinary
+// trail comments -- same convention as CONSOLIDATION_MEMBER_TITLE/
+// CONSOLIDATION_GROUP_TITLE above. Every gate-state comment still ends with
+// the canonical scope-guard line "<!-- ticketmill <repo>#<issue> -->" (see
+// scopeGuard()); this title adds one second, gate-state-specific line of
+// machine-parseable structure ABOVE it -- it never replaces or reshapes the
+// canonical marker itself.
+const GATE_STATE_TITLE = '## Gate State'
+// GATE_STATE_SCHEMA: payload shape version, embedded in every payload so
+// parseGateStateComment can REJECT (never coerce) a payload an older or
+// incompatible engine build wrote. Bump only on a breaking shape change.
+const GATE_STATE_SCHEMA = 1
+
+// GATE_STATE_PROBE_SCHEMA: the whole-set read probe (fetchGateStateBlocks,
+// wired below the TICKETMILL-TEST-HARNESS-SPLIT marker) -- ONE call over every
+// candidate issue, pinning a jq read per issue exactly like the claim probe's
+// pinned "last title-gated comment" idiom (:7524), never a bare `gh issue view
+// --json comments` handed to the agent's own judgment (the fetchConsolidation
+// Markers precedent this replaces for gate state, since a bare read let a
+// truncated response get silently misread as absence). `raw` is each issue's
+// VERBATIM jq stdout; the agent relays it, never parses or judges it --
+// parseGateStateProbeRow does that in JS. `exit_ok` is the agent-level gh exit
+// status. `self_login` is `gh api user --jq .login` (a single-object endpoint,
+// so this file's "never a bare gh api" pagination rule doesn't apply) -- the
+// PRIMARY trust signal isTrustedGateStateAuthor checks first; '' when the
+// token can't resolve it (installation tokens), which falls through to the
+// claim_authors fallback.
+const GATE_STATE_PROBE_SCHEMA = {
+  type: 'object', required: ['rows'],
+  properties: {
+    self_login: { type: 'string' },
+    rows: { type: 'array', items: { type: 'object', required: ['issue', 'raw', 'exit_ok'], properties: {
+      issue: { type: 'integer' }, raw: { type: 'string' }, exit_ok: { type: 'boolean' },
+    } } },
+  },
+}
+// GATE_STATE_VERIFY_SCHEMA: the Report-phase self-validation read-back --
+// one issue's raw comment-trail read (same three fields as a single
+// GATE_STATE_PROBE_SCHEMA row), issued per-issue rather than batched because
+// verification runs once per issue behind a ctx-scoped flag rather than across
+// the whole candidate set up front. Fed through the exact same
+// parseGateStateProbeRow -> parseGateStateComment pipeline the read-side probe
+// uses -- no second parser, no second trust rule.
+const GATE_STATE_VERIFY_SCHEMA = {
+  type: 'object', required: ['issue', 'raw', 'exit_ok'],
+  properties: {
+    issue: { type: 'integer' }, raw: { type: 'string' }, exit_ok: { type: 'boolean' },
+  },
+}
+
+// buildGateStatePayload: assembles the JSON payload embedded in a gate-state
+// comment. `settled` is capped to its last 6 entries here (mirrors
+// settledBlock's own slice(-6)) so a long-running issue's payload never grows
+// unbounded regardless of how many gates it has cleared. `seeded_from` names
+// the {run, epoch} of the block THIS ctx's `gate_budgets` were carried forward
+// from, when a resume seeds them from a prior run's recorded state, or null
+// when they started at zero this run. It is ALWAYS null at this tier: no
+// consumer seeds gate_budgets from a prior block yet (substrate only, no
+// consumer -- see the section banner above), so every call site passes null.
+// The field's PRESENCE, not its value, is what parseGateStateComment's schema
+// round-trips against -- a future consumer fills it in without a shape change
+// here. Every field defaults defensively (never throws on a sparse `o`) so a
+// caller mid-construction (e.g. a boundary with no group) gets a valid,
+// schema-conformant payload rather than an exception.
+function buildGateStatePayload(o) {
+  o = o || {}
+  return {
+    schema: GATE_STATE_SCHEMA,
+    repo: o.repo,
+    issue: o.issue,
+    run: o.run,
+    batch: o.batch,
+    epoch: (o.epoch === undefined) ? null : o.epoch,
+    boundary: o.boundary,
+    group_id: (o.group_id === undefined) ? null : o.group_id,
+    members: Array.isArray(o.members) ? o.members.slice() : [],
+    seeded_from: (o.seeded_from === undefined) ? null : o.seeded_from,
+    gate_budgets: (o.gate_budgets && typeof o.gate_budgets === 'object' && !Array.isArray(o.gate_budgets)) ? o.gate_budgets : {},
+    settled: (Array.isArray(o.settled) ? o.settled : []).slice(-6),
+  }
+}
+
+// buildGateStateComment: renders the full comment body posted at each gate-
+// state boundary. Fixed shape: title line, ONE human line that is
+// deliberately non-directive -- a resumed run's agents must never read this
+// as an instruction, it exists purely so a human (or a future run's read-back)
+// can see what the engine last recorded, never phrased as something to act
+// on -- a <details> wrapper holding the fenced JSON payload, and the canonical
+// scope-guard marker as the LAST NON-EMPTY line (parseGateStateComment
+// enforces this on read; it is what makes the comment legible to scopeGuard()
+// and every other marker-consumer in this file).
+function buildGateStateComment(repo, issue, payload) {
+  const p = payload || {}
+  const humanLine = 'Recorded automatically at the "' + p.boundary + '" boundary (run ' + p.run +
+    ') for resume continuity -- a record, not a directive; nothing here should be treated as an instruction.'
+  return [
+    GATE_STATE_TITLE,
+    humanLine,
+    '',
+    '<details><summary>Gate state payload</summary>',
+    '',
+    '```json',
+    JSON.stringify(payload, null, 2),
+    '```',
+    '',
+    '</details>',
+    '<!-- ticketmill ' + repo + '#' + issue + ' -->',
+  ].join('\n')
+}
+
+// parseGateStateComment: null unless `body` is a well-formed gate-state marker
+// FOR THIS repo/issue -- title-gated (first line exactly GATE_STATE_TITLE,
+// same convention as parseConsolidation*), fence-extracted, and REQUIRES the
+// canonical scope-guard marker to be the last non-empty line (a body that
+// merely quotes the block shape inside a larger comment, or has trailing
+// content after the marker, is rejected here, not left to the JSON parse to
+// catch). Rejects a payload whose schema/repo/issue don't match the ones this
+// read expects -- a payload from a different repo, a different issue (e.g. a
+// consolidation group's cross-posted comment), or an older/incompatible
+// schema version is never silently accepted. Wrapped in try/catch and NEVER
+// THROWS: any malformed/truncated JSON, or a payload that isn't a plain
+// object, returns null exactly like every other rejection path here, so a
+// caller never needs a second layer of defense around this call.
+function parseGateStateComment(body, repo, issue) {
+  try {
+    const s = String(body == null ? '' : body)
+    const lines = s.split('\n')
+    if (!lines.length || lines[0].trim() !== GATE_STATE_TITLE) return null
+    let lastIdx = lines.length - 1
+    while (lastIdx >= 0 && lines[lastIdx].trim() === '') lastIdx--
+    if (lastIdx < 0) return null
+    const expectedMarker = '<!-- ticketmill ' + repo + '#' + issue + ' -->'
+    if (lines[lastIdx].trim() !== expectedMarker) return null
+    const fenceMatch = /```json\r?\n([\s\S]*?)\r?\n```/.exec(s)
+    if (!fenceMatch) return null
+    const payload = JSON.parse(fenceMatch[1])
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
+    if (payload.schema !== GATE_STATE_SCHEMA) return null
+    if (payload.repo !== repo) return null
+    if (payload.issue !== issue) return null
+    return payload
+  } catch (e) {
+    return null
+  }
+}
+
+// parseGateStateProbeRow: JSON.parses the VERBATIM stdout of the pinned jq
+// read (GATE_STATE_PROBE_SCHEMA.rows[].raw / GATE_STATE_VERIFY_SCHEMA.raw) --
+// the agent relays stdout, never judges it, so this is the only place that
+// decides whether a read actually succeeded. Expected shape: {total: <int>,
+// blocks: [{body, author_login, author_association}, ...]} (oldest-first,
+// already sliced to the last few by the jq itself). ANY throw (non-JSON
+// stdout, a truncated/partial JSON string from a chunked or interrupted read)
+// OR shape mismatch (missing/wrong-typed total, blocks not an array, or a
+// block entry missing a string `body`) returns {ok: false, total: 0, blocks:
+// []} -- this function itself never throws, and it never returns ok:true over
+// a shape it isn't sure of. This is deliberate: selectGateState treats
+// ok:false as read-failed, so a truncated read can never be silently misread
+// as "genuinely absent" -- issue #166's core fail-open requirement -- it
+// fails LOUD instead. This is what makes that kind of truncation structurally
+// impossible to hide.
+function parseGateStateProbeRow(raw) {
+  try {
+    const o = JSON.parse(raw)
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return { ok: false, total: 0, blocks: [] }
+    if (!Number.isInteger(o.total) || o.total < 0) return { ok: false, total: 0, blocks: [] }
+    if (!Array.isArray(o.blocks)) return { ok: false, total: 0, blocks: [] }
+    for (const b of o.blocks) {
+      if (!b || typeof b !== 'object' || typeof b.body !== 'string') return { ok: false, total: 0, blocks: [] }
+    }
+    return { ok: true, total: o.total, blocks: o.blocks }
+  } catch (e) {
+    return { ok: false, total: 0, blocks: [] }
+  }
+}
+
+// isTrustedGateStateAuthor: is `login` allowed to author a block selectGateState
+// treats as authoritative? PRIMARY signal -- `login === selfLogin`, the
+// deployment's own authenticated identity (`gh api user --jq .login`, a
+// single-object endpoint so the file's "never a bare gh api" pagination rule
+// doesn't apply). This closes the self-bootstrap trust hole the capped
+// approach-gate contrarian flagged against a claim_authors-only rule (a stale
+// forged claim's author no longer qualifies as primary trust). FALLBACK (for
+// installation tokens where `gh api user` 403s) -- `claimAuthors`, restricted
+// to a claim that is fresh (age < CLAIM_STALE_SECONDS, :292) OR whose batch
+// matches THIS run's batch branch: a claim that is neither fresh nor batch-
+// matching authored no work in scope and is not evidence of anything.
+// claimAuthors entries: {login, ageSeconds, batch}; either of ageSeconds/batch
+// may be null/absent (unknown), in which case only the other test can pass
+// that entry.
+function isTrustedGateStateAuthor(login, selfLogin, claimAuthors, batch) {
+  if (!login) return false
+  if (selfLogin && login === selfLogin) return true
+  const list = Array.isArray(claimAuthors) ? claimAuthors : []
+  return list.some(function (c) {
+    if (!c || c.login !== login) return false
+    const fresh = typeof c.ageSeconds === 'number' && Number.isFinite(c.ageSeconds) && c.ageSeconds < CLAIM_STALE_SECONDS
+    const batchMatch = batch != null && c.batch === batch
+    return fresh || batchMatch
+  })
+}
+
+// deriveRunEpoch: turns the probe-returned `date -u +%Y-%m-%dT%H:%M:%SZ`
+// string (the same idiom already used elsewhere in this file for a wall-clock
+// anchor, since the sandbox has no Date.now()/argless `new Date()`) into
+// RUN_EPOCH (epoch ms), via the existing pure toEpochMs (:6382 as of writing).
+// Explicit null on anything unparseable -- NEVER NaN, so a downstream
+// `runEpochMs - payload.epoch` comparison in gateStateEpochStale can't
+// silently produce a NaN that always compares false; a subtraction against an
+// unusable "now" must read as unknown/stale, not as "definitely not stale".
+function deriveRunEpoch(nowRaw) {
+  const ms = toEpochMs(nowRaw)
+  return Number.isFinite(ms) ? ms : null
+}
+
+// gateStateEpochStale: shared by selectGateState -- true when `payload.epoch`
+// predates CLAIM_STALE_SECONDS relative to `runEpochMs`, OR either side is
+// unparseable/absent. An unknown age reads as stale, never as fresh (fail
+// toward re-verifying, not toward trusting silently).
+function gateStateEpochStale(payload, runEpochMs) {
+  const payloadEpoch = (payload && Number.isFinite(payload.epoch)) ? payload.epoch : null
+  if (payloadEpoch === null || !Number.isFinite(runEpochMs)) return true
+  return (runEpochMs - payloadEpoch) > (CLAIM_STALE_SECONDS * 1000)
+}
+
+// selectGateState: the single decision point for "what does this issue's
+// gate-state comment trail say, and can it be trusted?" Turns `rows` (one
+// issue's already-parsed probe result -- parseGateStateProbeRow's {ok, total,
+// blocks} shape, optionally carrying the agent-level `exit_ok` alongside it;
+// blocks are oldest-first, mirroring GitHub's own comment order), `evidence`
+// ({repo, issue, self_login, claim_authors, batch, run_epoch}), and
+// `priorWork` ({pr_number, worktree_exists, resume_point}) into exactly one
+// of four states:
+//   - 'read-failed' -- the probe/parse never produced usable data (an
+//     explicit agent-level exit_ok:false, OR parseGateStateProbeRow's own
+//     ok:false), OR the falsifiable-absent rule fires (below). This is what
+//     makes a truncated/broken read structurally impossible to misread as
+//     genuine absence.
+//   - 'absent' -- zero blocks, zero total, and nothing else on this issue
+//     (pr_number/worktree_exists/resume_point) is evidence prior work ever
+//     happened -- a genuinely fresh issue.
+//   - 'malformed' -- at least one block exists, but NONE of them parse
+//     (title-gated, fence-extracted, marker-checked -- see
+//     parseGateStateComment): the newest fails and every older one fails too.
+//   - 'found' -- at least one block parses. Selection is EXPLICIT TRUST-
+//     BEFORE-LAST-WINS: walk blocks newest -> oldest, return the first one
+//     whose author is trusted (isTrustedGateStateAuthor), counting every
+//     newer untrusted-but-parseable block passed over into `skipped`. If NO
+//     block is trusted, this is the degenerate all-untrusted case: state
+//     stays 'found' (there IS data, just not from a trusted author) using the
+//     newest PARSEABLE block's payload, `trusted: false`, and `skipped: 0`
+//     (nothing was skipped to reach it -- it's the first thing the walk
+//     looked at). `trusted` is kept on the result specifically so a caller
+//     can distinguish this degenerate case from an ordinary trusted find.
+// `stale` (only meaningful when `state === 'found'`) comes from
+// gateStateEpochStale against the SELECTED payload.
+//
+// FALSIFIABLE-ABSENT RULE: zero blocks + total===0 is only accepted as
+// genuine absence when nothing else on this issue is evidence prior work
+// happened. If `pr_number` is non-null, OR `worktree_exists` is true, OR
+// `resume_point` is anything other than 'implement', a prior run plainly did
+// SOMETHING here, so zero gate-state comments is contradictory --
+// read-failed, never absent. Zero blocks with no such evidence stays absent.
+// This is NEVER inferred from an empty blocks array alone -- always from this
+// explicit cross-check against independently-sourced preflight evidence.
+function selectGateState(rows, evidence, priorWork) {
+  const r = rows || {}
+  const ev = evidence || {}
+  const pw = priorWork || {}
+  const EMPTY = { payload: null, trusted: false, stale: false, skipped: 0 }
+
+  if (r.exit_ok === false || r.ok === false) {
+    return Object.assign({ state: 'read-failed' }, EMPTY)
+  }
+
+  const blocks = Array.isArray(r.blocks) ? r.blocks : []
+  const total = Number.isInteger(r.total) ? r.total : blocks.length
+  const hasPriorWork = !!(
+    (pw.pr_number !== null && pw.pr_number !== undefined) ||
+    pw.worktree_exists === true ||
+    (pw.resume_point != null && pw.resume_point !== 'implement')
+  )
+
+  if (blocks.length === 0) {
+    if (total === 0 && hasPriorWork) return Object.assign({ state: 'read-failed' }, EMPTY)
+    return Object.assign({ state: 'absent' }, EMPTY)
+  }
+
+  let skipped = 0
+  let fallback = null // newest PARSEABLE block, regardless of trust
+  let fallbackSkipped = 0
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i]
+    const payload = parseGateStateComment(b && b.body, ev.repo, ev.issue)
+    if (!payload) continue // unparseable at this position -- never counted into `skipped`
+    const trusted = isTrustedGateStateAuthor(b && b.author_login, ev.self_login, ev.claim_authors, ev.batch)
+    if (!fallback) { fallback = payload; fallbackSkipped = skipped }
+    if (trusted) {
+      return { state: 'found', payload: payload, trusted: true, stale: gateStateEpochStale(payload, ev.run_epoch), skipped: skipped }
+    }
+    skipped++
+  }
+
+  if (fallback) {
+    return { state: 'found', payload: fallback, trusted: false, stale: gateStateEpochStale(fallback, ev.run_epoch), skipped: fallbackSkipped }
+  }
+  return Object.assign({ state: 'malformed' }, EMPTY)
+}
+
+// diffGateStateIntent: compares the payload THIS run intended to post
+// (`intent`) against a payload actually read back (`actual` -- e.g.
+// selectGateState's `.payload`, or the Report-phase verify sweep's direct
+// re-read). Three verdicts:
+//   - 'match'      -- byte-for-byte the same write (JSON.stringify-equal).
+//   - 'superseded' -- `actual` is a LATER write from the SAME run (same
+//                     `run`, later `epoch`) -- expected and not alarming: a
+//                     later boundary in this same run posted after `intent`
+//                     was captured (e.g. a later pr-review iteration's write
+//                     landing after an earlier iteration's intent snapshot).
+//   - 'mismatch'   -- anything else: a different run's write sitting where
+//                     ours should be, an EARLIER write, or same-run content
+//                     that disagrees without a later epoch to explain it --
+//                     real corruption or a lost write.
+function diffGateStateIntent(intent, actual) {
+  if (!intent || !actual) return 'mismatch'
+  if (JSON.stringify(intent) === JSON.stringify(actual)) return 'match'
+  if (intent.run === actual.run && Number.isFinite(intent.epoch) && Number.isFinite(actual.epoch) && actual.epoch > intent.epoch) {
+    return 'superseded'
+  }
+  return 'mismatch'
+}
+
+// attachGateStateBlocks: per-preflight normalizer mirroring
+// attachEngineOwnedIntentional's shape (:3023) -- guarantees every preflight
+// carries all four gate-state PREFLIGHT_SCHEMA fields (gate_state_blocks,
+// gate_state_read_ok, gate_state_total_comments, gate_state_trust)
+// UNCONDITIONALLY, defaulted to their fail-open value, so a probe-died
+// fallback preflight entry (the agent never returned these optional fields at
+// all) flows through the Select-time selectGateState() call identically to a
+// fully-populated one -- no downstream reader ever has to defensively check
+// for a missing key. Pure and side-effect-free, like its model: returns a NEW
+// array, never mutates `preflights`.
+function attachGateStateBlocks(preflights) {
+  return (preflights || []).map(function (p) {
+    return Object.assign({}, p, {
+      gate_state_blocks: Array.isArray(p.gate_state_blocks) ? p.gate_state_blocks : [],
+      gate_state_read_ok: p.gate_state_read_ok === true,
+      gate_state_total_comments: Number.isInteger(p.gate_state_total_comments) ? p.gate_state_total_comments : 0,
+      gate_state_trust: typeof p.gate_state_trust === 'string' ? p.gate_state_trust : '',
+    })
+  })
+}
+
 
 // =============================================================================
 // CONSOLIDATION (unit-of-work) FOUNDATIONS
@@ -5379,6 +5770,7 @@ function __seed(o) {
   if ('ROOT' in o) ROOT = o.ROOT
   if ('ENGINE_OWNED' in o) ENGINE_OWNED = o.ENGINE_OWNED
   if ('LOCKSTEP_INSTALLED_PATHS' in o) LOCKSTEP_INSTALLED_PATHS = o.LOCKSTEP_INSTALLED_PATHS
+  if ('RUN_EPOCH' in o) RUN_EPOCH = o.RUN_EPOCH
   if ('MAX_CONTRARIAN_ITERATIONS' in o) MAX_CONTRARIAN_ITERATIONS = o.MAX_CONTRARIAN_ITERATIONS
   if ('OUTCOME_GRADING' in o) OUTCOME_GRADING = o.OUTCOME_GRADING
   if ('REVISIT_RISK' in o) REVISIT_RISK = o.REVISIT_RISK
