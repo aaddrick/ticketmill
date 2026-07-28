@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0] - 2026-07-28-gate-hygiene-t1
+
+- Make review findings the load-bearing artifact (#162)
+- Tally the quality gate and stop swallowing its cap (#163)
+- Stop requiring every contrarian finding to carry a recommendation (#164)
+- Fix the quality friction ratio's denominator (#165)
+- Durable per-issue gate state on the issue (substrate) (#166)
+
 ## 0.1.41 (2026-07-27)
 
 Observability. Every gate iteration has always recorded how it resolved, in a
