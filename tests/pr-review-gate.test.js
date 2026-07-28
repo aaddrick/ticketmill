@@ -224,6 +224,52 @@ test('reviewAndMerge(): both reviewers changes_requested with issues:[] breaks e
   }
 })
 
+// nothingToFix(r, f) = r.result === 'approved' || (f !== null && f.length === 0)
+// — the doc comment above it is explicit that an approval counts as
+// nothing-to-fix "regardless of what issues carries alongside an approval".
+// Every OTHER fixture in this file with an approved reviewer also happens to
+// carry issues: [], which independently satisfies the function's second
+// branch, so none of them can isolate the `r.result === 'approved' ||` half
+// of the OR: deleting it would not change their outcome. This scenario gives
+// the approved reviewer a NON-EMPTY issues array (a nit alongside the
+// approval) specifically so only the 'approved' branch can explain
+// nothingToFix returning true for it — a mutant deleting that branch would
+// flip bothNothingToFix to false here and send the loop into pr-fix instead
+// of halting early.
+test('reviewAndMerge(): spec approved-with-a-nit + code changes_requested-with-issues:[] still breaks early as "carried-unresolved" (isolates the approved branch of nothingToFix from the empty-array branch)', async function () {
+  const context = harness.boot()
+  seedReviewFlow(context)
+
+  const APPROVED_WITH_NIT = Object.assign({}, APPROVED_REVIEW, { issues: [{ severity: 'minor', summary: 'nit: naming' }] })
+  const EMPTY_CHANGES_REQUESTED = { result: 'changes_requested', comments: 'not quite right, but nothing concrete to name', issues: [], recommended_fix_agent: null, summary: 'needs work, no specifics' }
+
+  installScriptedResponder(context, {
+    'spec-review-i1': APPROVED_WITH_NIT,
+    'code-review-i1': EMPTY_CHANGES_REQUESTED,
+    // pr-fix-i1/merge deliberately unscripted below — proving neither runs.
+  })
+
+  const ctx = harness.makeCtx({ issue: 39, pr: 390 })
+  const result = await context.reviewAndMerge(ctx)
+
+  assert.strictEqual(result.status, 'needs_human')
+  assert.strictEqual(result.stage, 'pr-review')
+  assert.strictEqual(ctx.metrics.pr_review_iters, 1)
+  assert.strictEqual(ctx.metrics.findings_empty_exits, 1)
+
+  const g = ctx.gate_findings['pr-review']
+  // The spec reviewer's nit still tallies (recordGateOutcome runs regardless
+  // of disposition) — only the DISPOSITION is under test here.
+  assert.strictEqual(g.count, 1)
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(g.disposition)), { 'carried-unresolved': 1 })
+
+  const keys = context.agent.calls.map(stageKeyOf)
+  assert.deepStrictEqual(keys, ['spec-review-i1', 'code-review-i1', 'halt-note-pr-review'])
+  for (const shouldNotRun of ['pr-fix-i1', 'merge']) {
+    assert.ok(!keys.includes(shouldNotRun), 'stage "' + shouldNotRun + '" must not run; ran: ' + keys.join(', '))
+  }
+})
+
 test('reviewAndMerge(): one reviewer with issues:[] and the other with real findings still runs pr-fix-i1, carrying both the rendered finding and the empty reviewer\'s explicit no-findings line plus prose', async function () {
   const context = harness.boot()
   seedReviewFlow(context)

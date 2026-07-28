@@ -212,3 +212,55 @@ test('findingsBlock: an empty findings array emits an explicit no-findings line 
   assert.ok(/no structured findings/i.test(block), 'must state plainly that no structured findings were named: ' + block)
   assert.ok(block.includes('this prose must still show up'), 'prose must not be suppressed/demoted by an empty findings array: ' + block)
 })
+
+// ---- nothingToFix(r, f) (issue #162) ----
+//
+// Per-reviewer predicate used only by the pr-review merge gate: true when this
+// ONE reviewer, alone, has nothing actionable — either an outright approval
+// (regardless of what `issues` carries alongside it — the doc comment above
+// nothingToFix is explicit that this holds "regardless of what issues carries
+// alongside an approval"), or a changes_requested with a present-but-empty
+// normalized findings array. `f === null` (issues omitted) is deliberately NOT
+// nothing-to-fix on its own. Every pr-review-gate.test.js fixture with an
+// approved reviewer also happens to carry issues: [], which independently
+// satisfies the second branch, and bothNothingToFix's own AND short-circuits
+// before nothingToFix ever runs when both reviewers approve (prReviewClean).
+// So none of those scenarios can tell the two branches of the OR apart. These
+// units isolate each branch directly against the real function.
+
+test('nothingToFix: an approved result is nothing-to-fix even when issues alongside it is non-empty', function () {
+  const context = harness.boot()
+  const approvedWithIssues = { result: 'approved', issues: [{ severity: 'minor', summary: 'nit' }] }
+  const findings = context.normalizeFindings(approvedWithIssues.issues, 'code-i1')
+
+  assert.strictEqual(context.nothingToFix(approvedWithIssues, findings), true)
+})
+
+test('nothingToFix: an approved result is nothing-to-fix even when findings is null (issues omitted)', function () {
+  const context = harness.boot()
+  const approvedNoIssuesKey = { result: 'approved' }
+
+  assert.strictEqual(context.nothingToFix(approvedNoIssuesKey, null), true)
+})
+
+test('nothingToFix: a changes_requested result with a present-but-empty findings array is nothing-to-fix', function () {
+  const context = harness.boot()
+  const changesRequestedEmpty = { result: 'changes_requested' }
+
+  assert.strictEqual(context.nothingToFix(changesRequestedEmpty, []), true)
+})
+
+test('nothingToFix: a changes_requested result with findings === null (issues omitted) is NOT nothing-to-fix', function () {
+  const context = harness.boot()
+  const changesRequestedOmitted = { result: 'changes_requested' }
+
+  assert.strictEqual(context.nothingToFix(changesRequestedOmitted, null), false)
+})
+
+test('nothingToFix: a changes_requested result with a non-empty findings array is NOT nothing-to-fix', function () {
+  const context = harness.boot()
+  const changesRequestedReal = { result: 'changes_requested' }
+  const findings = context.normalizeFindings([{ severity: 'major', summary: 'real problem' }], 'code-i1')
+
+  assert.strictEqual(context.nothingToFix(changesRequestedReal, findings), false)
+})
