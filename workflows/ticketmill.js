@@ -1358,6 +1358,29 @@ function diffGateStateIntent(intent, actual) {
   return 'mismatch'
 }
 
+// chunkGateStateIssues / gateStateProbeCommandLine / deadGateStateChunkRows /
+// normalizeGateStateRow: shared by fetchGateStateBlocks (below the split) and
+// the Report-phase verifyGateState sweep -- both chunk the SAME issue list at
+// MAX_GATE_STATE_PROBE_CHUNK, pin the SAME per-issue jq idiom, fall back to
+// the SAME {raw: '', exit_ok: false} stub rows when a chunk's agent call
+// dies, and normalize a returned row's `raw`/`exit_ok` the same way. Kept as
+// four small pure helpers rather than two copies of each, so the read-side
+// probe and its self-validation sweep can never drift apart.
+function chunkGateStateIssues(list) {
+  const chunks = []
+  for (let i = 0; i < list.length; i += MAX_GATE_STATE_PROBE_CHUNK) chunks.push(list.slice(i, i + MAX_GATE_STATE_PROBE_CHUNK))
+  return chunks
+}
+function gateStateProbeCommandLine() {
+  return 'gh issue view <n> --repo ' + REPO + ' --json comments --jq \'{total: (.comments|length), blocks: [.comments[] | select(.body | startswith("' + GATE_STATE_TITLE + '")) | {body, author_login: .author.login, author_association: .authorAssociation}] | .[-3:]}\''
+}
+function deadGateStateChunkRows(chunk) {
+  return chunk.map(function (n) { return { issue: n, raw: '', exit_ok: false } })
+}
+function normalizeGateStateRow(row) {
+  return { raw: typeof row.raw === 'string' ? row.raw : '', exit_ok: row.exit_ok === true }
+}
+
 // attachGateStateBlocks: per-preflight normalizer AND real-data join, mirroring
 // attachEngineOwnedIntentional's shape (:3023) -- guarantees every preflight
 // carries all four gate-state PREFLIGHT_SCHEMA fields (gate_state_blocks,
@@ -4549,14 +4572,13 @@ async function fetchGateStateBlocks(issueNumbers, priorWorkByIssue) {
   const list = Array.isArray(issueNumbers) ? issueNumbers.slice() : []
   if (!list.length) return { rowsByIssue: {}, self_login: '' }
   const pwByIssue = priorWorkByIssue || {}
-  const chunks = []
-  for (let i = 0; i < list.length; i += MAX_GATE_STATE_PROBE_CHUNK) chunks.push(list.slice(i, i + MAX_GATE_STATE_PROBE_CHUNK))
+  const chunks = chunkGateStateIssues(list)
 
   const chunkResults = await Promise.all(chunks.map(function (chunk, ci) {
     return agent([
       'READ-ONLY (safe under any run mode, including a dry run). For EACH issue number listed below, run this EXACT',
       'command, substituting only <n> for that issue\'s number — do not alter the jq filter in any way:',
-      'gh issue view <n> --repo ' + REPO + ' --json comments --jq \'{total: (.comments|length), blocks: [.comments[] | select(.body | startswith("' + GATE_STATE_TITLE + '")) | {body, author_login: .author.login, author_association: .authorAssociation}] | .[-3:]}\'',
+      gateStateProbeCommandLine(),
       'Issues in this call: ' + chunk.join(', '),
       'Relay each command\'s stdout VERBATIM as `raw` — never parse, reformat, summarize, or judge it. `exit_ok` is',
       'whether that gh command exited 0 for that issue (false on any non-zero exit, including a repo/issue lookup',
@@ -4575,7 +4597,7 @@ async function fetchGateStateBlocks(issueNumbers, priorWorkByIssue) {
         // dead chunk — belt-and-braces: mark ONLY this chunk's issues read-failed via
         // explicit stub rows, never silently drop them (a dropped issue would look
         // identical to one this function was never asked about at all).
-        return { self_login: '', rows: chunk.map(function (n) { return { issue: n, raw: '', exit_ok: false } }) }
+        return { self_login: '', rows: deadGateStateChunkRows(chunk) }
       })
   }))
 
@@ -4583,7 +4605,7 @@ async function fetchGateStateBlocks(issueNumbers, priorWorkByIssue) {
   let selfLogin = ''
   for (const cr of chunkResults) {
     if (!selfLogin && cr.self_login && cr.self_login.trim()) selfLogin = cr.self_login.trim()
-    for (const row of (cr.rows || [])) rowsByIssue[row.issue] = { raw: typeof row.raw === 'string' ? row.raw : '', exit_ok: row.exit_ok === true }
+    for (const row of (cr.rows || [])) rowsByIssue[row.issue] = normalizeGateStateRow(row)
   }
 
   // Per-issue diagnostic log, using the SAME pure selectGateState decision a
@@ -4933,12 +4955,14 @@ async function postGateState(ctx, boundary) {
 // old per-boundary-during-processIssue design GATE_STATE_VERIFY_SCHEMA's
 // original comment described -- that design was superseded by this
 // Report-phase sweep before this task landed), chunked at
-// MAX_GATE_STATE_PROBE_CHUNK like fetchGateStateBlocks (:4513) -- belt-and-
-// braces: a dead chunk's agent call only takes its own chunk's issues down
-// with it, surviving chunks report normally.
+// MAX_GATE_STATE_PROBE_CHUNK like fetchGateStateBlocks (:4544, via the shared
+// chunkGateStateIssues helper) -- belt-and-braces: a dead chunk's agent call
+// only takes its own chunk's issues down with it, surviving chunks report
+// normally.
 //
 // The verify prompt carries ONLY the issue numbers and the pinned per-issue
-// jq idiom fetchGateStateBlocks uses (:4524) -- it NEVER carries
+// jq idiom fetchGateStateBlocks uses (via the shared gateStateProbeCommandLine
+// helper) -- it NEVER carries
 // ctx.gate_state_intent or any other part of the payload being checked
 // against. This is load-bearing: if the prompt included the intended
 // payload, the agent could satisfy the schema by echoing it back rather than
@@ -4994,14 +5018,13 @@ async function verifyGateState(results) {
 
   if (toVerify.length) {
     const issueNumbers = toVerify.map(function (r) { return r.issue })
-    const chunks = []
-    for (let i = 0; i < issueNumbers.length; i += MAX_GATE_STATE_PROBE_CHUNK) chunks.push(issueNumbers.slice(i, i + MAX_GATE_STATE_PROBE_CHUNK))
+    const chunks = chunkGateStateIssues(issueNumbers)
 
     const chunkRows = await Promise.all(chunks.map(function (chunk, ci) {
       return agent([
         'READ-ONLY. For EACH issue number listed below, run this EXACT command, substituting only <n> for that',
         'issue\'s number -- do not alter the jq filter in any way:',
-        'gh issue view <n> --repo ' + REPO + ' --json comments --jq \'{total: (.comments|length), blocks: [.comments[] | select(.body | startswith("' + GATE_STATE_TITLE + '")) | {body, author_login: .author.login, author_association: .authorAssociation}] | .[-3:]}\'',
+        gateStateProbeCommandLine(),
         'Issues in this call: ' + chunk.join(', '),
         'Relay each command\'s stdout VERBATIM as `raw` -- never parse, reformat, summarize, or judge it. `exit_ok` is',
         'whether that gh command exited 0 for that issue (false on any non-zero exit, including a repo/issue lookup',
@@ -5015,11 +5038,11 @@ async function verifyGateState(results) {
           if (r && Array.isArray(r.rows)) return r.rows
           // dead chunk -- belt-and-braces, mirrors fetchGateStateBlocks: mark ONLY this
           // chunk's issues read-failed via explicit stub rows, never silently drop them.
-          return chunk.map(function (n) { return { issue: n, raw: '', exit_ok: false } })
+          return deadGateStateChunkRows(chunk)
         })
     }))
     for (const rows of chunkRows) {
-      for (const row of (rows || [])) rowsByIssue[row.issue] = { raw: typeof row.raw === 'string' ? row.raw : '', exit_ok: row.exit_ok === true }
+      for (const row of (rows || [])) rowsByIssue[row.issue] = normalizeGateStateRow(row)
     }
   }
 
