@@ -1040,17 +1040,25 @@ const GATE_STATE_PROBE_SCHEMA = {
     } } },
   },
 }
-// GATE_STATE_VERIFY_SCHEMA: the Report-phase self-validation read-back --
-// one issue's raw comment-trail read (same three fields as a single
-// GATE_STATE_PROBE_SCHEMA row), issued per-issue rather than batched because
-// verification runs once per issue behind a ctx-scoped flag rather than across
-// the whole candidate set up front. Fed through the exact same
-// parseGateStateProbeRow -> parseGateStateComment pipeline the read-side probe
-// uses -- no second parser, no second trust rule.
+// GATE_STATE_VERIFY_SCHEMA: the Report-phase self-validation sweep's chunked
+// read-back (verifyGateState, wired below the TICKETMILL-TEST-HARNESS-SPLIT
+// marker) -- ONE agent call per chunk of at most MAX_GATE_STATE_PROBE_CHUNK
+// issues, shaped like GATE_STATE_PROBE_SCHEMA minus `self_login` (the verify
+// sweep is proving THIS run's own write round-tripped through GitHub, never
+// adjudicating trust between authors, so it has no use for a self-identity
+// signal). Pins the SAME per-issue jq idiom fetchGateStateBlocks uses --
+// `raw` is each issue's VERBATIM jq stdout, relayed never parsed or judged by
+// the agent. Fed through the exact same parseGateStateProbeRow ->
+// parseGateStateComment pipeline the read-side probe uses -- no second
+// parser, no second trust rule. The prompt this schema backs carries ONLY
+// issue numbers, never the payload being verified against -- see
+// verifyGateState's own comment for why that matters.
 const GATE_STATE_VERIFY_SCHEMA = {
-  type: 'object', required: ['issue', 'raw', 'exit_ok'],
+  type: 'object', required: ['rows'],
   properties: {
-    issue: { type: 'integer' }, raw: { type: 'string' }, exit_ok: { type: 'boolean' },
+    rows: { type: 'array', items: { type: 'object', required: ['issue', 'raw', 'exit_ok'], properties: {
+      issue: { type: 'integer' }, raw: { type: 'string' }, exit_ok: { type: 'boolean' },
+    } } },
   },
 }
 
@@ -4919,6 +4927,122 @@ async function postGateState(ctx, boundary) {
   return posted
 }
 
+// verifyGateState (issue #166, task 4): the Report-phase self-validation
+// sweep that proves post -> GitHub -> read -> parse for gate state in one
+// run. ONE stage for the WHOLE run (never 2N per-issue calls, and never the
+// old per-boundary-during-processIssue design GATE_STATE_VERIFY_SCHEMA's
+// original comment described -- that design was superseded by this
+// Report-phase sweep before this task landed), chunked at
+// MAX_GATE_STATE_PROBE_CHUNK like fetchGateStateBlocks (:4513) -- belt-and-
+// braces: a dead chunk's agent call only takes its own chunk's issues down
+// with it, surviving chunks report normally.
+//
+// The verify prompt carries ONLY the issue numbers and the pinned per-issue
+// jq idiom fetchGateStateBlocks uses (:4524) -- it NEVER carries
+// ctx.gate_state_intent or any other part of the payload being checked
+// against. This is load-bearing: if the prompt included the intended
+// payload, the agent could satisfy the schema by echoing it back rather than
+// actually relaying gh's real output, and the "comparison" would prove
+// nothing. JS alone -- never the agent -- runs parseGateStateProbeRow, then
+// parseGateStateComment on the newest returned block, then diffGateStateIntent
+// against the result's own gate_state_intent.
+//
+// phase('Report') runs on every terminal exit of a batch (STOP.tripped fills
+// the remaining results as 'not_started' and returns; a per-unit throw is
+// isolated to that unit by runPool -- see :5871), so `results` passed in here
+// always carries every issue's FINAL gate-state fields for this run, on every
+// exit path, not just a clean finish.
+//
+// Six outcomes, logged one per issue via `log()`. NON-FATAL end to end:
+// this sweep only ever logs -- it never mutates a result's status, never
+// throws past its own call site, and a dead/misbehaving chunk degrades to
+// 'read-failed' for that chunk's issues rather than aborting the sweep.
+//   - 'no-intent'   -- this run never recorded a successful gate-state post
+//                      for this issue AND never recorded a failed one either
+//                      (gate_state_intent and gate_state_post_failed both
+//                      absent) -- e.g. not_started, preflight-skipped, or the
+//                      unit died before its first boundary. Nothing to
+//                      verify; not alarming.
+//   - 'post-failed' -- postGateState() itself already reported the post
+//                      failed (ctx.gate_state_post_failed set, no intent
+//                      recorded) -- Task 2's KNOWN non-fatal path. Kept as
+//                      its own outcome so this benign, already-logged miss is
+//                      never reported alongside genuine read-back corruption.
+//   - 'read-failed' -- the verify probe itself couldn't produce usable data
+//                      for this issue this run (no row at all, an explicit
+//                      exit_ok:false, or parseGateStateProbeRow rejected the
+//                      stdout shape) -- never conflated with a real mismatch.
+//   - 'match'       -- diffGateStateIntent found the newest gate-state block
+//                      read back byte-identical to what this run intended.
+//   - 'superseded'  -- diffGateStateIntent found a later write from the SAME
+//                      run sitting where the intent snapshot was taken from
+//                      (e.g. a later pr-review iteration posted after an
+//                      earlier iteration's intent was captured) -- expected,
+//                      not alarming, so a concurrent unclaimed run's later
+//                      post (or this run's own later boundary) is never
+//                      reported as corruption.
+//   - 'mismatch'    -- anything else diffGateStateIntent returns: a
+//                      different run's write, an earlier write, no
+//                      gate-state block found at all despite a recorded
+//                      successful post, or same-run content that disagrees
+//                      without a later epoch to explain it. Real corruption
+//                      or a lost write.
+async function verifyGateState(results) {
+  const list = Array.isArray(results) ? results : []
+  const toVerify = list.filter(function (r) { return r && r.gate_state_intent })
+  const rowsByIssue = {}
+
+  if (toVerify.length) {
+    const issueNumbers = toVerify.map(function (r) { return r.issue })
+    const chunks = []
+    for (let i = 0; i < issueNumbers.length; i += MAX_GATE_STATE_PROBE_CHUNK) chunks.push(issueNumbers.slice(i, i + MAX_GATE_STATE_PROBE_CHUNK))
+
+    const chunkRows = await Promise.all(chunks.map(function (chunk, ci) {
+      return agent([
+        'READ-ONLY. For EACH issue number listed below, run this EXACT command, substituting only <n> for that',
+        'issue\'s number -- do not alter the jq filter in any way:',
+        'gh issue view <n> --repo ' + REPO + ' --json comments --jq \'{total: (.comments|length), blocks: [.comments[] | select(.body | startswith("' + GATE_STATE_TITLE + '")) | {body, author_login: .author.login, author_association: .authorAssociation}] | .[-3:]}\'',
+        'Issues in this call: ' + chunk.join(', '),
+        'Relay each command\'s stdout VERBATIM as `raw` -- never parse, reformat, summarize, or judge it. `exit_ok` is',
+        'whether that gh command exited 0 for that issue (false on any non-zero exit, including a repo/issue lookup',
+        'failure).',
+        '',
+        'Return rows: [{issue, raw, exit_ok}] -- exactly one entry per issue listed above, even one whose gh command',
+        'failed.',
+      ].join('\n'), { label: 'gate-state-verify-c' + ci, phase: 'Report', schema: GATE_STATE_VERIFY_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+        .catch(function () { return null })
+        .then(function (r) {
+          if (r && Array.isArray(r.rows)) return r.rows
+          // dead chunk -- belt-and-braces, mirrors fetchGateStateBlocks: mark ONLY this
+          // chunk's issues read-failed via explicit stub rows, never silently drop them.
+          return chunk.map(function (n) { return { issue: n, raw: '', exit_ok: false } })
+        })
+    }))
+    for (const rows of chunkRows) {
+      for (const row of (rows || [])) rowsByIssue[row.issue] = { raw: typeof row.raw === 'string' ? row.raw : '', exit_ok: row.exit_ok === true }
+    }
+  }
+
+  for (const r of list) {
+    if (!r) continue
+    let outcome
+    if (!r.gate_state_intent) {
+      outcome = r.gate_state_post_failed ? 'post-failed' : 'no-intent'
+    } else {
+      const row = rowsByIssue[r.issue]
+      const parsed = row ? parseGateStateProbeRow(row.raw) : { ok: false, total: 0, blocks: [] }
+      if (!row || row.exit_ok !== true || !parsed.ok) {
+        outcome = 'read-failed'
+      } else {
+        const newest = parsed.blocks.length ? parsed.blocks[parsed.blocks.length - 1] : null
+        const actual = newest ? parseGateStateComment(newest.body, REPO, r.issue) : null
+        outcome = diffGateStateIntent(r.gate_state_intent, actual)
+      }
+    }
+    log('gate-state-verify #' + r.issue + ': ' + outcome)
+  }
+}
+
 // =============================================================================
 // IMPLEMENT (setup -> research -> evaluate<->contrarian -> plan<->contrarian ->
 // tasks with review/quality loops -> test loop -> browser -> docblocks -> PR)
@@ -8398,6 +8522,20 @@ if (HELD_CLAIMS.length) {
   ].join('\n'), { label: 'claims-release', phase: 'Report', schema: NOTE_SCHEMA, model: M.probe.model, effort: M.probe.effort })
     .catch(function () { return null })
   if (!swept || !swept.posted) log('claims-release sweep incomplete — stale "' + CLAIM_LABEL + '" labels expire via the ' + Math.round(CLAIM_STALE_SECONDS / 3600) + 'h staleness window')
+}
+
+// ---- Gate-state self-validation sweep (issue #166, task 4) — proves
+// post -> GitHub -> read -> parse round-tripped for every issue this run
+// wrote a gate-state comment for. Advisory only (log lines, never a result
+// mutation) and non-fatal end to end: wrapped so a bug in the sweep itself
+// can never take the rest of Report down with it. Runs BEFORE the
+// token/friction/rework rollups below on purpose — those are pure
+// JS-computed aggregations over `results` that must never depend on this
+// sweep's (agent-backed, best-effort) outcome. ----
+try {
+  await verifyGateState(results)
+} catch (e) {
+  log('gate-state-verify sweep threw (non-fatal): ' + String((e && e.message) || e).slice(0, 200))
 }
 
 // ---- Token usage: JS-computed aggregation (no LLM math), injected verbatim below ----
