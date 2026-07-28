@@ -2011,13 +2011,22 @@ function revisitRiskBlock(ctx) {
 //                          verdict sound_with_caveats with zero critical/major
 //                          (the same condition that triggers settleDecision());
 //                          for pr-review, both spec and code review returned
-//                          'approved' (the same condition that ends the loop).
-//   carried-unresolved  - the gate's iteration cap was reached without a clean
-//                         pass: for approach/plan, critical/major findings
-//                         still open (they ride into ctx.unresolved); for
-//                         pr-review, MAX_PR_REVIEW_ITERATIONS reached without
-//                         both reviewers approving (the PR is left for human
-//                         review).
+//                          'approved' — still the only condition that may set
+//                          reviewAndMerge's approved = true, though (issue
+//                          #162) it is no longer the same condition that ends
+//                          the loop: an unclean iteration where both
+//                          reviewers independently had nothing to fix now
+//                          exits early too, tallied below as carried-unresolved.
+//   carried-unresolved  - the gate did not reach a clean pass: either (a) the
+//                         iteration cap was reached without both reviewers
+//                         approving — for approach/plan, critical/major
+//                         findings are still open (they ride into
+//                         ctx.unresolved) — or (b) for pr-review only (issue
+//                         #162), both reviewers requested changes while
+//                         naming no structured findings to fix, so a fix
+//                         stage would have had nothing to act on. Both (a)
+//                         and (b) land on the same needs_human outcome; only
+//                         ctx.metrics.findings_empty_exits distinguishes them.
 //   re-litigated        - neither of the above: the loop revises and
 //                         re-contests, so these findings get judged again
 //                         next iteration (a fix stage for pr-review, a
@@ -2032,13 +2041,18 @@ function revisitRiskBlock(ctx) {
 // iteration of that gate. Bounded implicitly: one entry per gate name;
 // approach/plan run at most challengeCap (<= MAX_CONTRARIAN_ITERATIONS) times,
 // pr-review at most MAX_PR_REVIEW_ITERATIONS times, per issue/task.
-// NOTE: unlike CHALLENGE_SCHEMA (approach/plan), REVIEW_SCHEMA's `issues`
-// (pr-review's finding source) is untyped with no `severity` field — neither
-// the spec- nor code-review prompts ask for one — so `gate_findings['pr-
-// review'].severity` will stay {critical:0, major:0, minor:0} regardless of
-// actual findings. That's expected, not a bug: recordGateOutcome degrades
-// gracefully when `f.severity` doesn't match critical/major/minor, and
-// `disposition`/`count` still carry real signal for pr-review.
+// NOTE (issue #162): REVIEW_SCHEMA.issues is now typed the same shape as
+// CHALLENGE_SCHEMA.findings (severity/summary required, recommendation
+// optional), and all four REVIEW_SCHEMA-producing prompts (spec review, code
+// review, quality review, test validation) ask for it via ISSUES_ASK. So
+// unlike before, `gate_findings['pr-review'].severity` now reports real,
+// non-zero counts drawn from both reviewers' normalized findings — this is
+// no longer permanently {critical:0, major:0, minor:0}. `unspecified` is
+// still possible in principle (recordGateOutcome only increments a bucket
+// for the three known severities) but should not occur in practice: the
+// schema requires `severity` to be one of critical/major/minor, and
+// normalizeFindings only falls back to 'unspecified' for a shape that slips
+// past validation.
 function recordGateOutcome(ctx, gate, findings, disposition) {
   if (!ctx || !ctx.gate_findings) return
   const key = String(gate || '').trim()
@@ -2119,6 +2133,22 @@ function findingsBlock(findings, comments, fallbackLabel) {
   lines.push('## Reviewer comments (context only — the findings above are the work list)')
   lines.push(String(comments || '(none)'))
   return lines.join('\n')
+}
+
+// nothingToFix (issue #162): per-reviewer predicate used only by the pr-review
+// merge gate (reviewAndMerge) — true when THIS reviewer, alone, has nothing
+// actionable: either it approved outright (regardless of what `issues` carries
+// alongside an approval — see the REVIEW_SCHEMA.issues comment above), or it
+// requested changes but its normalized findings array is present and empty.
+// `f === null` (the reviewer omitted `issues` entirely) is deliberately NOT
+// nothing-to-fix on its own — with no structured signal at all, prose-only
+// changes_requested still routes to the fix stage, matching pre-#162 behavior.
+// Two of these ANDed together (both reviewers have nothing to fix) is a
+// DIFFERENT condition from prReviewClean (both approved) — see reviewAndMerge:
+// prReviewClean is the only path that may set approved = true; this predicate
+// only decides whether an unclean iteration still deserves a fix stage.
+function nothingToFix(r, f) {
+  return r.result === 'approved' || (f !== null && f.length === 0)
 }
 
 // Compact intent context for fix stages — they otherwise see only reviewer comments
@@ -4704,6 +4734,7 @@ async function implementIssue(ctx) {
 // =============================================================================
 async function reviewAndMerge(ctx) {
   let approved = false
+  let haltReason = null
   for (let iter = 1; iter <= MAX_PR_REVIEW_ITERATIONS && !approved; iter++) {
     if (STOP.tripped) return fail(ctx, 'halted', 'pr-review', 'stopped: ' + STOP.reason)
     ctx.metrics.pr_review_iters = iter
@@ -4725,6 +4756,7 @@ async function reviewAndMerge(ctx) {
           '(gh pr view ' + ctx.pr + ' --json comments) for full context. On iteration 2+, stay consistent with your',
           'own prior spec reviews — do not reverse a prior scope approval without new information.',
           'Worktree: ' + ctx.worktree,
+          ISSUES_ASK,
           'Post a PR comment "## Spec Review (Iteration ' + iter + ')" with the verdict.',
           'Return result (approved|changes_requested), comments, issues, recommended_fix_agent, summary.',
         ].join('\n'), stageOpts('specReview'), REVIEW_SCHEMA)
@@ -4746,6 +4778,7 @@ async function reviewAndMerge(ctx) {
           IMPLEMENTERS.length ? 'If changes are requested, set recommended_fix_agent to one of: ' + IMPLEMENTERS.join(', ') + '.' : '',
           bwFeedback(ctx),
           'Worktree: ' + ctx.worktree,
+          ISSUES_ASK,
           'Post a PR comment "## Code Review (Iteration ' + iter + ')" with the verdict.',
           'Return result (approved|changes_requested), comments, issues, recommended_fix_agent, summary.',
         ].join('\n'), stageOpts('codeReview'), REVIEW_SCHEMA)
@@ -4755,21 +4788,54 @@ async function reviewAndMerge(ctx) {
     const code = reviews[1]
     if (!spec || !code) return fail(ctx, 'needs_human', 'pr-review', 'a PR reviewer died — PR #' + ctx.pr + ' left open for human review')
 
-    // gate_findings tally (issue #91): one call per PR-review iteration, using the
-    // same disposition vocabulary as the approach/plan gates above (see the doc
-    // comment on recordGateOutcome) — this is the only gate #87 left unwired, so
-    // an "escaped defect" (finding absent at approach/plan, present here) was
-    // previously undetectable. 'accepted' means both reviewers approved (the
-    // gate passed clean, mirroring the approved=true break below); on the final
-    // iteration without a clean pass the cap was reached with issues still open,
-    // same shape as the contrarian gates' 'carried-unresolved'; otherwise the
-    // loop continues into a fix stage and gets re-reviewed, i.e. 're-litigated'.
+    // gate_findings tally (issue #91, retyped by issue #162): one call per
+    // PR-review iteration, using the same disposition vocabulary as the
+    // approach/plan gates above (see the doc comment on recordGateOutcome) —
+    // this is the only gate #87 left unwired, so an "escaped defect" (finding
+    // absent at approach/plan, present here) was previously undetectable.
+    // Each reviewer's `issues` is normalized under its OWN source prefix
+    // ('spec-i'/'code-i' + iter) before the two arrays are concatenated for
+    // the tally — the two reviews run through parallel() above and land in
+    // one bucket, so model-chosen or shared ids would collide across
+    // reviewers or iterations. 'accepted' means both reviewers approved (the
+    // ONLY condition that may set approved = true, below). Two other ways an
+    // iteration can end without a clean pass: the cap was reached with real
+    // findings still open (same shape as the contrarian gates'
+    // 'carried-unresolved'), or both reviewers independently had nothing to
+    // fix (nothingToFix, above) while the pair as a whole wasn't clean —
+    // tallied as the SAME 'carried-unresolved' string (computeGateYield hard-
+    // codes exactly four disposition keys; a fifth would be silently
+    // dropped), distinguished only by ctx.metrics.findings_empty_exits and
+    // haltReason's text. Otherwise the loop continues into a fix stage and
+    // gets re-reviewed, i.e. 're-litigated'.
+    const specFindings = normalizeFindings(spec.issues, 'spec-i' + iter)
+    const codeFindings = normalizeFindings(code.issues, 'code-i' + iter)
     const prReviewClean = spec.result === 'approved' && code.result === 'approved'
-    const prReviewDisposition = prReviewClean ? 'accepted' : (iter === MAX_PR_REVIEW_ITERATIONS ? 'carried-unresolved' : 're-litigated')
-    recordGateOutcome(ctx, 'pr-review', (spec.issues || []).concat(code.issues || []), prReviewDisposition)
+    const bothNothingToFix = !prReviewClean && nothingToFix(spec, specFindings) && nothingToFix(code, codeFindings)
+    const capReached = iter === MAX_PR_REVIEW_ITERATIONS
+    const prReviewDisposition = prReviewClean ? 'accepted' : ((bothNothingToFix || capReached) ? 'carried-unresolved' : 're-litigated')
+    recordGateOutcome(ctx, 'pr-review', (specFindings || []).concat(codeFindings || []), prReviewDisposition)
 
     if (prReviewClean) { approved = true; break }
-    if (iter === MAX_PR_REVIEW_ITERATIONS) break
+
+    // Both reviewers have nothing to fix, but that isn't prReviewClean (one or
+    // both requested changes with zero findings named) — a fix stage with no
+    // findings and no prose to act on would just re-run the same review next
+    // iteration. Break WITHOUT approving, onto the existing needs_human below:
+    // a permissive predicate here would let a changes_requested verdict reach
+    // `gh pr merge --squash`. One reviewer with real findings skips this branch
+    // and falls through to the fix stage instead (the AND is preserved).
+    if (bothNothingToFix) {
+      ctx.metrics.findings_empty_exits++
+      haltReason = 'PR #' + ctx.pr + ' review iteration ' + iter + ': both reviewers requested changes but named zero structured findings to fix — left open for human review'
+      pushDecision(ctx, 'Gate: no findings to fix', 'PR review (iteration ' + iter + ') requested changes but neither reviewer named a structured finding — left for human review as carried-unresolved.')
+      break
+    }
+
+    if (capReached) {
+      haltReason = 'PR #' + ctx.pr + ' not approved after ' + MAX_PR_REVIEW_ITERATIONS + ' iterations — left open for human review'
+      break
+    }
 
     const fixAgent = pickFixAgent(code.recommended_fix_agent, null)
     const fix = await stage(ctx, 'pr-fix-i' + iter, [
@@ -4777,11 +4843,17 @@ async function reviewAndMerge(ctx) {
       '',
       'Address PR review feedback for PR #' + ctx.pr + ' in worktree ' + ctx.worktree + ' on branch ' + ctx.branch + ':',
       '',
-      'Spec review:', String(spec.comments || spec.summary || 'approved'), '',
-      'Code review:', String(code.comments || code.summary || 'approved'), '',
+      '## Spec review',
+      findingsBlock(specFindings, spec.comments, spec.summary || 'approved'),
+      '',
+      '## Code review',
+      findingsBlock(codeFindings, code.comments, code.summary || 'approved'),
+      '',
       fixContext(ctx, null),
       'After pushing, post a PR comment "## PR Review Fix (iteration ' + iter + ')" with the commit SHA and the fixes',
       'applied in 2-4 lines (gh pr comment ' + ctx.pr + ' --repo ' + REPO + ').',
+      'Prefix each fixes_applied entry with the id of the finding it resolves (e.g. "[code-i1-2] tightened the null',
+      'guard").',
       COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
@@ -4798,7 +4870,7 @@ async function reviewAndMerge(ctx) {
     if (q === 'halted') return fail(ctx, 'halted', 'quality-loop', STOP.tripped ? 'stopped: ' + STOP.reason : 'quality degrade rate exceeded during PR fixes')
   }
 
-  if (!approved) return fail(ctx, 'needs_human', 'pr-review', 'PR #' + ctx.pr + ' not approved after ' + MAX_PR_REVIEW_ITERATIONS + ' iterations — left open for human review')
+  if (!approved) return fail(ctx, 'needs_human', 'pr-review', haltReason || ('PR #' + ctx.pr + ' not approved after ' + MAX_PR_REVIEW_ITERATIONS + ' iterations — left open for human review'))
 
   // ---- BROWSER (pre-merge gate — re-verifies after any PR-review fixes) ----
   const bwm = await runBrowserCheck(ctx, 'pre-merge')
