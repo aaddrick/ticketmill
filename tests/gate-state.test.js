@@ -239,6 +239,16 @@ test('selectGateState: falsifiable-absent rule -- zero blocks with NO prior-work
   assert.strictEqual(result.state, 'absent')
 })
 
+test('selectGateState: zero blocks but total>0 is read-failed even with NO prior-work evidence -- a self-contradictory probe result is never absence', function () {
+  const context = harness.boot()
+  const result = context.selectGateState(
+    { ok: true, total: 3, blocks: [] },
+    { repo: REPO, issue: 1 },
+    { pr_number: null, worktree_exists: false, resume_point: 'implement' },
+  )
+  assert.strictEqual(result.state, 'read-failed')
+})
+
 test('selectGateState: falsifiable-absent rule also fires on worktree_exists / a non-implement resume_point alone', function () {
   const context = harness.boot()
   const byWorktree = context.selectGateState(

@@ -1000,7 +1000,7 @@ const CONSOLIDATION_MARKER_PROBE_SCHEMA = {
 
 // Comment title (first line) gating a gate-state marker apart from ordinary
 // trail comments -- same convention as CONSOLIDATION_MEMBER_TITLE/
-// CONSOLIDATION_GROUP_TITLE above. Every gate-state comment still ends with
+// CONSOLIDATION_GROUP_TITLE below. Every gate-state comment still ends with
 // the canonical scope-guard line "<!-- ticketmill <repo>#<issue> -->" (see
 // scopeGuard()); this title adds one second, gate-state-specific line of
 // machine-parseable structure ABOVE it -- it never replaces or reshapes the
@@ -1263,6 +1263,11 @@ function gateStateEpochStale(payload, runEpochMs) {
 // read-failed, never absent. Zero blocks with no such evidence stays absent.
 // This is NEVER inferred from an empty blocks array alone -- always from this
 // explicit cross-check against independently-sourced preflight evidence.
+// A second, narrower contradiction is checked first and unconditionally:
+// zero blocks but total>0 is self-contradictory on its face (the probe says
+// comments exist but produced none) -- exactly the truncated/corrupted-read
+// shape this whole design exists to make undetectable-as-absence, so it is
+// always read-failed regardless of `hasPriorWork`.
 function selectGateState(rows, evidence, priorWork) {
   const r = rows || {}
   const ev = evidence || {}
@@ -1282,7 +1287,8 @@ function selectGateState(rows, evidence, priorWork) {
   )
 
   if (blocks.length === 0) {
-    if (total === 0 && hasPriorWork) return Object.assign({ state: 'read-failed' }, EMPTY)
+    if (total > 0) return Object.assign({ state: 'read-failed' }, EMPTY)
+    if (hasPriorWork) return Object.assign({ state: 'read-failed' }, EMPTY)
     return Object.assign({ state: 'absent' }, EMPTY)
   }
 
