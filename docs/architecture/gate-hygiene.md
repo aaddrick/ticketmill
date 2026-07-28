@@ -376,9 +376,10 @@ across the board" — describes the state of the world *before* this issue.
 It is now inaccurate: severity counts are real as of the change this page
 documents. That passage is not corrected in place. It sits inside
 `metrics.md`'s single tracked provenance segment (`tests/fixtures/architecture-split.json`
-records that segment as starting at line 5 and running 329 lines, to the
-end of the 332-line file — everything but the four-line synthetic H1 and
-lede above it), which `tests/architecture-provenance.test.js` hashes
+records that segment as starting at line 5 and running 329 lines — 328 of
+them on disk, lines 5 through the 332-line file's end, plus one trailing
+blank line stripped when the file was written — everything but the
+four-line synthetic H1 and lede above it), which `tests/architecture-provenance.test.js` hashes
 verbatim against a digest recorded when `docs/ARCHITECTURE.md` was split
 into this directory. Editing any character inside a tracked segment turns
 that test red; there is no partial-credit edit. This page is the correction
@@ -395,9 +396,10 @@ gate now routinely shows up in that rollup, not three. Like the passage
 above, it cannot be corrected in place — and for the same structural
 reason, more bluntly here: `metrics.md`'s only tracked segment isn't scoped
 to this sentence, or to any sentence. `tests/fixtures/architecture-split.json`
-records exactly one segment for the whole file, 329 lines starting at its
-first heading and running to the end — everything but the file's four-line
-synthetic H1 and lede. `tests/architecture-provenance.test.js` hashes that
+records exactly one segment for the whole file: 329 lines starting at its
+first heading, 328 of them on disk (through the 332-line file's end) plus
+one trailing blank line stripped when the file was written — everything
+but the file's four-line synthetic H1 and lede. `tests/architecture-provenance.test.js` hashes that
 one segment verbatim, so it hashes the file from its first heading to the
 end, which includes line 114. Editing any character inside that segment,
 including the word "three" in this sentence, turns that test red.
