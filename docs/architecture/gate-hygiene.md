@@ -325,6 +325,19 @@ and cap branches — but it is worth stating explicitly for quality, because
 per-call count, so the invariant has to hold across calls, not just within
 one.
 
+`quality_scopes` is `quality_iters`'s companion counter, and it counts a
+different thing: calls, not iterations. `if (iter === 1)
+ctx.metrics.quality_scopes++` sits inside the same loop body as
+`quality_iters++`, below the same `STOP.tripped` guard described above, but
+it only fires on a call's first iteration. A STOP'd entry therefore still
+touches nothing — the guard returns before either statement runs, the same
+fact the invariant above already establishes for `quality_iters` — and
+because the increment fires at most once per call, `quality_scopes` can
+never exceed the number of loops an issue actually entered, regardless of
+how many iterations any of them ran. `computeFriction` is its only
+consumer; see "The friction denominator: pooled, not worst-scope" below for
+what it pools against.
+
 ### Why the empty-findings exit tallies carried-unresolved but returns approved
 
 The empty-findings exit sets `approved = true` — the loop treats it as
@@ -414,6 +427,97 @@ into a hard `fail()`. A capped-then-halted issue still gets its roll-up
 line, so the wording has to hold for both outcomes — it says the review
 never came back clean, not that anything merged.
 
+### The friction denominator: pooled, not worst-scope
+
+`computeFriction`'s quality driver divides the run-wide `quality_iters`
+total by a run-wide cap, `MAX_QUALITY_ITERATIONS * quality_scopes`, rather
+than the single-loop cap every other capped stage compares against. Issue
+#165 is what motivated this: `quality_iters` sums iterations across every
+call an issue made to `runQualityLoop` (one per task, one per PR-fix
+round), so comparing that sum to one loop's cap let a multi-task issue that
+cleared quality cleanly on every task still saturate the ratio to 1.0, the
+same score a genuinely capped-out issue earns. Five things about the fix
+are worth stating plainly, because more than one shape of fix was on the
+table.
+
+1. **Why pooled, not worst-scope (the adjudicated reason).** Pooled divides
+   one run-wide sum by one run-wide cap — a mean of each call's cost
+   against the cap it was actually allowed. The rejected alternative —
+   track the worst single scope's iteration count and ratio that alone
+   against the cap — is a max, not a mean. A max does not fix the problem
+   this issue was filed over, it relocates it: one capped scope, out of
+   however many tasks and PR-fix rounds an issue actually ran, would still
+   pin the WHOLE issue's quality term at 1.0 forever — the same "one bad
+   scope reads like every scope going badly" shape the issue's own Change
+   section complains about, just moved onto a different axis. Pooling is
+   the formula that lets an issue's quality friction reflect all of its
+   scopes rather than its single worst one. A secondary point, not the
+   deciding one: pooled also keeps the `quality` driver's rendered `value`
+   as the raw `quality_iters` the metrics blob already carries, needing no
+   new field; a worst-scope formula's number would appear nowhere in
+   `ctx.metrics`. That legibility point is real but subordinate to the
+   mean-versus-max argument above.
+2. **The accepted cost: non-monotonicity.** Pooling is not monotone in
+   `quality_iters`. A single-task issue that caps out on its only quality
+   call scores `5/5 = 1.0`; the same issue, with a PR-fix round added that
+   clears quality on that round's first iteration, scores `6/10 = 0.6` —
+   MORE total quality re-work (6 iterations spent, not 5) yet a LOWER
+   friction score. This is accepted, not overlooked, because diluting the
+   ratio this way is safe: cap exhaustion is not this metric's job to
+   preserve. It is carried by two channels that don't dilute —
+   `ctx.quality_caps`'s one-per-issue `VERIFY_SKIPS` line (see "The
+   one-line-per-issue cap roll-up" above) and
+   `gate_findings.quality.disposition['carried-unresolved']` — and it is
+   NOT carried by `quality_degrades` (see "What quality_degrades counts,
+   and what it doesn't" above: that counter fires only when an agent dies
+   inside the loop, never on cap exhaustion). Friction dilutes; visibility
+   of the cap-out does not.
+3. **Acceptance criterion 1, in its strongest form.** The issue asks for a
+   multi-task issue where every quality loop passed on iteration 1 to score
+   `0` on the quality term. Read literally, that criterion is unmet by both
+   formulas the issue sanctions — the adopted pooled ratio and the
+   worst-scope alternative it names as acceptable — on a fixture where
+   every call's first iteration is also its last: both compute `1/5 = 0.2`
+   per scope, one iteration actually run against a five-iteration cap, not
+   `0`. That is not a defect unique to pooling; it is a fact about the
+   issue's own Change section, which defines the ratio as `min(1,
+   iters/cap)` counting from 1 on a clean pass, not from 0. A formula that
+   scores exactly `0` on this fixture would have to be piecewise —
+   exempting iteration 1 specially, and only for multi-scope issues, since
+   the single-scope case already produced `0.2` under the pre-this-change
+   formula and nothing asks for that to change. `0.2` is the
+   sibling-consistent answer: it is what every other capped stage in this
+   file already scores on a same-shape one-clean-iteration case.
+4. **The corrected invariant pair.** Stage drivers (`weight: null`) satisfy
+   `contribution === Math.min(1, value / cap)` and `cap === baseCap *
+   (scopes ?? 1)`, where `value` is the stage's raw metric (`quality_iters`
+   for the quality driver) and `baseCap` is that stage's `MAX_*` constant.
+   Signal drivers (a numeric `weight`) satisfy `value * weight ===
+   contribution`. Every entry in the `drivers` array is one shape or the
+   other.
+5. **Why `scopes` is `null`, not `1`, on the other six stage drivers.**
+   Only the quality driver carries a `scopes` count backed by an actual
+   counter. `task_review_attempts` and `browser_iters` are multi-scope
+   aggregates in exactly the same sense `quality_iters` is —
+   `task_review_attempts` sums across every task's own review-attempt
+   loop, `browser_iters` sums across the `implement` and `pre-merge` calls
+   to `runBrowserCheck` — but neither has a scope counter backing it yet.
+   Giving them `scopes: 1` would be a false claim: it would assert those
+   aggregates were pooled over exactly one invocation, when the aggregate
+   is provably drawn from more than one. `null` claims nothing, which is
+   the honest state for both of them; pooling `task_review_attempts` and
+   `browser_iters` the same way this change pools `quality_iters` is a
+   natural follow-up, out of scope here. The remaining four stages
+   (`approach`, `plan`, `test`, `pr-review`) are genuinely single-scope —
+   one loop, one call, per issue — so `scopes: null` there means "no scope
+   count applies," not "not yet counted."
+
+Quality friction scores computed under this pooled denominator are not
+comparable to quality friction scores from a run predating this change: the
+same issue, run twice, can report a different quality contribution for
+reasons that have nothing to do with how hard it fought. Compare quality
+friction only within reports generated by the same version of this engine.
+
 ## Provenance: the frozen passage this page supersedes
 
 `docs/architecture/metrics.md:81-84` — the "Completing the gate findings
@@ -451,3 +555,30 @@ end, which includes line 114. Editing any character inside that segment,
 including the word "three" in this sentence, turns that test red.
 `metrics.md:114` stays exactly as it reads, superseded by this page the
 same way `metrics.md:81-84` already is.
+
+This page also supersedes `metrics.md:13-14` — "Seven capped pipeline
+stages (approach, plan, task-review, quality, test, browser, pr-review)
+each contribute `min(1, iters/cap)` to that score." That sentence is now
+true of six stages only: as of the change this page documents, the quality
+driver's contribution is `min(1, quality_iters / (MAX_QUALITY_ITERATIONS *
+quality_scopes))`, pooled across however many calls an issue made to
+`runQualityLoop`, not `min(1, iters/cap)` against one loop's cap (see "The
+friction denominator: pooled, not worst-scope" above). The other six stages
+are unaffected. Like the two passages above, it cannot be corrected in
+place — it sits inside the same 329-line tracked segment
+`tests/architecture-provenance.test.js` hashes verbatim — so
+`metrics.md:13-14` stays exactly as it reads, superseded by this page.
+
+Worth noting separately: the very next sentence, `metrics.md:15-17`'s "an
+issue whose stages all pass first try scores 0 across every one of them,"
+was already inaccurate before this change, and not for a reason this
+change introduces. Passing "first try" means an iteration count of 1, not
+0 — every one of the seven capped stages counts its iterations from `iter
+= 1` (the four `= iter` assignments at `workflows/ticketmill.js:3628`,
+`:4427`, `:4573`, `:4850`, and the three `++` increments at `:3096`,
+`:3317`, `:4707`, all inside loops that open `for (let iter = 1; ...)`), so
+`min(1, 1/cap)` is `1/cap`, not `0`, for any cap greater than 1. This
+sentence was inaccurate the moment it shipped, independent of anything
+issue #165 changes; this page does not attempt to correct it beyond
+flagging it here, since doing so is out of scope for the denominator fix
+this page otherwise documents.

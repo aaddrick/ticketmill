@@ -68,7 +68,7 @@ to ship.
 | `invocation-and-guardrails.md` | Invocation, the sandbox lint, and the engine-owned path guardrail. |
 | `branching-and-merge.md` | The batch-branch model, release stage, and merge auto-resolve. |
 | `metrics.md` | Friction and churn, rework tax, gate yield, and outcome grading. |
-| `gate-hygiene.md` | Typed review findings, engine-assigned ids, the three loop predicates, and gate-outcome tallying (the quality gate's disposition map, its cap, and its supersession of `metrics.md:114`). Authored text, added after the split; not tracked in the provenance fixture, the same as the `AGENTS.md`/`CLAUDE.md` row below. |
+| `gate-hygiene.md` | Typed review findings, engine-assigned ids, the three loop predicates, and gate-outcome tallying (the quality gate's disposition map, its cap, the pooled friction denominator, and its supersession of `metrics.md:13-14` and `:114`). Authored text, added after the split; not tracked in the provenance fixture, the same as the `AGENTS.md`/`CLAUDE.md` row below. |
 | `failure-semantics.md` | How the run fails, halts, and resumes (two segments, emitted out of source order: the short bullet list first, the incident-derived-machinery table second). |
 | `cost-and-tokens.md` | Token tracking, cost estimation, and the token_budget guard. |
 | `scheduling.md` | Claims interop, the consolidation gate, and lane scheduling. |
@@ -133,3 +133,19 @@ described above. `metrics.md:114`
 stays exactly as it reads, superseded by `gate-hygiene.md`'s "The quality
 gate" section, the same way `metrics.md:81-84` is superseded by the section
 above it.
+
+A third sentence in the same file goes stale the same way, again for the
+same structural reason: `metrics.md:13-14` — "Seven capped pipeline stages
+(approach, plan, task-review, quality, test, browser, pr-review) each
+contribute `min(1, iters/cap)` to that score" — describes a world where
+every capped stage's contribution compares one loop's iteration count to
+that same loop's cap. Issue #165 makes that untrue for one of the seven:
+the quality stage's cap is now pooled across however many calls an issue
+made to `runQualityLoop` (`quality_iters / (MAX_QUALITY_ITERATIONS *
+quality_scopes)`), not compared to a single loop's cap. This sentence
+cannot be corrected in place either, for the same reason `metrics.md:114`
+can't: `metrics.md`'s one tracked segment spans nearly the whole file, and
+`tests/architecture-provenance.test.js` hashes it verbatim from the first
+heading to the end. `metrics.md:13-14` stays exactly as it reads,
+superseded by `gate-hygiene.md`'s "The friction denominator: pooled, not
+worst-scope" section, the same way the two sentences above it already are.
