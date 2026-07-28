@@ -722,13 +722,18 @@ first increment in a given `reviewAndMerge()` call: a single rebuttal-only
 pr-fix round `continue`s into another review iteration rather than halting,
 so `rebuttal_only_rounds` going from 0 to 1 on an issue can mean nothing
 more than "the merge gate looped once more" — the same issue can still go
-on to reach `prReviewClean` cleanly on a later iteration. Only a *second*
-rebuttal-only round in the same call is an exit, joining the cap-reached and
-empty-findings breaks on the `needs_human` path (`pr-fix` runs at most at
-iterations 1 and 2 of `MAX_PR_REVIEW_ITERATIONS = 3`, so this bounds an
-issue to at most two rebuttal-only pr-fix rounds regardless). Reading
-`rebuttal_only_rounds` at pr-review without also checking whether the issue
-ultimately reached `approved` will misread a continuation as a stall.
+on to reach `prReviewClean` cleanly on a later iteration. A *second*
+rebuttal-only round in the same call is a halt, not a continuation, joining
+the cap-reached and empty-findings breaks on the `needs_human` path — but
+the counter does not increment on that second round: it tracks
+continuations, not rounds, and the halt is already carried by `haltReason`
+and the `needs_human` status, so counting it again would double-book a
+signal the status code already carries. Since `pr-fix` runs at most at
+iterations 1 and 2 of `MAX_PR_REVIEW_ITERATIONS = 3`, this still bounds an
+issue to at most two rebuttal-only pr-fix rounds regardless of what the
+counter reads. Reading `rebuttal_only_rounds` at pr-review without also
+checking whether the issue ultimately reached `approved` will misread a
+continuation as a stall.
 
 One gap worth naming plainly rather than leaving implicit: `rebuttal_only_rounds`
 is not one of `FRICTION_WEIGHTS`' drivers, and `test-quality` has no
