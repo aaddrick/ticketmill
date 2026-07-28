@@ -646,6 +646,12 @@ const REVIEW_SCHEMA = {
     recommended_fix_agent: { type: ['string', 'null'] }, summary: { type: 'string' },
   },
 }
+// ----- REVIEW_SCHEMA.issues prompt line (issue #162) — shared verbatim by every
+// REVIEW_SCHEMA reviewer prompt (quality review, test validation) so the
+// issues-vs-comments contract reads identically everywhere it's asked. -----
+const ISSUES_ASK = 'Every concern you want fixed goes in `issues`, one entry per concern, with severity, summary and a ' +
+  'recommendation; a concern appearing only in `comments` will not be fixed. If you return changes_requested, ' +
+  '`issues` must be non-empty; if you have nothing that must be fixed, return approved.'
 const FIX_SCHEMA = {
   type: 'object', required: ['status', 'summary'],
   properties: {
@@ -3020,9 +3026,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       'Diff to review: git -C ' + ctx.worktree + ' diff ' + TARGET + '...HEAD',
       IMPLEMENTERS.length ? 'If changes are requested, set recommended_fix_agent to one of: ' + IMPLEMENTERS.join(', ') + '.' : '',
       bwFeedback(ctx),
-      'Every concern you want fixed goes in `issues`, one entry per concern, with severity, summary and a',
-      'recommendation; a concern appearing only in `comments` will not be fixed. If you return changes_requested,',
-      '`issues` must be non-empty; if you have nothing that must be fixed, return approved.',
+      ISSUES_ASK,
       'Post an issue comment "## Quality Review (' + stepLabel + ', iteration ' + iter + ')" with your verdict',
       '(approved / changes requested) and key findings in 3-6 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
       'Return result (approved|changes_requested), comments, issues, recommended_fix_agent, summary.',
@@ -3555,9 +3559,7 @@ async function runTestLoop(ctx, forced) {
         : '- If no modified file contains testable logic (pure config/docs/assets), return result=approved immediately.',
       '- Only validate tests covering the modified code. Do NOT request tests for unrelated code, config, or assets.',
       'Audit for: TODO/incomplete tests, hollow assertions, missing edge cases, mock abuse.',
-      'Every concern you want fixed goes in `issues`, one entry per concern, with severity, summary and a',
-      'recommendation; a concern appearing only in `comments` will not be fixed. If you return changes_requested,',
-      '`issues` must be non-empty; if you have nothing that must be fixed, return approved.',
+      ISSUES_ASK,
       'Post an issue comment "## Test Validation (iteration ' + iter + ')" with your verdict in 2-4 lines',
       '(gh issue comment ' + ctx.issue + ' --repo ' + REPO + '); if approved because nothing testable changed, say so.',
       'Return result (approved|changes_requested), comments, issues, summary.',
