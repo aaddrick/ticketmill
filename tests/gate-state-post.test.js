@@ -50,6 +50,20 @@ function gateStateKeys(keys) {
   return keys.filter(function (k) { return k.indexOf('gate-state-') === 0 })
 }
 
+// Pulls the literal heredoc body back out of a postGateState prompt (the
+// exact text between the two TICKETMILL_GATE_STATE_EOF markers -- see
+// postGateState's prompt construction in workflows/ticketmill.js) and parses
+// it with the real parseGateStateComment, so a test can assert on the ACTUAL
+// payload a real postGateState() call built (including its GATE_STATE_WRITE_SEQ-
+// derived write_seq), not a hand-crafted fixture.
+function extractGateStatePayload(context, prompt, repo, issue) {
+  const m = /<<'TICKETMILL_GATE_STATE_EOF'\n([\s\S]*?)\nTICKETMILL_GATE_STATE_EOF/.exec(String(prompt))
+  assert.ok(m, 'expected a TICKETMILL_GATE_STATE_EOF heredoc body in the prompt:\n' + prompt)
+  const payload = context.parseGateStateComment(m[1], repo, issue)
+  assert.ok(payload, 'expected the extracted heredoc body to parse as a valid gate-state comment')
+  return payload
+}
+
 // ---- postGateState() in isolation ----
 
 test('postGateState: a dead gate-state agent sets gate_state_post_failed (never gate_state_intent), pushes a ctx.deferred note, and returns falsy', async function () {
@@ -194,16 +208,17 @@ test('implementIssue: a run that clears both gates posts gate-state "approach" t
   const context = harness.boot()
   seed(context)
 
+  const prompts = {}
   harness.installScriptedAgent(context, function (prompt, opts) {
     const label = (opts && opts.label) || ''
     if (label === '21:setup') return { status: 'success', worktree: '/tmp/fixture-worktree', branch: 'issue-21-fixture' }
     if (label === '21:research') return { status: 'success', context: { issue_title: 'Fixture', issue_body: 'req', related_files: [], dependencies: [], prior_work: '' } }
     if (label === '21:evaluate') return { status: 'success', approach: 'do the thing', rationale: 'because', complexity: 'trivial', risks: [], alternatives_rejected: [], summary: 'initial evaluation' }
     if (label === '21:challenge-approach-i1') return { verdict: 'sound_with_caveats', summary: 'fine', findings: [] }
-    if (label === '21:gate-state-approach') return { posted: true }
+    if (label === '21:gate-state-approach') { prompts.approach = prompt; return { posted: true } }
     if (label === '21:plan') return { status: 'success', summary: 'planned', tasks: [{ id: 1, description: 'Implement the fixture feature', agent: 'implementer' }], task_list_markdown: '' }
     if (label === '21:challenge-plan-i1') return { verdict: 'sound_with_caveats', summary: 'fine', findings: [] }
-    if (label === '21:gate-state-plan') return { posted: true }
+    if (label === '21:gate-state-plan') { prompts.plan = prompt; return { posted: true } }
     // Fail the first task immediately so the test doesn't have to script the
     // rest of IMPLEMENT — only the ordering of the two gate-state posts above it is under test.
     if (label === '21:task-1-implement') return { status: 'error', summary: 'forced failure', error: 'stop test here' }
@@ -222,6 +237,20 @@ test('implementIssue: a run that clears both gates posts gate-state "approach" t
   assert.deepStrictEqual(gateStateCalls, ['gate-state-approach', 'gate-state-plan'])
   // Both boundaries land BEFORE the first task-implement stage.
   assert.ok(keys.indexOf('gate-state-plan') < keys.indexOf('task-1-implement'))
+
+  // GATE_STATE_WRITE_SEQ (module-level, ++'d on every real postGateState()
+  // call) must have actually advanced across these two same-run writes, not
+  // just been present. RUN_EPOCH is identical for both (same run), so
+  // write_seq is the ONLY thing diffGateStateIntent can use to order two
+  // same-run boundaries against each other -- a regression that reverted the
+  // increment to a static value (e.g. always null, or always the same
+  // number) would leave every other assertion in this suite green while
+  // silently breaking same-run ordering.
+  const approachPayload = extractGateStatePayload(context, prompts.approach, REPO, 21)
+  const planPayload = extractGateStatePayload(context, prompts.plan, REPO, 21)
+  assert.strictEqual(typeof approachPayload.write_seq, 'number', 'expected a real numeric write_seq, not null/undefined')
+  assert.strictEqual(planPayload.write_seq, approachPayload.write_seq + 1,
+    'expected the module-level GATE_STATE_WRITE_SEQ counter to advance by exactly 1 between the two real postGateState() calls in this run')
 })
 
 // ---- exactly one gate-state stage per pr-review iteration ----
