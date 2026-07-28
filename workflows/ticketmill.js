@@ -592,11 +592,17 @@ const CHALLENGE_SCHEMA = {
   // Only verdict+summary are hard-required: opus challengers demonstrably drop the
   // findings array under long output, and control flow stays correct without it
   // (missing findings => 0 critical/major).
+  // recommendation joined findings.items' optional set in #164: requiring a fix
+  // proposal is prompt elaboration of the finding shape, not a control-flow need,
+  // and a published measurement tied that elaboration to rejecting correct code
+  // 26.2% -> 73.2% of the time. A required proposal also makes a finding cheaper
+  // to emit than to withhold, fighting these same prompts' stated acceptance
+  // condition that zero critical/major findings is the expected, unremarkable case.
   type: 'object', required: ['verdict', 'summary'],
   properties: {
     verdict: { enum: ['sound_with_caveats', 'needs_rework', 'investigate_first'] },
     strengths: { type: 'string' },
-    findings: { type: 'array', items: { type: 'object', required: ['severity', 'summary', 'recommendation'], properties: {
+    findings: { type: 'array', items: { type: 'object', required: ['severity', 'summary'], properties: {
       severity: { enum: ['critical', 'major', 'minor'] }, summary: { type: 'string' },
       assumption_challenged: { type: 'string' }, failure_scenario: { type: 'string' },
       impact: { type: 'string' }, recommendation: { type: 'string' },
@@ -635,11 +641,12 @@ const REVIEW_SCHEMA = {
   type: 'object', required: ['result', 'summary'],
   properties: {
     result: { enum: ['approved', 'changes_requested'] }, comments: { type: 'string' },
-    // issues is deliberately one field looser than CHALLENGE_SCHEMA.findings (:599):
-    // no `recommendation` in required. `issues` itself stays out of REVIEW_SCHEMA's
-    // required list (a reviewer that omits it entirely degrades to today's prose
-    // path, see normalizeFindings() below) and `id` is never part of the schema —
-    // the engine assigns it in normalizeFindings().
+    // issues.items now requires the same two fields as CHALLENGE_SCHEMA.findings.items
+    // (:599): severity and summary, with recommendation optional on both since #164.
+    // `issues` itself still stays out of REVIEW_SCHEMA's own required list (a reviewer
+    // that omits it entirely degrades to today's prose path, see normalizeFindings()
+    // below) and `id` is never part of either schema — the engine assigns it in
+    // normalizeFindings().
     issues: { type: 'array', items: { type: 'object', required: ['severity', 'summary'], properties: {
       severity: { enum: ['critical', 'major', 'minor'] }, summary: { type: 'string' }, recommendation: { type: 'string' },
     } } },
@@ -2071,7 +2078,9 @@ function revisitRiskBlock(ctx) {
 // computeGateYield.
 // NOTE (issue #162): REVIEW_SCHEMA.issues is now typed the same shape as
 // CHALLENGE_SCHEMA.findings (severity/summary required, recommendation
-// optional), and all four REVIEW_SCHEMA-producing prompts (spec review, code
+// optional — literally true on both schemas as of #164, which dropped
+// recommendation from CHALLENGE_SCHEMA.findings.items' required list), and
+// all four REVIEW_SCHEMA-producing prompts (spec review, code
 // review, quality review, test validation) ask for it via ISSUES_ASK. Before
 // this change, the same call site already passed `(spec.issues ||
 // []).concat(code.issues || [])` into recordGateOutcome, which counts by
@@ -4050,7 +4059,7 @@ async function challengeConsolidationGroup(group, settledCarrier) {
       iter > 1 ? 'This is iteration ' + iter + ': the group was revised per your prior findings — check whether they are addressed.' : '',
       'Post an issue comment on #' + current.primary + ' titled "## Contrarian: Consolidation Challenge (Group ' + groupId + ', Iteration ' + iter + ')" with your verdict and findings.',
       'STRUCTURED OUTPUT CONTRACT: verdict must be EXACTLY one of sound_with_caveats | needs_rework | investigate_first.',
-      'Every concern goes in the findings ARRAY (severity, summary, recommendation), never only in prose.',
+      'Every concern goes in the findings ARRAY (severity and summary required; add a recommendation when you have a concrete fix), never only in prose.',
     ].filter(Boolean).join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
 
     if (!ch) {
@@ -4422,8 +4431,8 @@ async function implementIssue(ctx) {
       'Working directory (read-only): ' + ctx.worktree,
       'Post an issue comment "## Contrarian: Approach Challenge (Iteration ' + iter + ')" with your verdict and findings.',
       'STRUCTURED OUTPUT CONTRACT: verdict must be EXACTLY one of sound_with_caveats | needs_rework | investigate_first.',
-      'Every concern goes in the findings ARRAY (objects with severity, summary, recommendation — keep each field to',
-      '2-3 sentences), never only in prose. Keep summary under 200 words so the output stays well-formed.',
+      'Every concern goes in the findings ARRAY (objects with severity and summary required — keep each field to',
+      '2-3 sentences; add a recommendation only when you have a concrete fix), never only in prose. Keep summary under 200 words so the output stays well-formed.',
     ].join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
     if (!ch) { log('#' + ctx.issue + ' contrarian(approach) died — proceeding with unchallenged approach (logged)'); pushDecision(ctx, 'Contrarian: Approach', 'SKIPPED — contrarian agent unavailable'); recordGateOutcome(ctx, 'approach', [], 'dismissed'); break }
 
@@ -4568,8 +4577,8 @@ async function implementIssue(ctx) {
       'Working directory (read-only): ' + ctx.worktree,
       'Post an issue comment "## Contrarian: Plan Stress Test (Iteration ' + iter + ')".',
       'STRUCTURED OUTPUT CONTRACT: verdict must be EXACTLY one of sound_with_caveats | needs_rework | investigate_first.',
-      'Every concern goes in the findings ARRAY (objects with severity, summary, recommendation — keep each field to',
-      '2-3 sentences), never only in prose. Keep summary under 200 words so the output stays well-formed.',
+      'Every concern goes in the findings ARRAY (objects with severity and summary required — keep each field to',
+      '2-3 sentences; add a recommendation only when you have a concrete fix), never only in prose. Keep summary under 200 words so the output stays well-formed.',
     ].join('\n'), stageOpts('contrarian'), CHALLENGE_SCHEMA)
     if (!ch) { log('#' + ctx.issue + ' contrarian(plan) died — proceeding with unchallenged plan (logged)'); pushDecision(ctx, 'Contrarian: Plan', 'SKIPPED — contrarian agent unavailable'); recordGateOutcome(ctx, 'plan', [], 'dismissed'); break }
 

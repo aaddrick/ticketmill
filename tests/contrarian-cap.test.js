@@ -164,3 +164,126 @@ test('implementIssue: a plan challenge that never clears the contrarian bar push
   const capNoteCall = context.agent.calls.find(function (c) { return c.opts.label === '1:cap-note-plan' })
   assert.ok(capNoteCall, 'expected a cap-note-plan stage call')
 })
+
+// ---- issue #164: recommendation dropped from CHALLENGE_SCHEMA.findings.items'
+// required list — a finding that omits it entirely must still render
+// byte-identically to today's empty-string-recommendation case (the ' -> '
+// trailing separator and all) at every render site it reaches. ----
+
+test('implementIssue: an approach-gate challenge finding that omits recommendation entirely renders byte-identically to the empty-recommendation case, at both the cap-out unresolved line and the re-evaluate-i1 prompt (#164)', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {} })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label === '1:setup') return { status: 'success', worktree: '/tmp/ticketmill-fixture-worktree', branch: 'issue-1-fixture' }
+    if (label === '1:research') return { status: 'success', context: { issue_title: 'Fixture', issue_body: 'req', related_files: [], dependencies: [], prior_work: '' } }
+    if (label === '1:evaluate') return { status: 'success', approach: 'do the thing', rationale: 'because', complexity: 'trivial', risks: [], alternatives_rejected: [], summary: 'initial evaluation' }
+    if (label === '1:challenge-approach-i1') {
+      // recommendation omitted entirely — not '', absent — the shape #164 newly permits.
+      return { verdict: 'needs_rework', summary: 'unconvinced round 1', findings: [{ severity: 'major', summary: 'missing risk analysis' }] }
+    }
+    if (label === '1:re-evaluate-i1') return { status: 'success', approach: 'revised approach', rationale: 'addressed', risks: [], alternatives_rejected: [], summary: 'revised evaluation' }
+    if (label === '1:challenge-approach-i2') {
+      // Cap iteration (trivial -> challengeCap 2): also recommendation-omitted.
+      return { verdict: 'needs_rework', summary: 'still unconvinced at the cap', findings: [{ severity: 'major', summary: 'risk analysis still thin' }] }
+    }
+    if (label === '1:cap-note-approach') return { posted: true }
+    if (label === '1:plan') return { status: 'error', error: 'stop test here (approach gate is what is under test)' }
+    if (label === '1:halt-note-plan') return { posted: true }
+    throw new Error('unexpected stage label: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 1 })
+  const result = await context.implementIssue(ctx)
+
+  assert.strictEqual(result.status, 'failed')
+  assert.strictEqual(result.stage, 'plan')
+
+  // Cap-iteration finding, recommendation omitted -> the '-> ' (f.recommendation
+  // || '') fallback renders the exact same trailing-space line as an
+  // explicit empty-string recommendation would (:4454's render site).
+  assert.strictEqual(ctx.unresolved.length, 1)
+  assert.strictEqual(ctx.unresolved[0], '[approach gate, major] risk analysis still thin -> ')
+
+  // Iteration-1's finding (also recommendation-omitted) must reach the
+  // re-evaluate-i1 prompt with the same rendering (:4475's render site).
+  const reEvalCall = context.agent.calls.find(function (c) { return c.opts.label === '1:re-evaluate-i1' })
+  assert.ok(reEvalCall, 'expected a re-evaluate-i1 stage call')
+  assert.ok(reEvalCall.prompt.includes('- [major] missing risk analysis -> '), 'expected the rendered finding line in the re-evaluate-i1 prompt: ' + reEvalCall.prompt)
+})
+
+test('implementIssue: a plan-gate challenge finding that omits recommendation entirely renders byte-identically to the empty-recommendation case, at both the cap-out unresolved line and the re-plan-i1 prompt (#164)', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {} })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label === '1:setup') return { status: 'success', worktree: '/tmp/ticketmill-fixture-worktree', branch: 'issue-1-fixture' }
+    if (label === '1:research') return { status: 'success', context: { issue_title: 'Fixture', issue_body: 'req', related_files: [], dependencies: [], prior_work: '' } }
+    if (label === '1:evaluate') return { status: 'success', approach: 'do the thing', rationale: 'because', complexity: 'trivial', risks: [], alternatives_rejected: [], summary: 'initial evaluation' }
+    // Clear the approach gate in one shot so only the plan gate is under test.
+    if (label === '1:challenge-approach-i1') return { verdict: 'sound_with_caveats', summary: 'fine', findings: [] }
+    if (label === '1:plan') return { status: 'success', summary: 'planned', tasks: [{ id: 1, description: 'Implement the fixture feature', agent: 'implementer' }], task_list_markdown: '' }
+    if (label === '1:challenge-plan-i1') {
+      // recommendation omitted entirely — not '', absent.
+      return { verdict: 'needs_rework', summary: 'unconvinced round 1', findings: [{ severity: 'major', summary: 'task ordering is wrong' }] }
+    }
+    if (label === '1:re-plan-i1') return { status: 'success', summary: 'replanned', tasks: [{ id: 1, description: 'Implement the fixture feature, reordered', agent: 'implementer' }], task_list_markdown: '' }
+    if (label === '1:challenge-plan-i2') {
+      // Cap iteration (trivial -> challengeCap 2): also recommendation-omitted.
+      return { verdict: 'needs_rework', summary: 'still unconvinced at the cap', findings: [{ severity: 'major', summary: 'task ordering still wrong' }] }
+    }
+    if (label === '1:cap-note-plan') return { posted: true }
+    if (label === '1:task-1-implement') return { status: 'error', summary: 'forced failure', error: 'stop test here (plan gate is what is under test)' }
+    if (label === '1:halt-note-implement') return { posted: true }
+    throw new Error('unexpected stage label: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 1 })
+  const result = await context.implementIssue(ctx)
+
+  assert.strictEqual(result.status, 'failed')
+  assert.strictEqual(result.stage, 'implement')
+
+  // Cap-iteration finding, recommendation omitted -> same trailing-space
+  // rendering as an explicit empty-string recommendation (:4598's render site).
+  assert.strictEqual(ctx.unresolved.length, 1)
+  assert.strictEqual(ctx.unresolved[0], '[plan gate, major] task ordering still wrong -> ')
+
+  // Iteration-1's finding (also recommendation-omitted) must reach the
+  // re-plan-i1 prompt with the same rendering (:4617's render site).
+  const rePlanCall = context.agent.calls.find(function (c) { return c.opts.label === '1:re-plan-i1' })
+  assert.ok(rePlanCall, 'expected a re-plan-i1 stage call')
+  assert.ok(rePlanCall.prompt.includes('- [major] task ordering is wrong -> '), 'expected the rendered finding line in the re-plan-i1 prompt: ' + rePlanCall.prompt)
+})
+
+test('implementIssue: an approach-gate challenge that omits `findings` entirely (sound_with_caveats, no findings key) still settles and records "accepted" (#164)', async function () {
+  // This locks in behavior that already held before #164: CHALLENGE_SCHEMA's
+  // top-level `required` was already just ['verdict', 'summary'] (:595,
+  // untouched by this issue) — only findings.items.required (the per-finding
+  // severity/summary/recommendation trio) changed. This guards against a
+  // regression that would newly demand the findings key itself; it does not
+  // prove anything #164 introduced.
+  const context = harness.boot()
+  context.__seed({ PROFILE: {} })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label === '1:setup') return { status: 'success', worktree: '/tmp/ticketmill-fixture-worktree', branch: 'issue-1-fixture' }
+    if (label === '1:research') return { status: 'success', context: { issue_title: 'Fixture', issue_body: 'req', related_files: [], dependencies: [], prior_work: '' } }
+    if (label === '1:evaluate') return { status: 'success', approach: 'do the thing', rationale: 'because', complexity: 'trivial', risks: [], alternatives_rejected: [], summary: 'initial evaluation' }
+    if (label === '1:challenge-approach-i1') return { verdict: 'sound_with_caveats', summary: 'fine, no structured findings at all' }
+    if (label === '1:plan') return { status: 'error', error: 'stop test here (approach gate is what is under test)' }
+    if (label === '1:halt-note-plan') return { posted: true }
+    throw new Error('unexpected stage label: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 1 })
+  const result = await context.implementIssue(ctx)
+
+  assert.strictEqual(result.status, 'failed')
+  assert.strictEqual(result.stage, 'plan')
+  harness.assertVmEqual(ctx.gate_findings.approach.disposition, { accepted: 1 })
+  assert.strictEqual(ctx.gate_findings.approach.count, 0)
+})

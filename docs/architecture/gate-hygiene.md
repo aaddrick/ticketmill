@@ -14,27 +14,73 @@ reviewer could put anything there, and nothing downstream read it. Fix
 stages worked from `rev.comments`/`rev.summary`, prose a human (or a later
 agent) had to parse to find the actual list of things to change. A finding
 is now a typed object: `severity`, `summary`, and an engine-assigned `id`,
-with an optional `recommendation`. The four REVIEW_SCHEMA-producing prompts
+with an optional `recommendation` — the same required/optional split
+`CHALLENGE_SCHEMA.findings` uses since #164 (see below); the `id` is the
+one part of this shape that stays REVIEW_SCHEMA-only. The four
+REVIEW_SCHEMA-producing prompts
 (spec review, code review, quality review, test validation) all carry the
 same `ISSUES_ASK` line tying the array to the verdict: every concern goes in
 `issues`, a concern that only appears in `comments` will not be fixed, and
 `changes_requested` with an empty `issues` is a contradiction the reviewer
 should resolve by returning `approved` instead.
 
-## The typed shape, and why it's one field looser than CHALLENGE_SCHEMA
+## The typed shape, and why CHALLENGE_SCHEMA gave up its extra required field
 
-`CHALLENGE_SCHEMA.findings` (the contrarian gates' shape) requires
-`severity`, `summary`, and `recommendation`. `REVIEW_SCHEMA.issues.items`
-requires only `severity` and `summary`; `recommendation` is optional. Both
-use the same three-value severity enum (`critical`/`major`/`minor`). The gap
-is deliberate, not an oversight: a contrarian's job is to argue a case, so a
-finding without a recommendation is an unfinished argument. A reviewer's job
-is closer to code review — "this is wrong" is a complete, actionable finding
-on its own, and forcing a `recommendation` for every nit would train
-reviewers to pad the field rather than skip it. `issues` itself stays out of
+`CHALLENGE_SCHEMA.findings.items` (the contrarian gates' shape) and
+`REVIEW_SCHEMA.issues.items` (the reviewer shape) now require the same two
+fields, `severity` and `summary`, and both declare `recommendation` as an
+optional string property. Both use the same three-value severity enum
+(`critical`/`major`/`minor`). That parity is new: until issue #164,
+`CHALLENGE_SCHEMA.findings.items` also required `recommendation`, on the
+reasoning that a contrarian's job is to argue a case, so a finding without a
+recommendation is an unfinished argument. Issue #164 retired that
+requirement. A mandatory fix proposal turned out to be exactly the kind of
+prompt elaboration that inflates rejection of correct work — a published
+measurement tied it to rejecting correct code 26.2% -> 73.2% of the time —
+and it fights the acceptance condition these same contrarian prompts already
+state: zero critical/major findings is the expected, unremarkable outcome of
+a challenge, not a failure to produce one. Requiring a `recommendation` made
+a finding cheaper to emit than to withhold, pushing challengers toward the
+opposite of that stated condition.
+
+The reviewer-side half of the original reasoning survives this change
+unchanged: a reviewer's job is closer to code review — "this is wrong" is a
+complete, actionable finding on its own, and forcing a `recommendation` for
+every nit would train reviewers to pad the field rather than skip it. That
+was true before #164 and remains the reason `REVIEW_SCHEMA.issues.items`
+never required the field in the first place; #164 just brought the
+contrarian shape into line with it rather than changing it.
+
+This parity is schema-level only. `ISSUES_ASK` — the shared prompt line
+every `REVIEW_SCHEMA` reviewer sees — still asks in prose for "severity,
+summary and a recommendation," unchanged by #164, so the two paths still
+read differently to a model even though a response omitting
+`recommendation` now validates identically on both. Reconciling that prose
+with the schema is out of scope here. `issues` itself also stays out of
 `REVIEW_SCHEMA.required` — a reviewer that never mentions the field at all
 is a different, and explicitly supported, case (see below) — and `id` is
-never part of the schema. The model never assigns an id.
+never part of either schema. The model never assigns an id, on either
+path.
+
+Issue #164 reworded the "findings ARRAY" prompt line at all three
+contrarian gates that have one — consolidation, approach, and plan — not
+only the approach and plan gates its issue body named. All three now ask
+for the array itself as mandatory, `severity` and `summary` as required
+fields, and a `recommendation` only when the challenger has a concrete fix
+to propose, rather than treating a missing one as a defect in the finding.
+
+Dropping `recommendation` from `required` changes nothing at render time.
+Every one of the five challenge render sites — the consolidation, approach,
+and plan gates' revise/re-plan prompts, plus the approach and plan gates'
+in-loop unresolved-caveat lines — already reads the field as
+`(f.recommendation || '')`, so an absent `recommendation` and an
+empty-string one were already indistinguishable output before #164; the
+schema change just makes the absent case reachable without failing
+validation first. `findingsBlock()`, the analogous render path on the
+`REVIEW_SCHEMA` side, coerces the same way — but it is a separate function
+serving reviewer findings, not one of the five, and it also prefixes each
+line with the engine-assigned `id` that challenge findings never carry (see
+below).
 
 ## Why the engine assigns the id, not the model
 
