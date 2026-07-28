@@ -16,4 +16,5 @@ plain JavaScript; every unit of actual work is a schema-validated subagent call.
 | [failure-semantics.md](failure-semantics.md) | How the run fails, halts, and resumes. |
 | [cost-and-tokens.md](cost-and-tokens.md) | Token tracking, cost estimation, and the token_budget guard. |
 | [scheduling.md](scheduling.md) | Claims interop, the consolidation gate, and lane scheduling. |
+| [engine-internals.md](engine-internals.md) | Long-form commentary moved out of `workflows/ticketmill.js` to keep it under the Workflow tool's 512 KiB script cap. Each section is the engine's own comment text, verbatim; the code keeps a summary and a pointer. |
 | [AGENTS.md](AGENTS.md) | Freeze pair with CLAUDE.md, constraining tech-docs to this directory's conventions. |

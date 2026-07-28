@@ -72,6 +72,7 @@ to ship.
 | `failure-semantics.md` | How the run fails, halts, and resumes (two segments, emitted out of source order: the short bullet list first, the incident-derived-machinery table second). |
 | `cost-and-tokens.md` | Token tracking, cost estimation, and the token_budget guard. |
 | `scheduling.md` | Claims interop, the consolidation gate, and lane scheduling. |
+| `engine-internals.md` | Long-form commentary moved out of `workflows/ticketmill.js` so the engine stays under the Workflow tool's 512 KiB script cap, which is enforced only at launch. Each section is the engine's own comment text, verbatim, and the code keeps a one-sentence summary plus a pointer. Authored text, added after the split; not tracked in the provenance fixture. |
 | `AGENTS.md`, `CLAUDE.md` | This freeze pair. Not moved prose; not tracked in the provenance fixture. |
 
 `docs/ARCHITECTURE.md` (one level up) is a permanent redirect stub left at the

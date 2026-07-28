@@ -20,6 +20,9 @@
 //     pattern-based allowances. Use it sparingly and only when the line is
 //     genuinely not the forbidden construct (e.g. a string literal or a
 //     trailing/inline comment that happens to contain one of these tokens).
+//   - Also fails if workflows/ticketmill.js is at or over the Workflow tool's
+//     512 KiB script cap, which is enforced only at launch — every other check
+//     in the repo passes on an engine too large to run.
 //   - Also fails if .claude/workflows/ticketmill.js is not byte-identical to
 //     workflows/ticketmill.js. mill-init copies the engine verbatim into each
 //     target repo's .claude/workflows/, and this repo keeps its own copy in
@@ -61,6 +64,18 @@ const LOCKSTEP_PAIRS = [
 ]
 
 const SANDBOX_OK = '// sandbox-ok'
+
+// The Workflow tool refuses to launch a script file larger than 512 KiB, and
+// refuses it at LAUNCH — nothing before that point notices. v0.2.0 shipped an
+// engine 32 KB over this line: node --check passed, the whole suite passed, CI
+// was green, and the released engine could not be run at all. So the size is
+// checked here, next to the other rules that only matter at runtime.
+//
+// The warn band exists because the failure is a cliff, not a slope. Crossing
+// the cap costs a release; crossing 92% of it costs nothing but tells you the
+// next few features need to budget for it.
+const ENGINE_BYTE_CAP = 524288
+const ENGINE_BYTE_WARN = Math.floor(ENGINE_BYTE_CAP * 0.92)
 
 const RULES = [
   {
@@ -110,6 +125,31 @@ function lintEngineSource(filePath) {
   return violations
 }
 
+// Reports a violation only when the engine is at or over the cap. The warn-band
+// message goes to stderr without failing, so a run that is merely close still
+// exits 0.
+function checkEngineSize(filePath) {
+  const relPath = path.relative(ROOT, filePath)
+  const bytes = fs.statSync(filePath).size
+  if (bytes >= ENGINE_BYTE_CAP) {
+    return [
+      relPath + ':1: ' + bytes.toLocaleString() + ' bytes exceeds the Workflow tool\'s ' +
+        ENGINE_BYTE_CAP.toLocaleString() + '-byte script cap by ' +
+        (bytes - ENGINE_BYTE_CAP).toLocaleString() + '. The engine cannot be launched at ' +
+        'this size. Move standing prose to docs/architecture/engine-internals.md and leave ' +
+        'a pointer, the way the 36 sections already there were moved',
+    ]
+  }
+  if (bytes >= ENGINE_BYTE_WARN) {
+    console.error(
+      'lint-engine: WARNING — ' + relPath + ' is ' + bytes.toLocaleString() + ' bytes, within ' +
+        (ENGINE_BYTE_CAP - bytes).toLocaleString() + ' bytes of the ' +
+        ENGINE_BYTE_CAP.toLocaleString() + '-byte Workflow script cap'
+    )
+  }
+  return []
+}
+
 function main() {
   const fixMode = process.argv.indexOf('--fix') !== -1
 
@@ -141,7 +181,7 @@ function main() {
 
   // Same scan in both modes: a sandbox violation in the source must still
   // fail --fix, not be silently carried into a freshly synced copy.
-  const violations = lintEngineSource(ENGINE_PATH)
+  const violations = lintEngineSource(ENGINE_PATH).concat(checkEngineSize(ENGINE_PATH))
 
   LOCKSTEP_PAIRS.forEach(function (pair) {
     if (!fs.readFileSync(pair.source).equals(fs.readFileSync(pair.copy))) {
@@ -161,9 +201,11 @@ function main() {
     process.exit(1)
   }
 
+  const bytes = fs.statSync(ENGINE_PATH).size
   console.log(
     'lint-engine: clean (' + path.relative(ROOT, ENGINE_PATH) + ', ' +
-      LOCKSTEP_PAIRS.length + ' lockstep pairs in sync)'
+      LOCKSTEP_PAIRS.length + ' lockstep pairs in sync, ' + bytes.toLocaleString() +
+      '/' + ENGINE_BYTE_CAP.toLocaleString() + ' bytes)'
   )
 }
 

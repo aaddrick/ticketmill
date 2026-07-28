@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.1 (2026-07-28)
+
+The engine got too big to run. The Workflow tool refuses any script file of
+512 KiB or more, and it refuses it at launch, which is the one moment nothing
+in this repository was watching. v0.2.0 shipped at 556,668 bytes, 32,380 past
+that line, with `node --check` passing, all 737 tests passing, and CI green.
+The release could not be launched at all.
+
+Two changes. The first is the fix: 36 blocks of standing commentary, the ones
+that explain why a helper is shaped the way it is rather than what the next
+line does, moved verbatim into `docs/architecture/engine-internals.md`. Each
+site keeps its opening sentence and gains a pointer to the section carrying the
+rest, so the reasoning is a link away instead of gone. The engine is now
+465,677 bytes with 58,611 to spare.
+
+The second is the guard, because the first is only worth as much as whatever
+stops it recurring. `scripts/lint-engine.js` now fails when the engine reaches
+the cap and warns on stderr, without failing, once it passes 92% of it. The
+failure names the overage in bytes and points at where the prose goes. It sits
+beside the sandbox-construct rules for the same reason those exist: the
+constructs are legal JavaScript and the size is a legal file, and both are only
+a problem at runtime, which is too late to find out.
+
+The warn band exists because this failure is a cliff rather than a slope.
+Crossing the cap costs a release. Crossing 92% costs nothing and tells the next
+few features to budget for it.
+
+One test moved with the prose. `tests/sandbox-lint.test.js` ran lint through
+`execFileSync`, which returns stdout only, so its helper reported an empty
+stderr on every passing run and could not have seen a warning that exits 0. It
+uses `spawnSync` now.
+
 ## [0.2.0] - 2026-07-28-gate-hygiene-t1
 
 - Make review findings the load-bearing artifact (#162)

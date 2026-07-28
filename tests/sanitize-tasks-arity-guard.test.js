@@ -15,15 +15,21 @@ const harness = require('./harness')
 test('arity guard: exactly one def + two calls of sanitizeTasks(ctx, ...), no stale single-arg calls', function () {
   const raw = harness.readEngineSource()
 
-  // Line ~134 carries a doc comment mentioning "sanitizeTasks()" with no
-  // arguments at all — strip that specific, parens-empty mention before
-  // counting real (ctx, ...) sites, so a doc-comment reword can't mask a
-  // genuine arity regression (and so this test fails loudly if the comment
-  // itself has drifted away from what this guard expects).
-  const withoutDocComment = raw.replace(/sanitizeTasks\(\)/, '')
-  assert.notStrictEqual(withoutDocComment, raw, 'expected to find the doc comment mentioning "sanitizeTasks()" with no args — has it moved or been reworded?')
+  // The engine header used to carry a doc comment mentioning "sanitizeTasks()"
+  // with no arguments at all, which this guard had to strip before counting
+  // real (ctx, ...) sites. That prose moved to
+  // docs/architecture/engine-internals.md when the header was lifted out to
+  // keep the engine under the Workflow tool's script-size cap, so there is no
+  // longer a parens-empty mention in the source to subtract. Assert its
+  // absence, so a reintroduced bare mention is a loud failure here rather than
+  // silently inflating the counts below.
+  assert.strictEqual(
+    raw.match(/sanitizeTasks\(\)/), null,
+    'found a bare "sanitizeTasks()" mention in the engine source — that prose now ' +
+    'lives in docs/architecture/engine-internals.md; the counts below assume it is absent',
+  )
 
-  const ctxFirstSites = withoutDocComment.match(/sanitizeTasks\(ctx,\s*/g) || []
+  const ctxFirstSites = raw.match(/sanitizeTasks\(ctx,\s*/g) || []
   assert.strictEqual(
     ctxFirstSites.length, 3,
     'expected exactly 1 def (`function sanitizeTasks(ctx, raw)`) + 2 call sites ' +
@@ -39,8 +45,8 @@ test('arity guard: exactly one def + two calls of sanitizeTasks(ctx, ...), no st
   )
 
   // Sanity canary: total "sanitizeTasks(" occurrences anywhere in the file
-  // (doc comment + def + 2 calls) is exactly 4 — catches an entirely new,
-  // unaccounted-for reference to the helper appearing anywhere in the source.
+  // (def + 2 calls) is exactly 3 — catches an entirely new, unaccounted-for
+  // reference to the helper appearing anywhere in the source.
   const allOccurrences = raw.match(/sanitizeTasks\(/g) || []
-  assert.strictEqual(allOccurrences.length, 4)
+  assert.strictEqual(allOccurrences.length, 3)
 })

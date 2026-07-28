@@ -21,7 +21,7 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { execFileSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
 
 const ROOT = path.join(__dirname, '..')
 const REAL_ENGINE_PATH = path.join(ROOT, 'workflows', 'ticketmill.js')
@@ -71,17 +71,20 @@ function makeSandbox(workflowsSource, claudeSource) {
   return dir
 }
 
-/** Run a lint-engine.js copy as a child process; never throws on non-zero exit. */
+/**
+ * Run a lint-engine.js copy as a child process; never throws on non-zero exit.
+ *
+ * spawnSync, not execFileSync, because lint-engine.js writes its size warning to
+ * stderr while still exiting 0. execFileSync returns only stdout, so the previous
+ * version of this helper reported `stderr: ''` on every successful run and a
+ * warning-band assertion could never see the warning it was checking for.
+ */
 function runLintWithArgs(lintScriptPath, args) {
-  try {
-    const stdout = execFileSync(process.execPath, [lintScriptPath].concat(args), { encoding: 'utf8' })
-    return { code: 0, stdout: stdout, stderr: '' }
-  } catch (err) {
-    return {
-      code: typeof err.status === 'number' ? err.status : 1,
-      stdout: err.stdout ? err.stdout.toString() : '',
-      stderr: err.stderr ? err.stderr.toString() : '',
-    }
+  const result = spawnSync(process.execPath, [lintScriptPath].concat(args), { encoding: 'utf8' })
+  return {
+    code: typeof result.status === 'number' ? result.status : 1,
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
   }
 }
 
@@ -331,4 +334,75 @@ test('--fix creates the copy when absent (byte-identical, exit 0)', function () 
 test('sanity: the real repo\'s two engine copies are themselves byte-identical', function () {
   const claudeSource = fs.readFileSync(REAL_CLAUDE_ENGINE_PATH, 'utf8')
   assert.strictEqual(claudeSource, realEngineSource, 'workflows/ticketmill.js and .claude/workflows/ticketmill.js have drifted — see the LOCKSTEP-EDIT rule')
+})
+
+// ---------------------------------------------------------------------------
+// Engine size cap.
+//
+// The Workflow tool refuses a script file at or over 512 KiB, and refuses it at
+// LAUNCH. v0.2.0 shipped an engine 32 KB past that line with node --check
+// passing, the full suite passing, and CI green — the release simply could not
+// be run. These tests pin the guard that now catches it before a release.
+//
+// Sizes are built by padding a comment line rather than by shipping a fixture,
+// so the assertions stay readable and no multi-hundred-KB blob enters the repo.
+
+const ENGINE_BYTE_CAP = 524288
+
+/** A syntactically irrelevant source of exactly `bytes` length (lint never evaluates it). */
+function sourceOfSize(bytes) {
+  const head = '// size fixture\n'
+  return head + '/'.repeat(bytes - head.length)
+}
+
+test('size guard: an engine at or over the 512 KiB cap fails, naming the overage', function () {
+  const source = sourceOfSize(ENGINE_BYTE_CAP + 4096)
+  withSandbox(source, undefined, function (dir) {
+    const result = runSandboxLint(dir)
+    const output = result.stdout + result.stderr
+
+    assert.notStrictEqual(result.code, 0, 'expected a source over the cap to fail; got:\n' + output)
+    assert.ok(output.includes('exceeds the Workflow tool'), 'expected the cap message; got:\n' + output)
+    assert.ok(output.includes('4,096'), 'expected the exact overage in the message; got:\n' + output)
+  })
+})
+
+test('size guard: exactly at the cap fails (the tool rejects >= cap, not > cap)', function () {
+  withSandbox(sourceOfSize(ENGINE_BYTE_CAP), undefined, function (dir) {
+    const result = runSandboxLint(dir)
+    const output = result.stdout + result.stderr
+    assert.notStrictEqual(result.code, 0, 'expected a source exactly at the cap to fail; got:\n' + output)
+    assert.ok(output.includes('exceeds the Workflow tool'), 'expected the cap message; got:\n' + output)
+  })
+})
+
+test('size guard: the warn band warns on stderr but still exits 0', function () {
+  // 95% of the cap: inside the 92% warn band, below the hard cap.
+  withSandbox(sourceOfSize(Math.floor(ENGINE_BYTE_CAP * 0.95)), undefined, function (dir) {
+    const result = runSandboxLint(dir)
+    const output = result.stdout + result.stderr
+
+    assert.strictEqual(result.code, 0, 'expected the warn band to stay green; got:\n' + output)
+    assert.ok(result.stderr.includes('WARNING'), 'expected a warning on stderr; got:\n' + output)
+    assert.ok(output.includes('script cap'), 'expected the warning to name the cap; got:\n' + output)
+  })
+})
+
+test('size guard: comfortably under the cap is silent', function () {
+  withSandbox(sourceOfSize(Math.floor(ENGINE_BYTE_CAP * 0.5)), undefined, function (dir) {
+    const result = runSandboxLint(dir)
+    const output = result.stdout + result.stderr
+    assert.strictEqual(result.code, 0, 'expected a small source to pass; got:\n' + output)
+    assert.ok(!output.includes('WARNING'), 'expected no size warning well under the cap; got:\n' + output)
+  })
+})
+
+test('the real engine is under the Workflow tool script cap and can therefore be launched', function () {
+  const bytes = fs.statSync(REAL_ENGINE_PATH).size
+  assert.ok(
+    bytes < ENGINE_BYTE_CAP,
+    'workflows/ticketmill.js is ' + bytes.toLocaleString() + ' bytes, at or over the ' +
+    ENGINE_BYTE_CAP.toLocaleString() + '-byte Workflow script cap — the engine cannot be ' +
+    'launched at this size. Move standing prose to docs/architecture/engine-internals.md.',
+  )
 })
