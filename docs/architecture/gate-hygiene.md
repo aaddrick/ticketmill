@@ -155,6 +155,15 @@ issue, not to attribute that count to a specific gate. Reading it alongside
 a given carried-unresolved tally at the merge gate was a real cap-out with
 findings still open, or an empty-findings exit that never reached the cap.
 
+The quality loop and test loop exits are visible outside `ctx.metrics` too.
+Each one pushes a `VERIFY_SKIPS` entry, the same mechanism a capped
+contrarian challenge or a skipped test loop already uses, so a
+`changes_requested` verdict converted to clean surfaces in the batch PR's
+Verification Gaps section instead of sitting only in a metric and a
+`pushDecision()` note a human has to go looking for. The merge gate's own
+empty-findings exit needs no separate `VERIFY_SKIPS` entry: it already lands
+on `needs_human`, which is visible on its own (see above).
+
 ## Fix stages echo finding ids back through `fixes_applied`
 
 Every fix stage fed by `findingsBlock()` (quality-fix, test-quality-fix,
