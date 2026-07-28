@@ -466,6 +466,17 @@ const FIX_SCHEMA = {
     status: { enum: ['success', 'error'] }, commit: { type: ['string', 'null'] },
     files_changed: { type: 'array', items: { type: 'string' } },
     fixes_applied: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' }, error: { type: ['string', 'null'] },
+    // rebutted (issue #167): a fixer's disagreement with a finding it judged wrong
+    // instead of fixing — mirrors how REVIEW_SCHEMA.issues stays out of
+    // REVIEW_SCHEMA's own required list (:450), so a fixer that never disagrees
+    // (the entire population before this issue) omits the key and produces a
+    // byte-identical response to today. normalizeRebuttals() below is the sole
+    // consumer; `id` is never part of this schema — finding_id must match an id
+    // the engine already assigned via normalizeFindings() and rendered to this
+    // fixer with a bracketed prefix (see FINDING_HYPOTHESIS_ASK).
+    rebutted: { type: 'array', items: { type: 'object', required: ['finding_id', 'evidence'], properties: {
+      finding_id: { type: 'string' }, evidence: { type: 'string' },
+    } } },
     notes_for_downstream: { type: 'array', items: { type: 'string' } },
   },
 }
@@ -1878,6 +1889,36 @@ function settledBlock(ctx) {
   ].join('\n')
 }
 
+// ----- contested-findings ledger (issue #167) -----
+// A finding a fixer rebutted (FIX_SCHEMA.rebutted, normalized by
+// normalizeRebuttals() below) is a DISPUTE, not a resolution — nobody has
+// judged whether the rebuttal's evidence actually disproves the finding.
+// This renders those disputes back to the NEXT reviewer so it can adjudicate
+// them, deliberately NOT reusing settleDecision()/settledBlock(): a settled
+// entry carries a "don't re-open without new evidence" contract because
+// someone already ruled on it; a contested entry carries the OPPOSITE
+// contract, because no one has — this function never calls settleDecision(),
+// only a reviewer (or eventually a human) closes a contested entry. Mirrors
+// settledBlock's shape (defensive read, last-6 window, per-field slice caps,
+// '' when empty) so both render identically at every site that pairs them.
+function contestedBlock(ctx) {
+  const contested = (ctx && ctx.contested) || []
+  if (!contested.length) return ''
+  return [
+    '## Contested findings (rebutted by a fixer, NOT adjudicated — verify, do not assume)',
+    contested.slice(-6).map(function (c) {
+      return '- [' + c.gate + '] [' + c.id + '] ' + String(c.summary || '').slice(0, 400) +
+        '\n  Fixer rebuttal: ' + String(c.evidence || '').slice(0, 300)
+    }).join('\n'),
+    'A contested finding is NOT resolved: verify the rebuttal\'s evidence yourself. If it holds, say so and drop',
+    'the finding. If it does not hold, re-raise it as a finding this iteration — do not let it sit contested',
+    'indefinitely with neither outcome.',
+    'A contested finding is NOT "already addressed" — no code changed for it and no one has ruled on it. The',
+    'iteration-2+ instruction elsewhere in this prompt not to re-flag issues already addressed or accepted does',
+    'NOT apply to anything in this block.',
+  ].join('\n')
+}
+
 // ----- handoff notes (agent -> future-agent context, 3-4 stages downstream) -----
 const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotchas that later agents will need ' +
   '(test/env setup, shifted line numbers after deletes, tooling oddities), also return notes_for_downstream ' +
@@ -1887,6 +1928,33 @@ const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotch
 const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> log -1 --format=%H — it prints the ' +
   'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
   'or recall a SHA from memory.'
+
+// ----- finding-hypothesis framing (issue #167) -----
+// A finding from a reviewer is a HYPOTHESIS to verify, not a command to obey
+// unconditionally — the two contrarian revision stages (approach re-evaluate,
+// plan re-plan) already carry this framing; nothing at the fix stages did,
+// leaving a fixer that disagrees no path but silent compliance or
+// status:'error'. Wired into exactly the three EVALUATOR-FED fix stages
+// (quality-fix, test-quality-fix, pr-fix) — never the two ORACLE-fed ones
+// (test-fix, browser-fix), which already carry a correct anti-rebuttal guard
+// ("fix the real defect — do NOT delete/weaken assertions just to make the
+// failure disappear") that this framing would invert: a failing test or a
+// broken page is ground truth, not a hypothesis. The consequence clause is
+// deliberately GATE-AGNOSTIC (no "ends this gate immediately" / "no further
+// fix round runs" language) so the same string stays true whichever of the
+// three gates renders it, including pr-review, where a rebuttal-only round
+// continues into another review iteration rather than halting on the spot.
+const FINDING_HYPOTHESIS_ASK = [
+  'Each finding above is a HYPOTHESIS the reviewer formed, not a command — verify it against the actual code before acting on it.',
+  'If a finding is wrong, do NOT change code to satisfy it: record it in `rebutted` with the concrete check you ran ' +
+    'that disproves it (a command, a line reference, a test result — not just disagreement).',
+  'List everything you actually fixed in `fixes_applied`; rebut ONLY the findings you did not fix — never rebut a ' +
+    'finding you also changed code for.',
+  'Only a finding rendered above with a bracketed id (e.g. "[code-i1-2]") can be rebutted — anything you see only ' +
+    'as prose must be fixed or addressed in `summary`, not rebutted.',
+  'A round that rebuts every finding and applies no fix never counts as resolving this gate: it is recorded as an ' +
+    'unresolved verification gap for a human to read, and it can never approve this gate on your say-so.',
+].join('\n')
 
 // ----- fixes_applied id-prefix ask (issue #162): shared by every fix stage fed
 // through findingsBlock() (quality-fix, test-quality-fix, pr-fix) so a human
@@ -2034,6 +2102,40 @@ function recordGateOutcome(ctx, gate, findings, disposition) {
   g.disposition[d] = (g.disposition[d] || 0) + 1
 }
 
+// retypeGateDisposition (issue #167): moves exactly ONE count from disposition
+// bucket `from` to bucket `to` within an already-recorded
+// ctx.gate_findings[gate] entry, WITHOUT touching that gate's overall `count`
+// or `severity` mix — both already reflect the findings themselves, which
+// retyping a disposition label does not change. Exists because
+// recordGateOutcome() above books a disposition BEFORE a fix stage runs (e.g.
+// the final quality iteration books 'carried-unresolved' at :2933, then the
+// fix stage's rebuttal is only known after that); this lets a later step
+// correct the label on a bucket that already exists rather than double-count
+// a second recordGateOutcome() call. No-ops (does nothing) when `gate` was
+// never recorded, or when the `from` bucket doesn't exist — there is nothing
+// to move.
+// from === to IS A SUPPORTED, COUNT-PRESERVING NO-OP, not an error case to
+// special-case away: it re-buckets a count into itself (subtract 1, then add
+// 1 back to the same key), netting zero change. This is reachable in
+// practice, not just theoretically — MAX_QUALITY_ITERATIONS is 5 (:46) and
+// the quality gate already books 'carried-unresolved' on iteration 5 before
+// any fix runs (:2933); a rebuttal-only fix on THAT iteration has nothing
+// meaningful to retype the bucket to, so the call site retypes
+// 'carried-unresolved' to itself for symmetry with every other iteration's
+// call, rather than special-casing the last iteration to skip the call.
+function retypeGateDisposition(ctx, gate, from, to) {
+  if (!ctx || !ctx.gate_findings) return
+  const key = String(gate || '').trim()
+  if (!key || !ctx.gate_findings[key]) return
+  const g = ctx.gate_findings[key]
+  const fromKey = String(from || '').trim()
+  const toKey = String(to || '').trim()
+  if (!fromKey || !toKey || !g.disposition[fromKey]) return
+  g.disposition[fromKey]--
+  if (g.disposition[fromKey] <= 0) delete g.disposition[fromKey]
+  g.disposition[toKey] = (g.disposition[toKey] || 0) + 1
+}
+
 // normalizeFindings (issue #162): turns a REVIEW_SCHEMA `issues` array into the
 // engine's structured finding shape, or signals "the reviewer omitted the key
 // entirely" so callers can fall back to today's prose-only path byte-for-byte.
@@ -2063,6 +2165,39 @@ function normalizeFindings(raw, source) {
     }
     return { id: id, severity: 'unspecified', summary: String(entry) }
   })
+}
+
+// normalizeRebuttals (issue #167): turns FIX_SCHEMA's `rebutted` array into a
+// validated list the engine can act on, mirroring normalizeFindings()'s
+// fail-toward-existing-behavior contract just above it. `raw` not being an
+// array (including undefined/null — a fixer that never disagreed, i.e. every
+// fixer before this issue) returns [] rather than null: unlike
+// normalizeFindings, there is no prose-fallback distinction worth preserving
+// here — "nothing to act on" is the only meaningful outcome either way. Every
+// drop (blank finding_id, blank evidence, or a finding_id absent from
+// `findings` — the exact, possibly-null array actually rendered to this
+// fixer) fails toward TODAY's behavior: the entry is silently dropped, never
+// trusted, so a fixer cannot fabricate a rebuttal against a finding id it was
+// never shown (FINDING_HYPOTHESIS_ASK's own "only a bracketed id can be
+// rebutted" clause is enforced here, not just asked for in prose). A
+// surviving entry carries the matched finding's `summary` through so
+// contestedBlock() can render a self-contained line without a second lookup.
+function normalizeRebuttals(raw, findings) {
+  if (!Array.isArray(raw)) return []
+  const byId = {}
+  for (const f of (Array.isArray(findings) ? findings : [])) {
+    if (f && f.id) byId[f.id] = f
+  }
+  const out = []
+  for (const entry of raw) {
+    const findingId = String((entry && entry.finding_id) || '').trim()
+    const evidence = String((entry && entry.evidence) || '').trim()
+    if (!findingId || !evidence) continue
+    const match = byId[findingId]
+    if (!match) continue
+    out.push({ finding_id: findingId, evidence: evidence, summary: match.summary || '' })
+  }
+  return out
 }
 
 // findingsBlock (issue #162): the single renderer feeding every fix stage
@@ -2906,6 +3041,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       '## Decision chain (context from prior stages)',
       decisionChain(ctx),
       settledBlock(ctx),
+      contestedBlock(ctx),
       '',
       'This is a task-level quality check inside the implementation workflow, NOT a full PR review.',
       'Check: code patterns and standards, consistency with codebase conventions, potential bugs, security concerns.',
@@ -4727,7 +4863,7 @@ async function reviewAndMerge(ctx) {
           'Verify PR #' + ctx.pr + ' achieves the goals of issue #' + ctx.issue + ' (spec review iteration ' + iter + ').',
           '',
           '## Decision chain', decisionChain(ctx),
-          settledBlock(ctx), '',
+          settledBlock(ctx), contestedBlock(ctx), '',
           learn('workflow'), // issue #88: spec review sees prior-run workflow/scope learnings
           'Check goal achievement, not code quality. Flag scope creep.',
           'IMPORTANT: before flagging any acceptance criterion as missing, check base branch ' + TARGET + ' — if the',
@@ -4748,7 +4884,7 @@ async function reviewAndMerge(ctx) {
           'Review code quality of PR #' + ctx.pr + ' against base ' + TARGET + ' for issue #' + ctx.issue + ' (code review iteration ' + iter + ').',
           '',
           '## Decision chain', decisionChain(ctx),
-          settledBlock(ctx), '',
+          settledBlock(ctx), contestedBlock(ctx), '',
           // issue #88: the merge-gate reviewer sees prior-run error patterns and
           // quality-loop learnings — the bug classes earlier runs caught late.
           learn('error_patterns'),
@@ -4995,7 +5131,7 @@ async function processIssue(pre) {
     // reasons:[]}) matches computeRevisitRisk's clean no-op shape so a preflight
     // that never carried revisit_risk (e.g. a resume-skip stub) never crashes.
     revisit_risk: (pre.revisit_risk && typeof pre.revisit_risk === 'object') ? pre.revisit_risk : { flagged: false, reasons: [] },
-    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_scopes: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0, findings_empty_exits: 0 },
+    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_scopes: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0, findings_empty_exits: 0, rebuttal_only_rounds: 0 },
     tokens: { total: 0, byModel: {}, byStage: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
     // Retained-changed-files / friction signals (issue #87). null (not []) means
     // "never captured" — probeChangedFiles() sets these once, unconditionally,

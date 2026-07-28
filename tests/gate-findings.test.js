@@ -333,3 +333,274 @@ test('nothingToFix: a changes_requested result with a non-empty findings array i
 
   assert.strictEqual(context.nothingToFix(changesRequestedReal, findings), false)
 })
+
+// ---- FIX_SCHEMA.rebutted (issue #167) ----
+//
+// Mirrors REVIEW_SCHEMA.issues (:450): declared on the schema so a fixer CAN
+// disagree, but not in FIX_SCHEMA's own required list, so a fixer that never
+// disagrees (every fixer before this issue) omits the key and validates
+// exactly as before.
+
+test('FIX_SCHEMA: required is still exactly [status, summary] — rebutted is declared but optional (#167)', function () {
+  const context = harness.boot()
+  const schema = harness.readGlobal(context, 'FIX_SCHEMA')
+
+  assert.deepStrictEqual(Array.from(schema.required), ['status', 'summary'])
+  assert.deepStrictEqual(Array.from(schema.properties.rebutted.items.required), ['finding_id', 'evidence'])
+  assert.strictEqual(schema.properties.rebutted.type, 'array')
+})
+
+// ---- FINDING_HYPOTHESIS_ASK (issue #167) ----
+//
+// Shared verbatim by the three evaluator-fed fix stages (quality-fix,
+// test-quality-fix, pr-fix). The consequence clause is gate-agnostic on
+// purpose: it must read true whichever of the three gates renders it,
+// including pr-review, where a rebuttal-only round continues into another
+// review iteration rather than halting the gate on the spot — so the string
+// must NOT claim an immediate exit or that no further fix round runs.
+
+test('FINDING_HYPOTHESIS_ASK: contains no immediate-exit wording (#167)', function () {
+  const context = harness.boot()
+  const ask = harness.readGlobal(context, 'FINDING_HYPOTHESIS_ASK')
+
+  assert.ok(!/ends this gate immediately/i.test(ask), 'must not claim the gate ends immediately: ' + ask)
+  assert.ok(!/no further fix round runs/i.test(ask), 'must not claim no further fix round runs: ' + ask)
+})
+
+test('FINDING_HYPOTHESIS_ASK: carries the verify-before-acting, rebut-only-what-you-did-not-fix, and bracketed-id clauses', function () {
+  const context = harness.boot()
+  const ask = harness.readGlobal(context, 'FINDING_HYPOTHESIS_ASK')
+
+  assert.ok(/hypothesis/i.test(ask), 'must frame findings as hypotheses: ' + ask)
+  assert.ok(/rebutted/.test(ask), 'must name the `rebutted` field: ' + ask)
+  assert.ok(/fixes_applied/.test(ask), 'must name the `fixes_applied` field: ' + ask)
+  assert.ok(/bracketed id/i.test(ask), 'must restrict rebuttal to bracketed-id findings: ' + ask)
+})
+
+// ---- normalizeRebuttals(raw, findings) (issue #167) ----
+//
+// Turns FIX_SCHEMA's `rebutted` array into a validated list, mirroring
+// normalizeFindings()'s fail-toward-existing-behavior contract: every drop
+// (blank finding_id/evidence, an id absent from the rendered finding set)
+// silently drops the entry rather than trusting it.
+
+test('normalizeRebuttals: a non-array raw (undefined — a fixer that never disagreed) returns []', function () {
+  const context = harness.boot()
+  const findings = context.normalizeFindings([{ severity: 'major', summary: 'a' }], 'code-i1')
+
+  harness.assertVmEqual(context.normalizeRebuttals(undefined, findings), [])
+  harness.assertVmEqual(context.normalizeRebuttals(null, findings), [])
+  harness.assertVmEqual(context.normalizeRebuttals('not an array', findings), [])
+})
+
+test('normalizeRebuttals: drops entries with a blank/missing finding_id', function () {
+  const context = harness.boot()
+  const findings = context.normalizeFindings([{ severity: 'major', summary: 'a' }], 'code-i1')
+
+  const out = context.normalizeRebuttals([
+    { finding_id: '', evidence: 'checked it, still wrong' },
+    { evidence: 'no finding_id key at all' },
+    { finding_id: '   ', evidence: 'whitespace-only id' },
+  ], findings)
+
+  harness.assertVmEqual(out, [])
+})
+
+test('normalizeRebuttals: drops entries with a blank/missing evidence', function () {
+  const context = harness.boot()
+  const findings = context.normalizeFindings([{ severity: 'major', summary: 'a' }], 'code-i1')
+
+  const out = context.normalizeRebuttals([
+    { finding_id: 'code-i1-1', evidence: '' },
+    { finding_id: 'code-i1-1' },
+    { finding_id: 'code-i1-1', evidence: '   ' },
+  ], findings)
+
+  harness.assertVmEqual(out, [])
+})
+
+test('normalizeRebuttals: drops a finding_id absent from the rendered finding set — a fixer cannot rebut an id it was never shown', function () {
+  const context = harness.boot()
+  const findings = context.normalizeFindings([{ severity: 'major', summary: 'a' }], 'code-i1')
+
+  const out = context.normalizeRebuttals([
+    { finding_id: 'code-i1-99', evidence: 'this id was never rendered to me' },
+  ], findings)
+
+  harness.assertVmEqual(out, [])
+})
+
+test('normalizeRebuttals: findings === null (issues omitted, prose-fallback path) drops every rebuttal — nothing was ever rendered with an id', function () {
+  const context = harness.boot()
+
+  const out = context.normalizeRebuttals([
+    { finding_id: 'code-i1-1', evidence: 'some evidence' },
+  ], null)
+
+  harness.assertVmEqual(out, [])
+})
+
+test('normalizeRebuttals: a surviving entry carries the matched finding\'s summary through', function () {
+  const context = harness.boot()
+  const findings = context.normalizeFindings([
+    { severity: 'major', summary: 'the null guard is too loose' },
+    { severity: 'minor', summary: 'nit: naming' },
+  ], 'code-i1')
+
+  const out = context.normalizeRebuttals([
+    { finding_id: 'code-i1-1', evidence: 'ran the reproducer at commit abc123, guard already covers this input' },
+  ], findings)
+
+  harness.assertVmEqual(out, [
+    {
+      finding_id: 'code-i1-1',
+      evidence: 'ran the reproducer at commit abc123, guard already covers this input',
+      summary: 'the null guard is too loose',
+    },
+  ])
+})
+
+test('normalizeRebuttals: arity is NOT preserved (unlike normalizeFindings) — drops are just dropped, never placeholder-preserved', function () {
+  const context = harness.boot()
+  const findings = context.normalizeFindings([{ severity: 'major', summary: 'a' }], 'code-i1')
+
+  const out = context.normalizeRebuttals([
+    { finding_id: 'code-i1-1', evidence: 'valid' },
+    { finding_id: '', evidence: 'blank id, dropped' },
+    { finding_id: 'code-i1-1', evidence: 'a second valid rebuttal of the same finding, also kept' },
+  ], findings)
+
+  assert.strictEqual(out.length, 2)
+})
+
+// ---- contestedBlock(ctx) (issue #167) ----
+//
+// Renders findings a fixer rebutted but nobody has adjudicated yet, back to
+// the NEXT reviewer. Deliberately does NOT call settleDecision() — this is a
+// dispute ledger, not an adjudication ledger.
+
+test('contestedBlock: an empty/absent ctx.contested renders as the empty string', function () {
+  const context = harness.boot()
+
+  assert.strictEqual(context.contestedBlock({ contested: [] }), '')
+  assert.strictEqual(context.contestedBlock({}), '')
+  assert.strictEqual(context.contestedBlock(null), '')
+  assert.strictEqual(context.contestedBlock(undefined), '')
+})
+
+test('contestedBlock: a single entry renders its gate, id, finding summary, and the fixer\'s evidence', function () {
+  const context = harness.boot()
+  const block = context.contestedBlock({
+    contested: [
+      { gate: 'quality', id: 'quality-task-1-i1-2', summary: 'the null guard is too loose', evidence: 'ran the reproducer, guard already covers this input' },
+    ],
+  })
+
+  assert.ok(block.includes('quality'), 'must name the gate: ' + block)
+  assert.ok(block.includes('quality-task-1-i1-2'), 'must name the finding id: ' + block)
+  assert.ok(block.includes('the null guard is too loose'), 'must include the finding summary: ' + block)
+  assert.ok(block.includes('ran the reproducer, guard already covers this input'), 'must include the fixer\'s evidence: ' + block)
+})
+
+test('contestedBlock: the heading names entries as contested and explicitly NOT adjudicated', function () {
+  const context = harness.boot()
+  const block = context.contestedBlock({ contested: [{ gate: 'quality', id: 'x-1', summary: 's', evidence: 'e' }] })
+  const heading = block.split('\n')[0]
+
+  assert.ok(/contested/i.test(heading), 'heading must name entries as contested: ' + heading)
+  assert.ok(/not adjudicated/i.test(heading), 'heading must state these are NOT adjudicated: ' + heading)
+})
+
+test('contestedBlock: closing contract is INVERTED from settledBlock — it tells the reviewer to adjudicate, not to leave settled decisions alone', function () {
+  const context = harness.boot()
+  const block = context.contestedBlock({ contested: [{ gate: 'quality', id: 'x-1', summary: 's', evidence: 'e' }] })
+
+  // settledBlock's contract discourages re-opening without new evidence;
+  // contestedBlock's contract does the opposite — it requires the reviewer to
+  // actually make a call (verify -> drop, or re-raise as a fresh finding).
+  assert.ok(/verify the rebuttal/i.test(block), 'must instruct the reviewer to verify the rebuttal: ' + block)
+  assert.ok(/drop/i.test(block), 'must offer "drop the finding" as one adjudicated outcome: ' + block)
+  assert.ok(/re-raise/i.test(block), 'must offer "re-raise" as the other adjudicated outcome: ' + block)
+  assert.ok(!/re-litigating.*process failure/i.test(block), 'must NOT carry settledBlock\'s discourage-reopening contract: ' + block)
+})
+
+test('contestedBlock: states a contested finding is not "already addressed" and that the iteration-2+ do-not-re-flag instruction does not apply to it', function () {
+  const context = harness.boot()
+  const block = context.contestedBlock({ contested: [{ gate: 'quality', id: 'x-1', summary: 's', evidence: 'e' }] })
+
+  assert.ok(/not.*already addressed/i.test(block), 'must state a contested finding is not "already addressed": ' + block)
+  assert.ok(/does not apply|not apply/i.test(block), 'must state the iteration-2+ do-not-re-flag instruction does not apply here: ' + block)
+})
+
+test('contestedBlock: renders only the last 6 entries', function () {
+  const context = harness.boot()
+  const contested = []
+  for (let i = 1; i <= 9; i++) contested.push({ gate: 'quality', id: 'x-' + i, summary: 'summary ' + i, evidence: 'evidence ' + i })
+
+  const block = context.contestedBlock({ contested: contested })
+
+  for (let i = 1; i <= 3; i++) assert.ok(!new RegExp('\\bx-' + i + '\\b').test(block), 'entry x-' + i + ' should have been dropped by the last-6 window: ' + block)
+  for (let i = 4; i <= 9; i++) assert.ok(new RegExp('\\bx-' + i + '\\b').test(block), 'entry x-' + i + ' should be within the last-6 window: ' + block)
+})
+
+// ---- retypeGateDisposition(ctx, gate, from, to) (issue #167) ----
+//
+// Moves exactly one count from disposition bucket `from` to `to` within an
+// already-recorded ctx.gate_findings[gate] entry, without touching `count`
+// or `severity`.
+
+test('retypeGateDisposition: moves one count from an existing bucket to a new one, leaving count/severity untouched', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({ issue: 10 })
+  context.recordGateOutcome(ctx, 'quality', [{ severity: 'major', summary: 'a' }], 'carried-unresolved')
+
+  context.retypeGateDisposition(ctx, 'quality', 'carried-unresolved', 'rebutted-unresolved')
+
+  const g = ctx.gate_findings.quality
+  assert.strictEqual(g.count, 1)
+  harness.assertVmEqual(g.severity, { critical: 0, major: 1, minor: 0 })
+  harness.assertVmEqual(g.disposition, { 'rebutted-unresolved': 1 })
+})
+
+test('retypeGateDisposition: is a no-op when the `from` bucket does not exist on that gate', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({ issue: 11 })
+  context.recordGateOutcome(ctx, 'quality', [{ severity: 'minor', summary: 'a' }], 'accepted')
+
+  context.retypeGateDisposition(ctx, 'quality', 'carried-unresolved', 'rebutted-unresolved')
+
+  harness.assertVmEqual(ctx.gate_findings.quality.disposition, { accepted: 1 })
+})
+
+test('retypeGateDisposition: is a no-op when the gate itself was never recorded — never throws', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({ issue: 12 })
+
+  assert.doesNotThrow(function () { context.retypeGateDisposition(ctx, 'quality', 'carried-unresolved', 'rebutted-unresolved') })
+  assert.deepStrictEqual(ctx.gate_findings, {})
+})
+
+test('retypeGateDisposition: defensive against a missing/partial ctx — never throws', function () {
+  const context = harness.boot()
+
+  assert.doesNotThrow(function () { context.retypeGateDisposition(null, 'quality', 'a', 'b') })
+  assert.doesNotThrow(function () { context.retypeGateDisposition({}, 'quality', 'a', 'b') })
+})
+
+test('retypeGateDisposition: from === to is a count-preserving no-op — reachable at MAX_QUALITY_ITERATIONS, where iteration 5 already books carried-unresolved before any fix runs', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({ issue: 13 })
+  context.recordGateOutcome(ctx, 'quality', [{ severity: 'major', summary: 'a' }], 'carried-unresolved')
+  context.recordGateOutcome(ctx, 'quality', [{ severity: 'minor', summary: 'b' }], 'carried-unresolved')
+  context.recordGateOutcome(ctx, 'quality', [{ severity: 'critical', summary: 'c' }], 'carried-unresolved')
+
+  const before = JSON.parse(JSON.stringify(ctx.gate_findings.quality))
+
+  context.retypeGateDisposition(ctx, 'quality', 'carried-unresolved', 'carried-unresolved')
+
+  const g = ctx.gate_findings.quality
+  assert.strictEqual(g.count, 3)
+  harness.assertVmEqual(g.severity, { critical: 1, major: 1, minor: 1 })
+  harness.assertVmEqual(g.disposition, { 'carried-unresolved': 3 })
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(g)), before)
+})
