@@ -213,6 +213,28 @@ test('findingsBlock: an empty findings array emits an explicit no-findings line 
   assert.ok(block.includes('this prose must still show up'), 'prose must not be suppressed/demoted by an empty findings array: ' + block)
 })
 
+test('findingsBlock: a non-null findings array with falsy comments falls back to fallbackLabel, not "(none)" (PR #169 code review)', function () {
+  const context = harness.boot()
+  const findings = [
+    { id: 'code-i1-1', severity: 'minor', summary: 'summary', recommendation: 'recommendation' },
+  ]
+
+  // Non-empty findings, empty comments: every call site passes `rev.summary ||
+  // '<label>'` as fallbackLabel, so this is the exact shape a reviewer that
+  // fills `issues` and `summary` but leaves `comments` empty produces.
+  const nonEmptyBlock = context.findingsBlock(findings, '', 'reviewer summary as fallback')
+  assert.ok(nonEmptyBlock.includes('reviewer summary as fallback'), 'must fall back to fallbackLabel, not drop it: ' + nonEmptyBlock)
+  assert.ok(!nonEmptyBlock.includes('(none)'), 'must not show the bare "(none)" placeholder when a fallbackLabel is available: ' + nonEmptyBlock)
+
+  // Empty findings, empty comments: same fallback chain applies.
+  const emptyBlock = context.findingsBlock([], '', 'reviewer summary as fallback')
+  assert.ok(emptyBlock.includes('reviewer summary as fallback'), 'must fall back to fallbackLabel, not drop it: ' + emptyBlock)
+
+  // No comments AND no fallbackLabel: the chain's final link still applies.
+  const noFallbackBlock = context.findingsBlock(findings, '', '')
+  assert.ok(noFallbackBlock.includes('(none)'), 'must fall through to the literal "(none)" placeholder when nothing else is available: ' + noFallbackBlock)
+})
+
 // ---- nothingToFix(r, f) (issue #162) ----
 //
 // Per-reviewer predicate used only by the pr-review merge gate: true when this

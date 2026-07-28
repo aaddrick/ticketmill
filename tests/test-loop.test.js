@@ -143,6 +143,13 @@ test('runTestLoop: a changes_requested test-validate with issues: [] is treated 
   assert.strictEqual(ctx.metrics.findings_empty_exits, 1)
   const stageKeys = scriptedAgent.calls.map(function (c) { return (c.opts && c.opts.label) || '' })
   assert.ok(!stageKeys.some(function (k) { return k.indexOf(':test-quality-fix-') !== -1 }), 'test-quality-fix stage key must be absent from recorded stage keys: ' + JSON.stringify(stageKeys))
+
+  // This exit converts a changes_requested verdict to a clean pass with no fix
+  // stage — it must surface in the batch PR's Verification Gaps, not just the
+  // run-record metrics counter above.
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 1)
+  assert.ok(verifySkips[0].includes('#46: test validation'))
 })
 
 // ---- MIRROR IMAGE (issue #162): `issues` omitted entirely must NOT be treated as empty ----
@@ -180,6 +187,9 @@ test('runTestLoop: MIRROR IMAGE — a changes_requested test-validate that OMITS
   assert.strictEqual(ctx.metrics.findings_empty_exits, 0)
   const stageKeys = scriptedAgent.calls.map(function (c) { return (c.opts && c.opts.label) || '' })
   assert.ok(stageKeys.some(function (k) { return k.indexOf(':test-quality-fix-i1') !== -1 }), 'test-quality-fix stage must run when `issues` is omitted (degrade to the prose path), not be treated as empty: ' + JSON.stringify(stageKeys))
+
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 0)
 })
 
 // ---- regression: the pre-#162 issues: ['x'] fixtures still trigger test-quality-fix,

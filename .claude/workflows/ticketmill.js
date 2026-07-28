@@ -647,8 +647,9 @@ const REVIEW_SCHEMA = {
   },
 }
 // ----- REVIEW_SCHEMA.issues prompt line (issue #162) — shared verbatim by every
-// REVIEW_SCHEMA reviewer prompt (quality review, test validation) so the
-// issues-vs-comments contract reads identically everywhere it's asked. -----
+// REVIEW_SCHEMA reviewer prompt (quality review, test validation, spec review,
+// code review) so the issues-vs-comments contract reads identically everywhere
+// it's asked. -----
 const ISSUES_ASK = 'Every concern you want fixed goes in `issues`, one entry per concern, with severity, summary and a ' +
   'recommendation; a concern appearing only in `comments` will not be fixed. If you return changes_requested, ' +
   '`issues` must be non-empty; if you have nothing that must be fixed, return approved.'
@@ -2140,7 +2141,7 @@ function findingsBlock(findings, comments, fallbackLabel) {
   }
   lines.push('')
   lines.push('## Reviewer comments (context only — the findings above are the work list)')
-  lines.push(String(comments || '(none)'))
+  lines.push(String(comments || fallbackLabel || '(none)'))
   return lines.join('\n')
 }
 
@@ -3078,6 +3079,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       approved = true
       ctx.metrics.findings_empty_exits++
       pushDecision(ctx, 'Gate: no findings to fix', 'Quality review (' + stepLabel + ', iteration ' + iter + ') requested changes but named zero structured findings — treated as clean.')
+      VERIFY_SKIPS.push('#' + ctx.issue + ': quality review (' + stepLabel + ', iteration ' + iter + ') requested changes but named zero structured findings — treated as clean, no fix stage ran')
       break
     }
 
@@ -3609,6 +3611,7 @@ async function runTestLoop(ctx, forced) {
     if (vFindings !== null && vFindings.length === 0) {
       ctx.metrics.findings_empty_exits++
       pushDecision(ctx, 'Gate: no findings to fix', 'Test validation (iteration ' + iter + ') requested changes but named zero structured findings — treated as clean.')
+      VERIFY_SKIPS.push('#' + ctx.issue + ': test validation (iteration ' + iter + ') requested changes but named zero structured findings — treated as clean, no fix stage ran')
       return { ok: true }
     }
 
