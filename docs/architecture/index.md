@@ -12,6 +12,7 @@ plain JavaScript; every unit of actual work is a schema-validated subagent call.
 | [invocation-and-guardrails.md](invocation-and-guardrails.md) | Invocation, the sandbox lint, and the engine-owned path guardrail. |
 | [branching-and-merge.md](branching-and-merge.md) | The batch-branch model, release stage, and merge auto-resolve. |
 | [metrics.md](metrics.md) | Friction and churn, rework tax, gate yield, and outcome grading. |
+| [gate-hygiene.md](gate-hygiene.md) | Typed review findings, engine-assigned ids, the absent-vs-empty distinction, and the three loop predicates. |
 | [failure-semantics.md](failure-semantics.md) | How the run fails, halts, and resumes. |
 | [cost-and-tokens.md](cost-and-tokens.md) | Token tracking, cost estimation, and the token_budget guard. |
 | [scheduling.md](scheduling.md) | Claims interop, the consolidation gate, and lane scheduling. |
