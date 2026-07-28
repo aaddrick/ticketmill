@@ -100,10 +100,14 @@ when the split happened. It has no opinion on new material:
 
 `metrics.md:81-84` ("Completing the gate findings tally", ending
 "`gate_findings['pr-review'].severity` stays zero across the board") is
-moved prose describing the state of the world before issue #162, and issue
-#162 made that sentence false: severity counts are real now. It cannot be
-corrected in place — it sits inside a tracked segment — so it was left
-exactly as it shipped and superseded by `gate-hygiene.md`, which is the
-correction and the durable source of truth. Read `gate-hygiene.md`'s
+moved prose describing the state of the world before issue #162, and it was
+already inaccurate when it shipped: the merge gate already fed real,
+non-zero counts into `gate_findings['pr-review'].severity` whenever a
+reviewer happened to name a concern in `issues` rather than `comments`.
+Issue #162 is what makes the correction worth writing down: severity counts
+are now guaranteed and schema-backed rather than incidental. The sentence
+cannot be corrected in place — it sits inside a tracked segment — so it was
+left exactly as it shipped and superseded by `gate-hygiene.md`, which is
+the correction and the durable source of truth. Read `gate-hygiene.md`'s
 provenance paragraph before trusting anything `metrics.md` says about
 `gate_findings['pr-review'].severity`.

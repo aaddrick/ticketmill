@@ -2054,10 +2054,14 @@ function revisitRiskBlock(ctx) {
 // NOTE (issue #162): REVIEW_SCHEMA.issues is now typed the same shape as
 // CHALLENGE_SCHEMA.findings (severity/summary required, recommendation
 // optional), and all four REVIEW_SCHEMA-producing prompts (spec review, code
-// review, quality review, test validation) ask for it via ISSUES_ASK. So
-// unlike before, `gate_findings['pr-review'].severity` now reports real,
-// non-zero counts drawn from both reviewers' normalized findings — this is
-// no longer permanently {critical:0, major:0, minor:0}. `unspecified` is
+// review, quality review, test validation) ask for it via ISSUES_ASK. Before
+// this change, the same call site already passed `(spec.issues ||
+// []).concat(code.issues || [])` into recordGateOutcome, which counts by
+// entry length regardless of shape — so `gate_findings['pr-review'].severity`
+// already carried real, non-zero counts whenever a reviewer happened to put a
+// concern in `issues` rather than `comments`. Now that all four prompts ask
+// for it explicitly, those counts are guaranteed and schema-backed rather
+// than incidental. `unspecified` is
 // still possible in principle (recordGateOutcome only increments a bucket
 // for the three known severities) but should not occur in practice: the
 // schema requires `severity` to be one of critical/major/minor, and
@@ -2131,7 +2135,13 @@ function normalizeFindings(raw, source) {
 //                          empty array must never suppress or demote prose.
 function findingsBlock(findings, comments, fallbackLabel) {
   if (findings === null) return String(comments || fallbackLabel || '')
-  const lines = ['## Findings to fix']
+  // Headings are `###`, not `##`: every call site nests this block under its own
+  // `##`-level wrapper (pr-fix wraps two calls in `## Spec review` / `## Code
+  // review`; the two internal fix stages call this with no wrapper at all). `##`
+  // here would sit at the same level as those wrappers and make the rendered
+  // prompt structurally flat, with nothing but the id prefix on each finding line
+  // to tell a reader where one reviewer's block ends and the next begins.
+  const lines = ['### Findings to fix']
   if (findings.length > 0) {
     for (const f of findings) {
       lines.push('- [' + f.id + '] [' + f.severity + '] ' + f.summary + ' -> ' + (f.recommendation || ''))
@@ -2140,7 +2150,7 @@ function findingsBlock(findings, comments, fallbackLabel) {
     lines.push('(reviewer named no structured findings)')
   }
   lines.push('')
-  lines.push('## Reviewer comments (context only — the findings above are the work list)')
+  lines.push('### Reviewer comments (context only — the findings above are the work list)')
   lines.push(String(comments || fallbackLabel || '(none)'))
   return lines.join('\n')
 }

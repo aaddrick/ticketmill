@@ -179,14 +179,17 @@ normalized findings, at *any* severity. An issue is flagged as an escaped
 defect when that count is greater than zero while its early gates
 (`approach`, `plan`) recorded no findings of their own (and weren't simply
 dismissed for a dead challenger — see the `earlyOnlyDismissed` guard in
-`computeGateYield`). Before #162, `gate_findings['pr-review'].count` was
-always effectively silent on real findings, because nothing fed structured
-findings into it from the merge gate at all: the field existed, but nothing
-populated it with real signal. Now that the four rewritten prompts ask
-reviewers to put every concern into `issues` rather than leaving it in
-`comments`, that same count field starts reporting real, non-zero values —
-which is the count `computeGateYield` was already reading on one side of
-the `escaped` comparison. The result: the first batch report produced after
+`computeGateYield`). Before #162, the merge gate already passed
+`(spec.issues || []).concat(code.issues || [])` into `recordGateOutcome`,
+and `recordGateOutcome` counts array length regardless of entry shape — so
+`gate_findings['pr-review'].count` was already populated with real signal,
+but only incidentally: it depended on a reviewer choosing to put a concern
+in the untyped `issues` array rather than in free-text `comments`, with
+nothing asking for one over the other. Now that the four rewritten prompts
+ask reviewers to put every concern into `issues` rather than leaving it in
+`comments`, that same count field is guaranteed and schema-backed rather
+than incidental — which is the count `computeGateYield` was already reading
+on one side of the `escaped` comparison. The result: the first batch report produced after
 this change can show escaped defects on issues where an earlier run,
 against the same reviewer behavior, would have shown none. That is a
 baseline shift in what the metric can see, not a regression in what the
