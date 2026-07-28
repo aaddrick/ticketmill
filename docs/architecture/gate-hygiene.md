@@ -689,8 +689,9 @@ catch the difference. Gate state instead pins the same deterministic
 (`gh issue view <n> --repo <r> --json comments --jq '{total, blocks}'`,
 computed by `gateStateProbeCommandLine()`, where both `total` and `blocks`
 run through the identical `select(.body | startswith("## Gate State"))`
-filter): jq, not the agent, computes the exact return shape. The agent's only job is relaying that command's stdout
-verbatim as `raw` — it never parses or judges it. `parseGateStateProbeRow`
+filter): jq, not the agent, computes the exact return shape. The agent's
+only job is relaying that command's stdout verbatim as `raw` — it never
+parses or judges it. `parseGateStateProbeRow`
 is what actually decides whether a read succeeded, and it is built so a
 truncated or non-JSON `raw` string can never validate: any shape mismatch —
 missing/wrong-typed `total`, `blocks` not an array, a block missing a

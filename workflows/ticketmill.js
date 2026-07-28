@@ -4683,7 +4683,17 @@ async function fetchGateStateBlocks(issueNumbers, priorWorkByIssue) {
     const rowsArg = Object.assign({ exit_ok: row.exit_ok }, parsed)
     const pw = pwByIssue[n] || {}
     const sel = selectGateState(rowsArg, { repo: REPO, issue: n, self_login: selfLogin, claim_authors: [], batch: TARGET, run_epoch: RUN_EPOCH }, pw)
-    if (sel.state === 'read-failed' && parsed.blocks.length === 0 && parsed.total === 0 && hasGateStatePriorWork(pw)) {
+    // readOk mirrors attachGateStateBlocks' definition (:1467) exactly -- the same
+    // "did the read actually succeed" test, so this log and the stored preflight
+    // fields never disagree about it. Without this gate, EVERY hard read failure
+    // (dead chunk, non-zero gh exit, truncated stdout) also has blocks.length===0
+    // and total===0, so it printed the same "absent (unexpected: ...)" line as a
+    // genuine falsifiable-absent read -- on a resume, where hasGateStatePriorWork
+    // is true for exactly the issues this substrate serves, that made read
+    // failures indistinguishable from suspicious absences (issue #166 PR #177
+    // review, iteration 2).
+    const readOk = row.exit_ok === true && parsed.ok === true
+    if (sel.state === 'read-failed' && readOk && parsed.blocks.length === 0 && parsed.total === 0 && hasGateStatePriorWork(pw)) {
       const why = pw.pr_number != null ? ('PR #' + pw.pr_number + ' open')
         : pw.worktree_exists ? 'worktree exists'
         : ('resume_point=' + pw.resume_point)
@@ -8624,7 +8634,8 @@ if (HELD_CLAIMS.length) {
 
 // ---- Gate-state self-validation sweep (issue #166, task 4) — proves
 // post -> GitHub -> read -> parse round-tripped for every issue this run
-// wrote a gate-state comment for. Advisory only (log lines, never a result
+// wrote a gate-state comment for. Advisory only (log lines, plus a
+// VERIFY_SKIPS entry on mismatch/read-failed — see :5122 — never a result
 // mutation) and non-fatal end to end: wrapped so a bug in the sweep itself
 // can never take the rest of Report down with it. Runs BEFORE the
 // token/friction/rework rollups below on purpose — those are pure

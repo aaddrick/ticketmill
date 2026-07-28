@@ -151,6 +151,36 @@ test('fetchGateStateBlocks: a fully dead probe (every chunk agent call dies) mar
   }
 })
 
+test('fetchGateStateBlocks: a fully dead probe WITH prior-work evidence logs plain read-failed, never the suspicious-absent wording (issue #166 PR #177 review, iteration 2)', async function () {
+  const context = harness.boot()
+  seed(context)
+  const logs = []
+  context.log = function (msg) { logs.push(String(msg)) }
+  harness.installScriptedAgent(context, function () { return null }) // every chunk call dies
+
+  await context.fetchGateStateBlocks([2], { 2: { pr_number: 99, worktree_exists: false, resume_point: 'review' } })
+  const line = logs.find(function (l) { return l.indexOf('#2') !== -1 })
+  assert.ok(line, 'expected a log line for issue #2: ' + JSON.stringify(logs))
+  assert.ok(line.indexOf('read-failed') !== -1, 'a dead chunk with prior-work evidence must still log read-failed: ' + line)
+  assert.ok(line.indexOf('absent') === -1, 'a dead chunk must never be logged as absent, even with prior-work evidence: ' + line)
+})
+
+test('fetchGateStateBlocks: a non-zero gh exit for one issue WITH prior-work evidence logs plain read-failed, never the suspicious-absent wording (issue #166 PR #177 review, iteration 2)', async function () {
+  const context = harness.boot()
+  seed(context)
+  const logs = []
+  context.log = function (msg) { logs.push(String(msg)) }
+  harness.installScriptedAgent(context, function () {
+    return { self_login: 'bot', rows: [{ issue: 2, raw: '', exit_ok: false }] } // gh exited non-zero for this issue
+  })
+
+  await context.fetchGateStateBlocks([2], { 2: { pr_number: 99, worktree_exists: false, resume_point: 'review' } })
+  const line = logs.find(function (l) { return l.indexOf('#2') !== -1 })
+  assert.ok(line, 'expected a log line for issue #2: ' + JSON.stringify(logs))
+  assert.ok(line.indexOf('read-failed') !== -1, 'a non-zero gh exit with prior-work evidence must still log read-failed: ' + line)
+  assert.ok(line.indexOf('absent') === -1, 'a non-zero gh exit must never be logged as absent, even with prior-work evidence: ' + line)
+})
+
 test('fetchGateStateBlocks: one dead chunk of three leaves the other two chunks\' issues intact', async function () {
   const context = harness.boot()
   seed(context)
@@ -190,6 +220,22 @@ test('fetchGateStateBlocks: a live chunk that returns rows for some but not all 
   assert.ok(line.indexOf('read-failed') !== -1 && line.indexOf('absent') === -1, 'issue #2 must log read-failed, never absent: ' + line)
 })
 
+test('fetchGateStateBlocks: a live chunk that omits an issue\'s row WITH prior-work evidence still logs plain read-failed, never the suspicious-absent wording (issue #166 PR #177 review, iteration 2)', async function () {
+  const context = harness.boot()
+  seed(context)
+  const logs = []
+  context.log = function (msg) { logs.push(String(msg)) }
+  harness.installScriptedAgent(context, function () {
+    return { self_login: 'bot', rows: [{ issue: 1, raw: jqRow(0, []), exit_ok: true }] } // omits issue 2's row
+  })
+
+  await context.fetchGateStateBlocks([1, 2], { 2: { pr_number: 99, worktree_exists: false, resume_point: 'review' } })
+  const line = logs.find(function (l) { return l.indexOf('#2') !== -1 })
+  assert.ok(line, 'expected a log line for issue #2: ' + JSON.stringify(logs))
+  assert.ok(line.indexOf('read-failed') !== -1, 'an omitted row with prior-work evidence must still log read-failed: ' + line)
+  assert.ok(line.indexOf('absent') === -1, 'an omitted row must never be logged as absent, even with prior-work evidence: ' + line)
+})
+
 test('fetchGateStateBlocks: truncated jq stdout (agent succeeded, jq output is garbage) logs read-failed, never absent', async function () {
   const context = harness.boot()
   seed(context)
@@ -204,6 +250,22 @@ test('fetchGateStateBlocks: truncated jq stdout (agent succeeded, jq output is g
   assert.ok(line, 'expected a log line naming issue #42: ' + JSON.stringify(logs))
   assert.ok(line.indexOf('read-failed') !== -1, 'expected "read-failed", got: ' + line)
   assert.ok(line.indexOf('absent') === -1, 'must never log a truncated read as absent: ' + line)
+})
+
+test('fetchGateStateBlocks: truncated jq stdout WITH prior-work evidence logs plain read-failed, never the suspicious-absent wording (issue #166 PR #177 review, iteration 2)', async function () {
+  const context = harness.boot()
+  seed(context)
+  const logs = []
+  context.log = function (msg) { logs.push(String(msg)) }
+  harness.installScriptedAgent(context, function () {
+    return { self_login: 'bot', rows: [{ issue: 42, raw: '{"total": 2, "blocks": [{"bo', exit_ok: true }] }
+  })
+
+  await context.fetchGateStateBlocks([42], { 42: { pr_number: 99, worktree_exists: false, resume_point: 'review' } })
+  const line = logs.find(function (l) { return l.indexOf('#42') !== -1 })
+  assert.ok(line, 'expected a log line for issue #42: ' + JSON.stringify(logs))
+  assert.ok(line.indexOf('read-failed') !== -1, 'truncated stdout with prior-work evidence must still log read-failed: ' + line)
+  assert.ok(line.indexOf('absent') === -1, 'truncated stdout must never be logged as absent, even with prior-work evidence: ' + line)
 })
 
 test('fetchGateStateBlocks: a genuinely empty issue (valid read, zero blocks, zero total, no prior-work evidence) logs absent', async function () {
