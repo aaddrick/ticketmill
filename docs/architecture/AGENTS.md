@@ -121,11 +121,14 @@ now records outcomes through `recordGateOutcome` too, so a fourth gate
 routinely shows up in the same rollup. This sentence cannot be corrected in
 place either, and not merely because it sits inside a tracked segment the
 way `metrics.md:81-84` does — `metrics.md`'s only tracked segment is not
-scoped to a passage within the file, it is the file: `tests/fixtures/architecture-split.json`
-records one segment for `metrics.md`, 329 lines starting at its first
-heading, running to the end. `tests/architecture-provenance.test.js` hashes
-that segment verbatim, so it hashes the entire file, and there is no
-partial-credit edit even smaller than the one described above. `metrics.md:114`
+scoped to a passage within the file, it spans nearly the whole file:
+`tests/fixtures/architecture-split.json` records one segment for
+`metrics.md`, 329 lines starting at its first heading and running to the
+end of the 332-line file — everything but the four-line synthetic H1 and
+lede above that heading. `tests/architecture-provenance.test.js` hashes
+that segment verbatim, so it hashes the file from its first heading to the
+end, and there is no partial-credit edit even smaller than the one
+described above. `metrics.md:114`
 stays exactly as it reads, superseded by `gate-hygiene.md`'s "The quality
 gate" section, the same way `metrics.md:81-84` is superseded by the section
 above it.

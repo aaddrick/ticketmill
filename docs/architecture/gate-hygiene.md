@@ -242,10 +242,14 @@ and before (or instead of) the fix stage that verdict triggers:
   carried-unresolved only on the last iteration the loop is allowed to
   spend, re-litigated on every iteration before it.
 
-Both agent-death branches `break` immediately, the same way the loop's two
-clean exits leave no further work: an issue can leave one call to this loop
-having recorded at most one disposition per iteration it actually entered,
-never more.
+The five-branch disposition map above stays five branches even though a
+third death — the fix agent, not the simplify or review agent — can also
+end an iteration: that death happens in the fix stage, *after* the
+iteration's disposition is already recorded by one of the branches above,
+so it never needs a disposition branch of its own. All three deaths `break`
+immediately, the same way the loop's two clean exits leave no further work:
+an issue can leave one call to this loop having recorded at most one
+disposition per iteration it actually entered, never more.
 
 ### The invariant: sum(disposition) === quality_iters
 
@@ -314,8 +318,10 @@ Two things anchor this specifically to the quality gate:
 ### What quality_degrades counts, and what it doesn't
 
 `ctx.metrics.quality_degrades` increments once per call to `runQualityLoop`
-where `degraded` is `true` on exit — only the two agent-death branches
-above (simplify dies, review dies). It does **not** increment on cap
+where `degraded` is `true` on exit — the two agent-death branches in the
+disposition map above (simplify dies, review dies), plus a third that
+sits outside that map: the fix agent dying in the fix stage, after that
+iteration's disposition is already recorded. It does **not** increment on cap
 exhaustion: a loop that spends all `MAX_QUALITY_ITERATIONS` iterations
 re-litigating and never reaches a clean review sets neither `approved` nor
 `degraded`, and falls through the loop tail the same as a converged loop,
@@ -370,8 +376,9 @@ across the board" — describes the state of the world *before* this issue.
 It is now inaccurate: severity counts are real as of the change this page
 documents. That passage is not corrected in place. It sits inside
 `metrics.md`'s single tracked provenance segment (`tests/fixtures/architecture-split.json`
-records that segment as starting at line 5 and running 329 lines — the
-entire file), which `tests/architecture-provenance.test.js` hashes
+records that segment as starting at line 5 and running 329 lines, to the
+end of the 332-line file — everything but the four-line synthetic H1 and
+lede above it), which `tests/architecture-provenance.test.js` hashes
 verbatim against a digest recorded when `docs/ARCHITECTURE.md` was split
 into this directory. Editing any character inside a tracked segment turns
 that test red; there is no partial-credit edit. This page is the correction
@@ -389,8 +396,10 @@ above, it cannot be corrected in place — and for the same structural
 reason, more bluntly here: `metrics.md`'s only tracked segment isn't scoped
 to this sentence, or to any sentence. `tests/fixtures/architecture-split.json`
 records exactly one segment for the whole file, 329 lines starting at its
-first heading, which is the entire body. `tests/architecture-provenance.test.js`
-hashes that one segment verbatim, so it hashes the entire file. Editing any
-character of `metrics.md`, including the word "three" in this sentence,
-turns that test red. `metrics.md:114` stays exactly as it reads, superseded
-by this page the same way `metrics.md:81-84` already is.
+first heading and running to the end — everything but the file's four-line
+synthetic H1 and lede. `tests/architecture-provenance.test.js` hashes that
+one segment verbatim, so it hashes the file from its first heading to the
+end, which includes line 114. Editing any character inside that segment,
+including the word "three" in this sentence, turns that test red.
+`metrics.md:114` stays exactly as it reads, superseded by this page the
+same way `metrics.md:81-84` already is.

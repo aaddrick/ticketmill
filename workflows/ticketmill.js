@@ -5637,7 +5637,7 @@ function computeGateYield(results) {
   }
   if (escapedDefects.length) {
     lines.push('')
-    lines.push('Escaped defects (findings at "' + ESCAPE_GATE + '" that every earlier gate missed):')
+    lines.push('Escaped defects (findings at "' + ESCAPE_GATE + '" that neither "' + EARLY_GATES.join('" nor "') + '" raised):')
     lines.push('')
     lines.push('| Issue | Findings at ' + ESCAPE_GATE + ' |')
     lines.push('| --- | --- |')
