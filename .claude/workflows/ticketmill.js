@@ -3322,7 +3322,7 @@ async function fail(ctx, status, stageKey, error) {
   await postNote(ctx, stageKey, status, error)
   BATCH.failures++
   if (BATCH.failures >= MAX_BATCH_FAILURES) tripStop('circuit breaker: ' + BATCH.failures + ' issues failed')
-  return Object.assign({ issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx), changed_files: (ctx && ctx.changed_files) || null, added_files: (ctx && ctx.added_files) || null, touch_counts: (ctx && ctx.touch_counts) || {}, gate_findings: (ctx && ctx.gate_findings) || {}, settled: (((ctx && ctx.settled) || []).slice()) }, frictionFields(ctx, status))
+  return Object.assign({ issue: ctx.issue, title: ctx.title, status: status, stage: stageKey, pr: ctx.pr || null, error: String(error || ''), follow_ups: [], metrics: ctx.metrics || null, tokens: ctx.tokens || null, timeline: timeline(ctx), handoff_notes: (ctx.notes || []).slice(), members: memberIssues(ctx), changed_files: (ctx && ctx.changed_files) || null, added_files: (ctx && ctx.added_files) || null, touch_counts: (ctx && ctx.touch_counts) || {}, gate_findings: (ctx && ctx.gate_findings) || {}, settled: (((ctx && ctx.settled) || []).slice()), gate_state_intent: (ctx && ctx.gate_state_intent) || null, gate_state_post_failed: (ctx && ctx.gate_state_post_failed) || null }, frictionFields(ctx, status))
 }
 
 // =============================================================================
@@ -4694,6 +4694,81 @@ async function postConsolidationMarkers(units) {
   }
 }
 
+// postGateState (issue #166): non-fatal per-issue write of the durable
+// "## Gate State" comment (buildGateStateComment/buildGateStatePayload, above
+// the TICKETMILL-TEST-HARNESS-SPLIT marker) at a run boundary. Modeled
+// directly on the cap-note-plan/cap-note-approach stages just above
+// (stageOpts('probe'), NOTE_SCHEMA, exactly 1 try, log-only on a dead agent
+// or posted!==true) -- like those, NO path through this helper may fail an
+// issue; every failure mode degrades to a logged/deferred note and the caller
+// keeps going.
+//
+// Posting idiom deliberately breaks from postConsolidationMarkers just above
+// (`gh issue comment ... --body "..."`, :4645/:4660): that idiom is safe only
+// because a consolidation marker's body is flat, oneLine()-rendered
+// key:value text with nothing in it that a shell would treat specially. A
+// gate-state body embeds free text straight out of ctx.settled (rationale/
+// resolution strings a human or an earlier agent wrote), which CAN contain
+// apostrophes, backticks, or `$` -- any of which a `--body "$(...)"` or an
+// UNQUOTED heredoc would hand to the shell for interpolation, silently
+// corrupting the posted payload (or worse). Instead this pins `gh issue
+// comment <n> --repo <r> --body-file -` fed by stdin from a QUOTED heredoc
+// (`<<'...'`), which disables ALL shell expansion inside it -- the payload
+// reaches `gh` as literal bytes no matter what punctuation the free text
+// carries.
+//
+// ctx.gate_state_intent is set to the intended payload ONLY when the agent
+// actually reports posted===true. Every other outcome (dead agent after its
+// one try, an explicit posted:false, or a schema mismatch) instead sets
+// ctx.gate_state_post_failed = boundary (last failure wins across an issue's
+// several boundaries) and pushes a ctx.deferred note, so the miss is visible
+// without ever touching gate_state_intent. This asymmetry is deliberate:
+// setting intent unconditionally would let Task 4's Report-phase verify
+// sweep compare an intent against a block that was never actually written
+// and report 'mismatch' (real corruption) for what is, here, a routine,
+// designed-for non-fatal skip.
+async function postGateState(ctx, boundary) {
+  const payload = buildGateStatePayload({
+    repo: REPO,
+    issue: ctx.issue,
+    run: RUN_TAG,
+    batch: TARGET,
+    epoch: RUN_EPOCH,
+    boundary: boundary,
+    group_id: ctx.groupId,
+    members: memberIssues(ctx),
+    gate_budgets: {
+      approach: (ctx.metrics && ctx.metrics.approach_iters) || 0,
+      plan: (ctx.metrics && ctx.metrics.plan_iters) || 0,
+      'pr-review': (ctx.metrics && ctx.metrics.pr_review_iters) || 0,
+    },
+    settled: ctx.settled,
+  })
+  const body = buildGateStateComment(REPO, ctx.issue, payload)
+  const posted = await stage(ctx, 'gate-state-' + boundary, [
+    'Post the durable gate-state record on issue #' + ctx.issue + ' of ' + REPO + ' EXACTLY as given below, verbatim',
+    'and unchanged -- do not reformat, reword, summarize, or add anything to it. Run exactly this command, with the',
+    'body fed on stdin via a QUOTED heredoc (the quotes around the delimiter are load-bearing: they disable ALL',
+    'shell interpolation inside the heredoc, which matters because the body below may contain apostrophes,',
+    'backticks, or $ characters that must reach gh as literal bytes, not be expanded by the shell):',
+    '',
+    'gh issue comment ' + ctx.issue + ' --repo ' + REPO + ' --body-file - <<\'TICKETMILL_GATE_STATE_EOF\'',
+    body,
+    'TICKETMILL_GATE_STATE_EOF',
+    '',
+    'Do NOT substitute an unquoted heredoc (<<EOF) or a --body "$(...)" form -- both would let the shell interpolate',
+    'characters inside the body. Return posted=true/false.',
+  ].join('\n'), stageOpts('probe'), NOTE_SCHEMA, 1)
+  if (posted && posted.posted === true) {
+    ctx.gate_state_intent = payload
+  } else {
+    ctx.gate_state_post_failed = boundary
+    ctx.deferred.push('Gate-state comment did not post at boundary "' + boundary + '" for issue #' + ctx.issue + ' -- resume continuity for this boundary is degraded (logged, non-fatal, no consumer yet).')
+    log('#' + ctx.issue + ' gate-state post (' + boundary + ') did not post -- resume continuity degraded for this boundary only (non-fatal, logged)')
+  }
+  return posted
+}
+
 // =============================================================================
 // IMPLEMENT (setup -> research -> evaluate<->contrarian -> plan<->contrarian ->
 // tasks with review/quality loops -> test loop -> browser -> docblocks -> PR)
@@ -4912,6 +4987,13 @@ async function implementIssue(ctx) {
     pushDecision(ctx, 'Revised Evaluation (i' + iter + ')', '**Approach:** ' + (re.approach || '') + '\n' + (re.summary || ''))
   }
 
+  // Gate-state boundary 'approach' (issue #166): covers every one of the loop's
+  // four exits above (dead contrarian, sound_with_caveats, cap-out, dead
+  // re-evaluate) -- all four are `break`s out of the same loop, so one post
+  // placed right here, before anything that can fail the issue, durably
+  // records the approach gate's outcome regardless of which exit was taken.
+  await postGateState(ctx, 'approach')
+
   // ---- PLAN + CONTRARIAN CHALLENGE (plan) ----
   const agentMenu = IMPLEMENTERS.length
     ? IMPLEMENTERS.map(function (n) {
@@ -5051,6 +5133,13 @@ async function implementIssue(ctx) {
     if (revised.length) tasks = revised
     pushDecision(ctx, 'Revised Plan (i' + iter + ')', (rp.summary || '') + '\n**Tasks:**\n' + tasks.map(function (t) { return '- ' + t.id + ' [' + (t.agent || 'implementer') + '] ' + t.description }).join('\n'))
   }
+
+  // Gate-state boundary 'plan' (issue #166): covers every one of the loop's
+  // four exits above (dead contrarian, sound_with_caveats, cap-out, dead
+  // re-plan) the same way the 'approach' boundary covers its own loop -- all
+  // four are `break`s, so one post here, before the IMPLEMENT section below,
+  // durably records the plan gate's outcome regardless of which exit fired.
+  await postGateState(ctx, 'plan')
 
   // ---- IMPLEMENT (sequential per-task: implement -> review -> fix loop -> quality loop) ----
   let tasksCompleted = 0
@@ -5296,7 +5385,18 @@ async function reviewAndMerge(ctx) {
     ])
     const spec = reviews[0]
     const code = reviews[1]
-    if (!spec || !code) return fail(ctx, 'needs_human', 'pr-review', 'a PR reviewer died — PR #' + ctx.pr + ' left open for human review')
+    if (!spec || !code) {
+      // Gate-state boundary 'pr-review-iN-aborted' (issue #166): the ONLY exit
+      // from this loop that a resumed run can reach WITHOUT ever passing
+      // through the recordGateOutcome() call below, because the process_pr
+      // resume path (processIssue -> reviewAndMerge directly) never runs the
+      // approach/plan gates or their own boundary posts. Without a post here,
+      // a resume whose reviewers die on iteration 1 would record nothing at
+      // all for this issue. ctx.metrics.pr_review_iters is already `iter`
+      // (set above, before the reviews ran), so no extra plumbing is needed.
+      await postGateState(ctx, 'pr-review-i' + iter + '-aborted')
+      return fail(ctx, 'needs_human', 'pr-review', 'a PR reviewer died — PR #' + ctx.pr + ' left open for human review')
+    }
 
     // gate_findings tally (issue #91, retyped by issue #162): one call per
     // PR-review iteration, using the same disposition vocabulary as the
@@ -5325,6 +5425,14 @@ async function reviewAndMerge(ctx) {
     const capReached = iter === MAX_PR_REVIEW_ITERATIONS
     const prReviewDisposition = prReviewClean ? 'accepted' : ((bothNothingToFix || capReached) ? 'carried-unresolved' : 're-litigated')
     recordGateOutcome(ctx, 'pr-review', (specFindings || []).concat(codeFindings || []), prReviewDisposition)
+
+    // Gate-state boundary 'pr-review-iN' (issue #166): kept INSIDE the loop,
+    // right after the gate_findings tally above, because reviewAndMerge
+    // returns from inside this loop at both breaks below (nothing-to-fix and
+    // cap-reached) as well as at the clean-approval break just below this
+    // line -- a post placed after the loop would never run for either of
+    // those in-loop returns.
+    await postGateState(ctx, 'pr-review-i' + iter)
 
     if (prReviewClean) { approved = true; break }
 
@@ -5489,7 +5597,7 @@ async function reviewAndMerge(ctx) {
   if (mar.resolved) ctx.metrics.merge_auto_resolved = (ctx.metrics.merge_auto_resolved || 0) + 1
 
   log('#' + ctx.issue + ' merged PR #' + ctx.pr + (merge.follow_up_issues && merge.follow_up_issues.length ? ' (follow-ups: ' + merge.follow_up_issues.join(', ') + ')' : ''))
-  return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx), changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings, settled: (ctx.settled || []).slice() }, frictionFields(ctx, 'completed'))
+  return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'completed', pr: ctx.pr, follow_ups: merge.follow_up_issues || [], stage: 'merge', error: null, metrics: ctx.metrics, tokens: ctx.tokens, timeline: timeline(ctx), handoff_notes: ctx.notes.slice(), members: memberIssues(ctx), changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings, settled: (ctx.settled || []).slice(), gate_state_intent: ctx.gate_state_intent || null, gate_state_post_failed: ctx.gate_state_post_failed || null }, frictionFields(ctx, 'completed'))
 }
 
 // =============================================================================
@@ -5547,7 +5655,12 @@ async function processIssue(pre) {
     // must NOT count as "shipped into TARGET" — see batchClosesIssues() below,
     // which is the sole reader of this field.
     const merged_into_target = pre.pr_state === 'merged' && pre.pr_base === TARGET
-    return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target, changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings, settled: (ctx.settled || []).slice() }, frictionFields(ctx, 'skipped'))
+    // gate_state_intent/gate_state_post_failed: shape totality only -- no
+    // gate-state boundary can fire on this skip path (it never runs
+    // implementIssue/reviewAndMerge), so these are always null here and the
+    // Report-phase verify sweep (Task 4) reads that as 'no-intent', never as
+    // a mismatch.
+    return Object.assign({ issue: ctx.issue, title: ctx.title, status: 'skipped', pr: ctx.pr, follow_ups: [], stage: 'preflight', error: null, reason: pre.reason, members: memberIssues(ctx), merged_into_target: merged_into_target, changed_files: ctx.changed_files, added_files: ctx.added_files, touch_counts: ctx.touch_counts, gate_findings: ctx.gate_findings, settled: (ctx.settled || []).slice(), gate_state_intent: null, gate_state_post_failed: null }, frictionFields(ctx, 'skipped'))
   }
   if (pre.resume_point === 'process_pr') {
     log('#' + ctx.issue + ' healing: open PR #' + ctx.pr + ' found — jumping to review/merge')
