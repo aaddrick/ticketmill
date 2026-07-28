@@ -3153,7 +3153,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
   if (degraded) ctx.metrics.quality_degrades++
 
   // Cap exhaustion (issue #163): the loop ran out of iterations without a
-  // clean review AND without an agent dying (both degrade branches above
+  // clean review AND without an agent dying (three degrade branches above
   // break out before reaching here). Rolled up to exactly ONE VERIFY_SKIPS
   // line per issue — runQualityLoop is called once per task plus once per
   // PR-fix round, and without this roll-up a chatty task would print one
