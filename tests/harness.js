@@ -78,7 +78,7 @@ const SPLIT_MARKER = 'TICKETMILL-TEST-HARNESS-SPLIT'
 const SELECT_ANCHOR = "phase('Select')"
 
 // A ctx.metrics shape matching processIssue()'s initial object exactly (workflows/
-// ticketmill.js:5127) — kept in sync by hand since the harness can't import it.
+// ticketmill.js:5130) — kept in sync by hand since the harness can't import it.
 function freshMetrics() {
   return {
     approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0,

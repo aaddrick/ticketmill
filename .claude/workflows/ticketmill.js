@@ -2635,8 +2635,8 @@ function computeFriction(results) {
     for (const k of stageKeys) {
       const baseCap = caps[k] > 0 ? caps[k] : 1 // guard a misconfigured 0/negative cap from dividing by zero
       const tracked = Object.prototype.hasOwnProperty.call(multiScopeField, k)
-      // scopes stays null (not 1) for the six single-scope stages: a number
-      // here is a claim "this many invocations were pooled", and only
+      // scopes stays null (not 1) for the six stages with no scope counter: a
+      // number here is a claim "this many invocations were pooled", and only
       // quality currently has a counter backing that claim. A metrics blob
       // with no quality_scopes field (pre-this-change data) falls back to
       // Math.max(1, 0) === 1, so cap === baseCap and the ratio scores exactly

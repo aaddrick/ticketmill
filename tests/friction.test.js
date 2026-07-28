@@ -315,7 +315,7 @@ test('computeFriction: a deliberately saturating fixture (quality_iters 12, qual
   assert.strictEqual(d.contribution, 1) // Math.min(1, ...) clamps it
 })
 
-test('computeFriction: scopes stays null (not a number) for single-scope stages — asserted on a task-review driver and a browser driver', function () {
+test('computeFriction: scopes stays null (not a number) for stages with no scope counter — asserted on a task-review driver and a browser driver', function () {
   const context = harness.boot()
   const results = [
     { issue: 38, metrics: { task_review_attempts: 2, browser_iters: 1 }, needs_human: false, contrarian_capped: false, unresolved_count: 0, test_quality_fix_rounds: 0 },
