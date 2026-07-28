@@ -85,6 +85,7 @@ function freshMetrics() {
     task_review_attempts: 0, quality_iters: 0, quality_degrades: 0,
     test_iters: 0, browser_iters: 0, pr_review_iters: 0,
     merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0,
+    findings_empty_exits: 0,
   }
 }
 
