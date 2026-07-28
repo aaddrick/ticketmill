@@ -68,7 +68,7 @@ to ship.
 | `invocation-and-guardrails.md` | Invocation, the sandbox lint, and the engine-owned path guardrail. |
 | `branching-and-merge.md` | The batch-branch model, release stage, and merge auto-resolve. |
 | `metrics.md` | Friction and churn, rework tax, gate yield, and outcome grading. |
-| `gate-hygiene.md` | Typed review findings, engine-assigned ids, and the three loop predicates. Authored text, added after the split; not tracked in the provenance fixture, the same as the `AGENTS.md`/`CLAUDE.md` row below. |
+| `gate-hygiene.md` | Typed review findings, engine-assigned ids, the three loop predicates, and gate-outcome tallying (the quality gate's disposition map, its cap, and its supersession of `metrics.md:114`). Authored text, added after the split; not tracked in the provenance fixture, the same as the `AGENTS.md`/`CLAUDE.md` row below. |
 | `failure-semantics.md` | How the run fails, halts, and resumes (two segments, emitted out of source order: the short bullet list first, the incident-derived-machinery table second). |
 | `cost-and-tokens.md` | Token tracking, cost estimation, and the token_budget guard. |
 | `scheduling.md` | Claims interop, the consolidation gate, and lane scheduling. |
@@ -111,3 +111,25 @@ left exactly as it shipped and superseded by `gate-hygiene.md`, which is
 the correction and the durable source of truth. Read `gate-hygiene.md`'s
 provenance paragraph before trusting anything `metrics.md` says about
 `gate_findings['pr-review'].severity`.
+
+A second, unrelated sentence in the same file goes stale the same way, for
+the same structural reason: `metrics.md:114`, the `computeGateYield(results)`
+lede — "rolls the three gates' `gate_findings` tallies" — describes a world
+where `approach`, `plan`, and `pr-review` were the only gates that ever
+appeared in `gate_findings`. Issue #163 makes that untrue: the quality loop
+now records outcomes through `recordGateOutcome` too, so a fourth gate
+routinely shows up in the same rollup. This sentence cannot be corrected in
+place either, and not merely because it sits inside a tracked segment the
+way `metrics.md:81-84` does — `metrics.md`'s only tracked segment is not
+scoped to a passage within the file, it spans nearly the whole file:
+`tests/fixtures/architecture-split.json` records one segment for
+`metrics.md`, 329 lines starting at its first heading — 328 of them on
+disk, running to the end of the 332-line file, plus one trailing blank
+line stripped when the file was written — everything but the four-line
+synthetic H1 and lede above that heading. `tests/architecture-provenance.test.js` hashes
+that segment verbatim, so it hashes the file from its first heading to the
+end, and there is no partial-credit edit even smaller than the one
+described above. `metrics.md:114`
+stays exactly as it reads, superseded by `gate-hygiene.md`'s "The quality
+gate" section, the same way `metrics.md:81-84` is superseded by the section
+above it.

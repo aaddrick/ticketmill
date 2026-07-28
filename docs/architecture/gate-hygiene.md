@@ -208,6 +208,166 @@ just weren't structured, so they never reached `gate_findings`. Redefining
 flat `count` (so a pile of `minor` findings doesn't read the same as one
 `critical`) is a natural follow-up, and is explicitly out of scope here.
 
+## The quality gate
+
+The quality loop (`runQualityLoop`, called once per task and once per
+PR-fix round) is the fourth gate to record outcomes through
+`recordGateOutcome`, after `approach`, `plan`, and `pr-review`. Its shape
+differs from those three in ways worth spelling out: it has one reviewer
+instead of two, it runs `MAX_QUALITY_ITERATIONS` times per *call* rather
+than per issue, and its cap line has to survive being called several times
+over the life of one issue without flooding the batch PR.
+
+### The five-branch disposition map
+
+Every iteration of the loop takes exactly one of five branches, and every
+branch ends in exactly one `recordGateOutcome(ctx, 'quality', findings,
+disposition)` call, placed immediately after the branch's verdict is known
+and before (or instead of) the fix stage that verdict triggers:
+
+- **Simplify agent dies.** `[] / 'dismissed'` — no review verdict was ever
+  reached, so there is nothing to tally as a finding.
+- **Review agent dies.** `[] / 'dismissed'` — same reasoning, one step later
+  in the loop.
+- **`rev.result === 'approved'`.** `revFindings || [] / 'accepted'` — a
+  genuine clean verdict from the one reviewer this loop has.
+- **The empty-findings exit.** `changes_requested` with `revFindings`
+  present and empty (`revFindings !== null && revFindings.length === 0`) —
+  `revFindings || [] / 'carried-unresolved'`. See below for why this is
+  `'carried-unresolved'` and not `'accepted'`, even though the loop treats
+  it as clean and sets `approved = true`.
+- **`changes_requested` with real findings.** `revFindings || []`, with the
+  same ternary the merge gate's `prReviewDisposition` uses: `iter ===
+  MAX_QUALITY_ITERATIONS ? 'carried-unresolved' : 're-litigated'` —
+  carried-unresolved only on the last iteration the loop is allowed to
+  spend, re-litigated on every iteration before it.
+
+The five-branch disposition map above stays five branches even though a
+third death — the fix agent, not the simplify or review agent — can also
+end an iteration: that death happens in the fix stage, *after* the
+iteration's disposition is already recorded by one of the branches above,
+so it never needs a disposition branch of its own. All three deaths `break`
+immediately, the same way the loop's two clean exits leave no further work:
+an issue can leave one call to this loop having recorded at most one
+disposition per iteration it actually entered, never more.
+
+### The invariant: sum(disposition) === quality_iters
+
+`ctx.metrics.quality_iters++` fires exactly once per iteration, at the top
+of the loop body, and — critically — *after* the loop's `STOP.tripped`
+check, which returns `'halted'` before either statement runs. An iteration
+either exits before `quality_iters` increments (the STOP path, which
+returns immediately and touches nothing else) or it increments
+`quality_iters` and then, on every one of the five branches above, calls
+`recordGateOutcome` exactly once before the iteration ends — whether that
+end is a `break` or a loop back around for another `iter`. No branch
+increments `quality_iters` without also recording a disposition, and no
+branch records a disposition without having incremented `quality_iters`
+first. The result is exact and unconditional, per issue, with no
+adjustment for STOP or anything else:
+
+```
+sum(gate_findings.quality.disposition) === ctx.metrics.quality_iters
+```
+
+This is the same one-disposition-per-iteration-entered discipline every
+disposition-recording loop in this file keeps — see the merge gate's
+`prReviewDisposition` call and the approach/plan contrarian gates' accept
+and cap branches — but it is worth stating explicitly for quality, because
+`quality_iters` is a single run-wide counter summed across every call to
+`runQualityLoop` for an issue (one per task, one per PR-fix round), not a
+per-call count, so the invariant has to hold across calls, not just within
+one.
+
+### Why the empty-findings exit tallies carried-unresolved but returns approved
+
+The empty-findings exit sets `approved = true` — the loop treats it as
+clean, the same predicate the earlier section on this page already
+establishes for the quality loop specifically — but it records
+`'carried-unresolved'`, not `'accepted'`. This is deliberate, and it is the
+same choice the merge gate already makes at its own empty-findings exit
+(`bothNothingToFix`, described above): a `changes_requested` verdict is not
+consent, even when it carries zero structured findings, and
+`recordGateOutcome` should not launder that into the same disposition
+string a genuine `approved` verdict earns.
+
+Two things anchor this specifically to the quality gate:
+
+- **`computeGateYield`'s accepted:dismissed ratio.** The Gate Yield table
+  renders `accepted / (accepted + dismissed)` as a compact per-gate health
+  signal — verdicts that closed clean, out of verdicts that could speak at
+  all (`dismissed` means the reviewer died, not that it judged and
+  rejected). Tallying the empty-findings exit as `'accepted'` would inflate
+  that ratio with iterations the reviewer never actually approved; keeping
+  it as `'carried-unresolved'` — a bucket the ratio's denominator doesn't
+  touch — keeps `accepted` meaning only "the reviewer said approved," full
+  stop. The exit stays visible in the table anyway, in the `Carried` column
+  rendered beside the ratio for exactly this reason.
+- **The approach contrarian gate's precedent.** The contrarian gates already
+  use `'carried-unresolved'` for an iteration that falls short of a clean
+  resolution without an agent dying: the approach challenge's
+  cap-with-caveats branch (`recordGateOutcome(ctx, 'approach', ch.findings,
+  'carried-unresolved')`) fires when the cap is reached and the run
+  proceeds anyway, "WITH UNRESOLVED CAVEATS." The quality loop's
+  empty-findings exit is a variant of the same idea — a verdict that is not
+  the reviewer's unqualified sign-off — tallied with the disposition this
+  codebase already uses for "proceeded without a clean resolution," rather
+  than inventing a fifth. `computeGateYield` hard-codes exactly four
+  disposition keys; a fifth would be silently dropped from the rollup.
+
+### What quality_degrades counts, and what it doesn't
+
+`ctx.metrics.quality_degrades` increments once per call to `runQualityLoop`
+where `degraded` is `true` on exit — the two agent-death branches in the
+disposition map above (simplify dies, review dies), plus a third that
+sits outside that map: the fix agent dying in the fix stage, after that
+iteration's disposition is already recorded. It does **not** increment on cap
+exhaustion: a loop that spends all `MAX_QUALITY_ITERATIONS` iterations
+re-litigating and never reaches a clean review sets neither `approved` nor
+`degraded`, and falls through the loop tail the same as a converged loop,
+just without `approved` ever having been set. The name reads like "quality
+regressed"; what it actually counts is narrower — an agent died inside this
+loop. Cap exhaustion's own signal lives at
+`gate_findings.quality.disposition['carried-unresolved']`, via the
+last-iteration branch of the five-way map above, not in `quality_degrades`.
+The `FRICTION_WEIGHTS` comment carries this same clarification next to the
+weight itself; the name stays as-is rather than being renamed, so this
+change doesn't carry an unrelated rename along with it.
+
+### The one-line-per-issue cap roll-up
+
+Cap exhaustion — `!approved && !degraded` at the loop tail, the state left
+by every iteration recording `'re-litigated'` or a final
+`'carried-unresolved'` without ever reaching a clean review — gets exactly
+one `VERIFY_SKIPS` entry per issue, not one per call. `runQualityLoop` runs
+once per task plus once per PR-fix round, so an issue with several tasks
+(or several PR-fix rounds) capping out would otherwise print one line per
+call and flood the batch PR's Verification Gaps section with
+near-duplicate entries for the same issue.
+
+The roll-up works by rewriting a remembered slot instead of pushing a new
+line each time: `ctx.quality_caps` collects the human-readable scope label
+(`"task 3"`, `"PR-fix round 2"`) for every call that caps out, and
+`ctx.quality_cap_skip_index` remembers where in `VERIFY_SKIPS` that issue's
+one line lives. The first cap on an issue pushes a new entry and records
+its index; every subsequent cap on the same issue rewrites that same index
+in place with the updated scope list joined into one message. `VERIFY_SKIPS`
+is append-only elsewhere in the engine, so rewriting a remembered index
+stays valid even under pool concurrency — nothing else can have inserted
+itself at that index in between. Both fields are lazily initialized (`if
+(!ctx.quality_caps) ctx.quality_caps = []`, not part of the `ctx` object
+literal `processIssue` builds) because `tests/harness.js`'s `makeCtx()`
+enumerates `ctx`'s fields explicitly, and adding either field to the
+canonical literal would mean updating that enumeration for something most
+tests never touch.
+
+The line's wording deliberately claims nothing about the PR's fate: this
+loop can also exit through the degrade-window halt immediately below it in
+the source, which both callers (`reviewAndMerge`, the per-task loop) turn
+into a hard `fail()`. A capped-then-halted issue still gets its roll-up
+line, so the wording has to hold for both outcomes — it says the review
+never came back clean, not that anything merged.
+
 ## Provenance: the frozen passage this page supersedes
 
 `docs/architecture/metrics.md:81-84` — the "Completing the gate findings
@@ -216,11 +376,32 @@ across the board" — describes the state of the world *before* this issue.
 It is now inaccurate: severity counts are real as of the change this page
 documents. That passage is not corrected in place. It sits inside
 `metrics.md`'s single tracked provenance segment (`tests/fixtures/architecture-split.json`
-records that segment as starting at line 5 and running 329 lines — the
-entire file), which `tests/architecture-provenance.test.js` hashes
+records that segment as starting at line 5 and running 329 lines — 328 of
+them on disk, lines 5 through the 332-line file's end, plus one trailing
+blank line stripped when the file was written — everything but the
+four-line synthetic H1 and lede above it), which `tests/architecture-provenance.test.js` hashes
 verbatim against a digest recorded when `docs/ARCHITECTURE.md` was split
 into this directory. Editing any character inside a tracked segment turns
 that test red; there is no partial-credit edit. This page is the correction
 and the durable source of truth going forward — `metrics.md:81-84` stays
 exactly as it reads, byte for byte, as a historical snapshot superseded by
 this document.
+
+This page also supersedes `metrics.md:114` — the `computeGateYield(results)`
+lede sentence, "rolls the three gates' `gate_findings` tallies." That
+sentence goes stale the moment the change this page documents merges:
+`computeGateYield` rolls up whichever gates appear in `gate_findings`,
+and `quality` recording outcomes through `recordGateOutcome` means a fourth
+gate now routinely shows up in that rollup, not three. Like the passage
+above, it cannot be corrected in place — and for the same structural
+reason, more bluntly here: `metrics.md`'s only tracked segment isn't scoped
+to this sentence, or to any sentence. `tests/fixtures/architecture-split.json`
+records exactly one segment for the whole file: 329 lines starting at its
+first heading, 328 of them on disk (through the 332-line file's end) plus
+one trailing blank line stripped when the file was written — everything
+but the file's four-line synthetic H1 and lede. `tests/architecture-provenance.test.js` hashes that
+one segment verbatim, so it hashes the file from its first heading to the
+end, which includes line 114. Editing any character inside that segment,
+including the word "three" in this sentence, turns that test red.
+`metrics.md:114` stays exactly as it reads, superseded by this page the
+same way `metrics.md:81-84` already is.

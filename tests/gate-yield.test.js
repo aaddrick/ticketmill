@@ -198,3 +198,59 @@ test('computeGateYield: a result missing gate_findings entirely degrades cleanly
   assert.deepStrictEqual(plain(gy.by_issue), [{ issue: 1, escaped: false }, { issue: 2, escaped: false }])
   assert.strictEqual(gy.has_signal, false)
 })
+
+// ---- issue #163: the new 'quality' gate key rolls into by_gate/has_signal
+// exactly like every other gate, but is neither an EARLY_GATE nor the
+// ESCAPE_GATE, so it must never perturb escaped_defects/by_issue. ----
+
+test('computeGateYield: a quality key tallies into by_gate but never affects escaped_defects — a pr-review finding still escapes with no approach/plan present', function () {
+  const context = harness.boot()
+  const results = [
+    {
+      issue: 11,
+      gate_findings: {
+        quality: gate(3, { major: 3 }, { 're-litigated': 2, 'carried-unresolved': 1 }),
+        'pr-review': gate(1, { minor: 1 }, { accepted: 1 }),
+      },
+    },
+  ]
+  const gy = context.computeGateYield(results)
+
+  // Same escape outcome as if 'quality' were absent entirely (compare against
+  // tests/gate-yield.test.js's own escaped-defect case above): quality is not
+  // in EARLY_GATES, so it contributes nothing to earlyCount.
+  assert.deepStrictEqual(plain(gy.escaped_defects), [{ issue: 11, count: 1 }])
+  assert.deepStrictEqual(plain(gy.by_issue), [{ issue: 11, escaped: true }])
+
+  const quality = plain(gy.by_gate).quality
+  assert.strictEqual(quality.count, 3)
+  assert.deepStrictEqual(quality.severity, { critical: 0, major: 3, minor: 0 })
+})
+
+test('computeGateYield: an issue with ONLY quality gate_findings (no pr-review at all) is never flagged as an escaped defect', function () {
+  const context = harness.boot()
+  const results = [
+    { issue: 12, gate_findings: { quality: gate(4, { major: 4 }, { 're-litigated': 4 }) } },
+  ]
+  const gy = context.computeGateYield(results)
+
+  assert.deepStrictEqual(plain(gy.escaped_defects), [])
+  assert.deepStrictEqual(plain(gy.by_issue), [{ issue: 12, escaped: false }])
+})
+
+// ---- issue #163: the quality-denominator footnote renders only when a
+// 'quality' key is actually present in this run's gate_findings ----
+
+test('computeGateYield: the quality-denominator footnote renders when a quality key is present, and is absent otherwise', function () {
+  const context = harness.boot()
+
+  const withoutQuality = context.computeGateYield([
+    { issue: 20, gate_findings: { approach: gate(1, { minor: 1 }, { accepted: 1 }) } },
+  ])
+  assert.doesNotMatch(withoutQuality.markdown, /quality runs once per task/)
+
+  const withQuality = context.computeGateYield([
+    { issue: 21, gate_findings: { quality: gate(1, { minor: 1 }, { accepted: 1 }) } },
+  ])
+  assert.match(withQuality.markdown, /quality runs once per task plus once per PR-fix round/)
+})

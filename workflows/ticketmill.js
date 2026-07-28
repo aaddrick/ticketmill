@@ -2013,8 +2013,9 @@ function revisitRiskBlock(ctx) {
   ].join('\n')
 }
 
-// ----- gate findings tally (issue #87 task 3, issue #91 wired in pr-review) -----
-// Per-gate (the two per-issue contrarian gates 'approach'/'plan', plus the
+// ----- gate findings tally (issue #87 task 3, issue #91 wired in pr-review, issue #163 wired in quality) -----
+// Per-gate (the two per-issue contrarian gates 'approach'/'plan', the
+// per-task-plus-per-PR-fix-round 'quality' code-review gate, plus the
 // per-task 'pr-review' merge gate) tally of finding counts, severity mix, and
 // how that gate ITERATION resolved:
 //   accepted            - the gate iteration passed clean: for approach/plan,
@@ -2031,26 +2032,43 @@ function revisitRiskBlock(ctx) {
 //                         iteration cap was reached without both reviewers
 //                         approving — for approach/plan, critical/major
 //                         findings are still open (they ride into
-//                         ctx.unresolved) — or (b) for pr-review only (issue
-//                         #162), both reviewers requested changes while
-//                         naming no structured findings to fix, so a fix
-//                         stage would have had nothing to act on. Both (a)
-//                         and (b) land on the same needs_human outcome; only
-//                         ctx.metrics.findings_empty_exits distinguishes them.
+//                         ctx.unresolved) — or (b) for pr-review (issue #162)
+//                         and quality (issue #163) alike, the reviewer(s)
+//                         requested changes while naming no structured
+//                         findings to fix, so a fix stage would have had
+//                         nothing to act on. For pr-review, (a) and (b) land
+//                         on the same needs_human outcome; only
+//                         ctx.metrics.findings_empty_exits distinguishes
+//                         them. quality has a single reviewer, not a pair,
+//                         so its (b) is one changes_requested verdict with
+//                         issues: [] — that branch sets runQualityLoop's own
+//                         approved = true (see below) even though it still
+//                         tallies carried-unresolved here: "clean" for the
+//                         loop's control flow and "clean" for this gate
+//                         tally answer different questions.
 //   re-litigated        - neither of the above: the loop revises and
 //                         re-contests, so these findings get judged again
 //                         next iteration (a fix stage for pr-review, a
 //                         re-evaluate stage for approach/plan).
 //   dismissed           - the gate produced no adjudicated verdict at all
-//                         (challenger agent died) — any findings were never
-//                         actually judged. pr-review has no equivalent call:
-//                         a dead reviewer there fails the run immediately
-//                         (see reviewAndMerge) rather than tallying an outcome.
+//                         (challenger/reviewer agent died) — any findings
+//                         were never actually judged. pr-review has no
+//                         equivalent call: a dead reviewer there fails the
+//                         run immediately (see reviewAndMerge) rather than
+//                         tallying an outcome. quality has two dismissed
+//                         call sites instead (see runQualityLoop): the
+//                         simplify agent dying before a review verdict ever
+//                         existed, and the review agent itself dying.
 // One call per gate ITERATION (not per finding), so `disposition` tallies
 // outcomes while `severity` sums every finding's severity across every
 // iteration of that gate. Bounded implicitly: one entry per gate name;
 // approach/plan run at most challengeCap (<= MAX_CONTRARIAN_ITERATIONS) times,
-// pr-review at most MAX_PR_REVIEW_ITERATIONS times, per issue/task.
+// pr-review at most MAX_PR_REVIEW_ITERATIONS times, per issue/task. quality
+// runs once per task plus once per PR-fix round (up to
+// MAX_QUALITY_ITERATIONS iterations each), so its denominator is not
+// directly comparable to pr-review, which runs once per issue (up to
+// MAX_PR_REVIEW_ITERATIONS iterations) — see the footnote in
+// computeGateYield.
 // NOTE (issue #162): REVIEW_SCHEMA.issues is now typed the same shape as
 // CHALLENGE_SCHEMA.findings (severity/summary required, recommendation
 // optional), and all four REVIEW_SCHEMA-producing prompts (spec review, code
@@ -2503,8 +2521,18 @@ function aggregateMergeAutoResolve(results) {
 //   unresolved_count         - per-finding granularity ON TOP OF contrarian_capped,
 //                             so a capped-out issue carrying five open findings
 //                             scores higher than one carrying only one.
-//   quality_degrades         - each time the quality loop accepted a "degraded"
-//                             exit instead of a clean approval.
+//   quality_degrades         - each time the quality loop's simplify, review,
+//                             or fix AGENT DIED mid-loop (see runQualityLoop),
+//                             not each time the loop merely regressed on
+//                             quality. Cap exhaustion (all iterations spent
+//                             without a clean review, no agent death) also
+//                             returns 'degraded' from runQualityLoop, but the
+//                             increment above only fires on the agent-death
+//                             branches — cap exhaustion never touches this
+//                             counter. Its own signal lives at
+//                             gate_findings.quality['carried-unresolved']
+//                             instead (issue #163); the misleading name is
+//                             kept as-is to avoid an unrelated rename.
 //   test_quality_fix_rounds  - each extra fix round the test-quality gate forced.
 const FRICTION_WEIGHTS = {
   needs_human: 2,
@@ -3055,7 +3083,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
         HANDOFF_ASK,
         'Return status, commit, files_changed, summary.',
       ].join('\n'), stageOpts('simplify'), IMPL_SCHEMA)
-      if (!simp || simp.status === 'error') { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': simplify degraded'); break }
+      if (!simp || simp.status === 'error') { recordGateOutcome(ctx, 'quality', [], 'dismissed'); degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': simplify degraded'); break }
       collectNotes(ctx, 'simplify', simp)
       collectPostedCommit(ctx, 'simplify-' + prefix + '-i' + iter, simp)
     } else if (iter === 1) {
@@ -3081,18 +3109,20 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       '(approved / changes requested) and key findings in 3-6 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
       'Return result (approved|changes_requested), comments, issues, recommended_fix_agent, summary.',
     ].join('\n'), stageOpts('qReview'), REVIEW_SCHEMA)
-    if (!rev) { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': review degraded'); break }
+    if (!rev) { recordGateOutcome(ctx, 'quality', [], 'dismissed'); degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': review degraded'); break }
 
     const revFindings = normalizeFindings(rev.issues, 'quality-' + prefix + '-i' + iter)
-    if (rev.result === 'approved') { approved = true; break }
+    if (rev.result === 'approved') { recordGateOutcome(ctx, 'quality', revFindings || [], 'accepted'); approved = true; break }
     if (revFindings !== null && revFindings.length === 0) {
       approved = true
       ctx.metrics.findings_empty_exits++
+      recordGateOutcome(ctx, 'quality', revFindings || [], 'carried-unresolved')
       pushDecision(ctx, 'Gate: no findings to fix', 'Quality review (' + stepLabel + ', iteration ' + iter + ') requested changes but named zero structured findings — treated as clean.')
       VERIFY_SKIPS.push('#' + ctx.issue + ': quality review (' + stepLabel + ', iteration ' + iter + ') requested changes but named zero structured findings — treated as clean, no fix stage ran')
       break
     }
 
+    recordGateOutcome(ctx, 'quality', revFindings || [], iter === MAX_QUALITY_ITERATIONS ? 'carried-unresolved' : 're-litigated')
     const fixAgent = pickFixAgent(rev.recommended_fix_agent, null)
     const fix = await stage(ctx, 'quality-fix-' + prefix + '-i' + iter, [
       implementerBlock(fixAgent),
@@ -3121,6 +3151,33 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
   // rolling degrade window across this issue's tasks
   ctx.degrades.push(degraded)
   if (degraded) ctx.metrics.quality_degrades++
+
+  // Cap exhaustion (issue #163): the loop ran out of iterations without a
+  // clean review AND without an agent dying (three degrade branches above
+  // break out before reaching here). Rolled up to exactly ONE VERIFY_SKIPS
+  // line per issue — runQualityLoop is called once per task plus once per
+  // PR-fix round, and without this roll-up a chatty task would print one
+  // line per call. ctx.quality_caps/quality_cap_skip_index are lazily
+  // initialized (not part of processIssue()'s ctx literal) because
+  // tests/harness.js's makeCtx() enumerates ctx's fields explicitly and
+  // would need updating for anything added there. VERIFY_SKIPS is
+  // append-only, so the remembered index stays valid even under pool
+  // concurrency. Deliberately silent on merge status: this loop can also
+  // exit via the degrade-window halt just below, which both callers
+  // (reviewAndMerge, the per-task loop) turn into a hard fail() — so this
+  // line must not claim anything merged on a capped-then-halted issue.
+  if (!approved && !degraded) {
+    if (!ctx.quality_caps) ctx.quality_caps = []
+    ctx.quality_caps.push(stepLabel)
+    const capMsg = '#' + ctx.issue + ': quality gate capped at ' + MAX_QUALITY_ITERATIONS + ' iterations without a clean review (' + ctx.quality_caps.join(', ') + ')'
+    if (typeof ctx.quality_cap_skip_index === 'number' && ctx.quality_cap_skip_index < VERIFY_SKIPS.length) {
+      VERIFY_SKIPS[ctx.quality_cap_skip_index] = capMsg
+    } else {
+      ctx.quality_cap_skip_index = VERIFY_SKIPS.length
+      VERIFY_SKIPS.push(capMsg)
+    }
+  }
+
   const window = ctx.degrades.slice(-QUALITY_DEGRADE_WINDOW)
   const count = window.filter(Boolean).length
   if (count >= MAX_QUALITY_DEGRADES_IN_WINDOW) {
@@ -5569,9 +5626,18 @@ function computeGateYield(results) {
         (b.ratio == null ? '—' : b.accepted + ':' + b.dismissed) + ' | ' + b.relitigated + ' | ' + b.carried + ' |')
     }
   }
+  // quality's denominator footnote (issue #163): quality runs once per task
+  // PLUS once per PR-fix round (each up to MAX_QUALITY_ITERATIONS iterations),
+  // unlike every other gate in this table which runs at most once per issue.
+  // Without this note the quality row's raw counts read as directly
+  // comparable to pr-review's, and they are not.
+  if (byGate.quality) {
+    lines.push('')
+    lines.push('Note: quality runs once per task plus once per PR-fix round (up to ' + MAX_QUALITY_ITERATIONS + ' iterations each), so its denominator is not directly comparable to pr-review, which runs once per issue (up to ' + MAX_PR_REVIEW_ITERATIONS + ' iterations).')
+  }
   if (escapedDefects.length) {
     lines.push('')
-    lines.push('Escaped defects (findings at "' + ESCAPE_GATE + '" that every earlier gate missed):')
+    lines.push('Escaped defects (findings at "' + ESCAPE_GATE + '" that neither "' + EARLY_GATES.join('" nor "') + '" raised):')
     lines.push('')
     lines.push('| Issue | Findings at ' + ESCAPE_GATE + ' |')
     lines.push('| --- | --- |')

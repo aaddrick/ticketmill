@@ -60,6 +60,29 @@ test('recordGateOutcome: different gate keys tally independently', function () {
   harness.assertVmEqual(ctx.gate_findings.plan.disposition, { dismissed: 1 })
 })
 
+test('recordGateOutcome: a "quality" gate key tallies independently, without perturbing the "approach"/"plan" buckets already recorded on the same ctx', function () {
+  const context = harness.boot()
+  const ctx = harness.makeCtx({ issue: 3.5 })
+
+  context.recordGateOutcome(ctx, 'approach', [{ severity: 'critical', summary: 'a' }], 'accepted')
+  context.recordGateOutcome(ctx, 'plan', [{ severity: 'minor', summary: 'b' }], 'dismissed')
+  context.recordGateOutcome(ctx, 'quality', [
+    { severity: 'major', summary: 'c' },
+    { severity: 'major', summary: 'd' },
+  ], 're-litigated')
+
+  harness.assertVmEqual(ctx.gate_findings.quality, {
+    count: 2,
+    severity: { critical: 0, major: 2, minor: 0 },
+    disposition: { 're-litigated': 1 },
+  })
+  // The pre-existing keys are untouched by the new 'quality' call.
+  assert.strictEqual(ctx.gate_findings.approach.count, 1)
+  harness.assertVmEqual(ctx.gate_findings.approach.disposition, { accepted: 1 })
+  assert.strictEqual(ctx.gate_findings.plan.count, 1)
+  harness.assertVmEqual(ctx.gate_findings.plan.disposition, { dismissed: 1 })
+})
+
 test('recordGateOutcome: a "dismissed" outcome (dead challenger) with no findings still tallies the disposition', function () {
   const context = harness.boot()
   const ctx = harness.makeCtx({ issue: 4 })
