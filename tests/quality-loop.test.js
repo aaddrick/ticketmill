@@ -123,9 +123,13 @@ test('runQualityLoop: halts immediately with zero agent calls when STOP is alrea
   assert.strictEqual(scriptedAgent.calls.length, 0)
   // Discriminates from the degrade-window halt path above: the STOP check
   // is the very first line of the loop body, before either counter
-  // increments, so both stay at their fresh-ctx zero.
+  // increments, so all three stay at their fresh-ctx zero. quality_scopes in
+  // particular (issue #165) only increments on iter === 1 INSIDE the loop
+  // body, below this STOP check, so a STOP-tripped call must increment
+  // neither quality_iters nor quality_scopes.
   assert.strictEqual(ctx.metrics.quality_iters, 0)
   assert.strictEqual(ctx.metrics.quality_degrades, 0)
+  assert.strictEqual(ctx.metrics.quality_scopes, 0)
 })
 
 test('runQualityLoop: each quality-fix round tallies its files_changed into ctx.touch_counts (issue #87 task 2) — a file fixed twice reads 2, a file fixed once reads 1', async function () {
@@ -469,6 +473,9 @@ test('runQualityLoop: a fully capped loop (5 changes_requested iterations, no de
   assert.strictEqual(result, 'degraded')
   assert.strictEqual(ctx.metrics.quality_iters, 5)
   assert.strictEqual(ctx.metrics.quality_degrades, 0)
+  // issue #165: quality_scopes counts INVOCATIONS of runQualityLoop, not
+  // iterations — one capped loop (5 iterations) is still exactly one scope.
+  assert.strictEqual(ctx.metrics.quality_scopes, 1)
   const g = ctx.gate_findings.quality
   assert.strictEqual(g.count, 5)
   harness.assertVmEqual(g.disposition, { 're-litigated': 4, 'carried-unresolved': 1 })
@@ -497,6 +504,10 @@ test('runQualityLoop: two capped scopes on the same ctx (a task, then a PR-fix r
 
   assert.strictEqual(firstResult, 'degraded')
   assert.strictEqual(secondResult, 'degraded')
+  // issue #165: two runQualityLoop invocations on the same ctx (a task, then
+  // a PR-fix round) leave quality_scopes at exactly 2 — one per call, not one
+  // per iteration (10 iterations ran in total across the two calls).
+  assert.strictEqual(ctx.metrics.quality_scopes, 2)
 
   const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
   assert.strictEqual(verifySkips.length, 1, 'a second capped scope on the same ctx must rewrite the existing entry in place, not append a second one: ' + JSON.stringify(verifySkips))

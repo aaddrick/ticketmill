@@ -2566,8 +2566,14 @@ const FRICTION_TOP_N = 5
 //
 // Each of the seven capped pipeline stages (approach/plan/task-review/quality/
 // test/browser/pr-review) contributes a normalized min(1, iters/cap) ratio —
-// running below a cap is normal, not friction, so a unit that cleared every
-// gate on its first pass scores 0 there regardless of how many stages it has.
+// running below a cap is normal, not friction. Four of the seven stages
+// (approach/plan/test/pr-review) run at most once per issue, so their
+// denominator is that single loop's cap; quality is the one whose pooled
+// denominator is implemented here (cap * quality_scopes, via multiScopeField
+// below) rather than one loop's cap against a multi-loop numerator.
+// task-review and browser are multi-scope aggregates too and not yet counted
+// this way (see multiScopeField below).
+//
 // Caps are read LIVE off module scope inside the function body (MAX_CONTRARIAN_
 // ITERATIONS et al — the same idiom aggregateTokens uses reading STAGE_LABELS),
 // never captured once at module load, so a __seed()-overridden cap in tests
@@ -2604,6 +2610,17 @@ function computeFriction(results) {
     browser: 'browser_iters',
     'pr-review': 'pr_review_iters',
   }
+  // multiScopeField: stage keys whose metric is a run-wide aggregate across
+  // MULTIPLE loop invocations (quality runs once per task plus once per
+  // PR-fix round — see the module comment above), rather than a single
+  // loop's iteration count. Each entry names the ctx.metrics field counting
+  // how many scopes/invocations contributed to that aggregate, so the ratio
+  // below pools the cap (cap * scopes) instead of comparing the aggregate to
+  // one loop's cap. task_review_attempts and browser_iters are two more
+  // multi-scope aggregates (per-task task review, per-phase browser checks —
+  // implement and pre-merge) not yet counted this way — this map is the
+  // extension point for adding them once their own scope counters exist.
+  const multiScopeField = { quality: 'quality_scopes' }
   const stageKeys = Object.keys(caps)
 
   const byIssue = []
@@ -2616,11 +2633,20 @@ function computeFriction(results) {
     let score = 0
 
     for (const k of stageKeys) {
-      const cap = caps[k] > 0 ? caps[k] : 1 // guard a misconfigured 0/negative cap from dividing by zero
+      const baseCap = caps[k] > 0 ? caps[k] : 1 // guard a misconfigured 0/negative cap from dividing by zero
+      const tracked = Object.prototype.hasOwnProperty.call(multiScopeField, k)
+      // scopes stays null (not 1) for the six stages with no scope counter: a
+      // number here is a claim "this many invocations were pooled", and only
+      // quality currently has a counter backing that claim. A metrics blob
+      // with no quality_scopes field (pre-this-change data) falls back to
+      // Math.max(1, 0) === 1, so cap === baseCap and the ratio scores exactly
+      // as it did before this change.
+      const scopes = tracked ? Math.max(1, Number(m[multiScopeField[k]]) || 0) : null
+      const cap = baseCap * (scopes || 1)
       const iters = Number(m[stageField[k]]) || 0
       const ratio = Math.min(1, iters / cap)
       if (ratio > 0) {
-        drivers.push({ name: k, value: iters, weight: null, contribution: ratio })
+        drivers.push({ name: k, value: iters, weight: null, cap: cap, scopes: scopes, contribution: ratio })
         stageTotals[k].total += ratio
         stageTotals[k].count += 1
       }
@@ -3071,6 +3097,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
   for (let iter = 1; !approved && !degraded && iter <= MAX_QUALITY_ITERATIONS; iter++) {
     if (STOP.tripped) return 'halted'
     ctx.metrics.quality_iters++
+    if (iter === 1) ctx.metrics.quality_scopes++
 
     if (runSimplify) {
       const simp = await stage(ctx, 'simplify-' + prefix + '-i' + iter, [
@@ -5100,7 +5127,7 @@ async function processIssue(pre) {
     // reasons:[]}) matches computeRevisitRisk's clean no-op shape so a preflight
     // that never carried revisit_risk (e.g. a resume-skip stub) never crashes.
     revisit_risk: (pre.revisit_risk && typeof pre.revisit_risk === 'object') ? pre.revisit_risk : { flagged: false, reasons: [] },
-    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0, findings_empty_exits: 0 },
+    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_scopes: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0, findings_empty_exits: 0 },
     tokens: { total: 0, byModel: {}, byStage: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
     // Retained-changed-files / friction signals (issue #87). null (not []) means
     // "never captured" — probeChangedFiles() sets these once, unconditionally,

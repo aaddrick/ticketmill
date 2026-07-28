@@ -115,6 +115,10 @@ test('composeFrictionChurn: returns the real computeFriction/computeChurn output
   const results = [
     { issue: 5, metrics: { browser_iters: 3 }, needs_human: false, contrarian_capped: false, unresolved_count: 0, test_quality_fix_rounds: 0, changed_files: ['shared/util.js'], touch_counts: {} },
     { issue: 6, metrics: {}, needs_human: false, contrarian_capped: false, unresolved_count: 0, test_quality_fix_rounds: 0, changed_files: ['shared/util.js'], touch_counts: {} },
+    // issue #165: a multi-scope quality fixture proves the new driver keys
+    // (cap, scopes) added by the pooled-denominator fix survive composition
+    // rather than being dropped/truncated on the way through the composer.
+    { issue: 8, metrics: { quality_iters: 6, quality_scopes: 3 }, needs_human: false, contrarian_capped: false, unresolved_count: 0, test_quality_fix_rounds: 0, changed_files: [], touch_counts: {} },
   ]
 
   const fc = context.composeFrictionChurn(results, { serializeGlobs: [], engineOwned: [] })
@@ -126,6 +130,14 @@ test('composeFrictionChurn: returns the real computeFriction/computeChurn output
   assert.strictEqual(fc.churn.hotspots.length, directChurn.hotspots.length)
   assert.strictEqual(fc.churn.hotspots[0].file, 'shared/util.js')
   assert.strictEqual(fc.churn.hotspots[0].count, 2)
+
+  const fcRow = fc.friction.by_issue.find(function (r) { return r.issue === 8 })
+  const directRow = direct.by_issue.find(function (r) { return r.issue === 8 })
+  assert.deepStrictEqual(fcRow.drivers, directRow.drivers, 'composed friction drivers must be the same objects/values computeFriction produces directly')
+  const qualityDriver = fcRow.drivers.find(function (d) { return d.name === 'quality' })
+  assert.strictEqual(qualityDriver.cap, 15) // MAX_QUALITY_ITERATIONS (5) * quality_scopes (3)
+  assert.strictEqual(qualityDriver.scopes, 3)
+  assert.ok(Math.abs(qualityDriver.contribution - 0.4) < 1e-9)
 })
 
 test('composeFrictionChurn: opts are forwarded to computeChurn, not dropped or read off module scope', function () {
