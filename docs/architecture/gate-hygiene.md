@@ -574,9 +574,9 @@ issue whose stages all pass first try scores 0 across every one of them,"
 was already inaccurate before this change, and not for a reason this
 change introduces. Passing "first try" means an iteration count of 1, not
 0 — every one of the seven capped stages counts its iterations from `iter
-= 1` (the four `= iter` assignments at `workflows/ticketmill.js:3628`,
-`:4427`, `:4573`, `:4850`, and the three `++` increments at `:3096`,
-`:3317`, `:4707`, all inside loops that open `for (let iter = 1; ...)`), so
+= 1` (the four `= iter` assignments at `workflows/ticketmill.js:3631`,
+`:4430`, `:4576`, `:4853`, and the three `++` increments at `:3099`,
+`:3320`, `:4710`, all inside loops that open `for (let iter = 1; ...)`), so
 `min(1, 1/cap)` is `1/cap`, not `0`, for any cap greater than 1. This
 sentence was inaccurate the moment it shipped, independent of anything
 issue #165 changes; this page does not attempt to correct it beyond
