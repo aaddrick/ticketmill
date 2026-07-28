@@ -46,6 +46,10 @@ function stageKeyOf(call) {
   return label.slice(label.indexOf(':') + 1)
 }
 
+function gateStateKeys(keys) {
+  return keys.filter(function (k) { return k.indexOf('gate-state-') === 0 })
+}
+
 // ---- postGateState() in isolation ----
 
 test('postGateState: a dead gate-state agent sets gate_state_post_failed (never gate_state_intent), pushes a ctx.deferred note, and returns falsy', async function () {
@@ -139,7 +143,7 @@ test('implementIssue: a run whose plan stage dies still posts exactly one gate-s
   assert.strictEqual(result.stage, 'plan')
 
   const keys = context.agent.calls.map(stageKeyOf)
-  const gateStateCalls = keys.filter(function (k) { return k.indexOf('gate-state-') === 0 })
+  const gateStateCalls = gateStateKeys(keys)
   assert.deepStrictEqual(gateStateCalls, ['gate-state-approach'])
   assert.ok(ctx.gate_state_intent, 'the approach boundary must have posted successfully')
   assert.strictEqual(ctx.gate_state_intent.boundary, 'approach')
@@ -214,7 +218,7 @@ test('implementIssue: a run that clears both gates posts gate-state "approach" t
   assert.strictEqual(result.stage, 'implement')
 
   const keys = context.agent.calls.map(stageKeyOf)
-  const gateStateCalls = keys.filter(function (k) { return k.indexOf('gate-state-') === 0 })
+  const gateStateCalls = gateStateKeys(keys)
   assert.deepStrictEqual(gateStateCalls, ['gate-state-approach', 'gate-state-plan'])
   // Both boundaries land BEFORE the first task-implement stage.
   assert.ok(keys.indexOf('gate-state-plan') < keys.indexOf('task-1-implement'))
@@ -260,7 +264,7 @@ test('reviewAndMerge: posts exactly one gate-state stage per pr-review iteration
   assert.strictEqual(ctx.metrics.pr_review_iters, 3)
 
   const keys = context.agent.calls.map(stageKeyOf)
-  const gateStateCalls = keys.filter(function (k) { return k.indexOf('gate-state-') === 0 })
+  const gateStateCalls = gateStateKeys(keys)
   assert.deepStrictEqual(gateStateCalls, ['gate-state-pr-review-i1', 'gate-state-pr-review-i2', 'gate-state-pr-review-i3'])
 })
 
@@ -287,7 +291,7 @@ test('processIssue: a process_pr resume whose reviewers both die on iteration 1 
   assert.strictEqual(result.stage, 'pr-review')
 
   const keys = context.agent.calls.map(stageKeyOf)
-  const gateStateCalls = keys.filter(function (k) { return k.indexOf('gate-state-') === 0 })
+  const gateStateCalls = gateStateKeys(keys)
   // Exactly the aborted boundary -- never 'gate-state-approach'/'gate-state-plan'
   // (this resume path never runs implementIssue at all), and never the
   // in-loop 'gate-state-pr-review-i1' (the reviewers never both returned).
@@ -327,7 +331,7 @@ test('reviewAndMerge: STOP trips during iteration 1 posts nothing new for the it
   assert.strictEqual(result.stage, 'pr-review')
 
   const keys = context.agent.calls.map(stageKeyOf)
-  const gateStateCalls = keys.filter(function (k) { return k.indexOf('gate-state-') === 0 })
+  const gateStateCalls = gateStateKeys(keys)
   assert.deepStrictEqual(gateStateCalls, ['gate-state-pr-review-i1'])
   assert.ok(!keys.includes('spec-review-i2'), 'iteration 2 must never start once STOP has tripped')
 })
