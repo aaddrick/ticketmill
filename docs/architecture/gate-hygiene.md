@@ -554,7 +554,8 @@ apostrophes, backticks, or newlines; `oneLine()`'s single-line-per-field
 convention can't express it without lossy flattening. `JSON.stringify`/
 `JSON.parse` round-trips it exactly instead, so `buildGateStatePayload`
 assembles a real object (`schema`, `repo`, `issue`, `run`, `batch`, `epoch`,
-`boundary`, `group_id`, `members`, `seeded_from`, `gate_budgets`, `settled`)
+`write_seq`, `boundary`, `group_id`, `members`, `seeded_from`, `gate_budgets`,
+`settled`)
 and the comment fences it as JSON rather than trying to force it through
 consolidation's flat format.
 
@@ -652,24 +653,28 @@ about this issue's history rather than learning that the history is empty
 or broken.
 
 `absent` is the state that most needs to be earned rather than assumed.
-Zero blocks and zero total comments looks, on its own, exactly like a
-genuinely fresh issue that has never reached a gate. But it looks
-*identical* to a truncated or failed read on an issue that has real
-history — and the only way to tell those two apart is to check something
-the gate-state read itself has no access to: whether this issue shows other
-independent evidence of prior work. `hasGateStatePriorWork(priorWork)`
-makes that check explicit — a non-null `pr_number`, a `worktree_exists` of
-`true`, or a `resume_point` other than `'implement'` — any one of these
-means a prior run plainly did *something* here, so zero gate-state comments
-next to any of them is contradictory, not confirmatory. `selectGateState`
-treats that combination as `read-failed`, never `absent`. Absence is only
-accepted as genuine when zero blocks/zero total comments is *not*
-contradicted by that independent evidence. A second, narrower check runs
-first and unconditionally, ahead of the prior-work cross-check: zero blocks
-with a nonzero `total` is self-contradictory on its face (the probe reports
-comments exist but produced none) — the exact shape a truncated or
-corrupted read would take — so it is always `read-failed` regardless of
-prior-work evidence.
+Zero blocks and a zero `total` looks, on its own, exactly like a genuinely
+fresh issue that has never reached a gate. But it looks *identical* to a
+truncated or failed read on an issue that has real history — and the only
+way to tell those two apart is to check something the gate-state read
+itself has no access to: whether this issue shows other independent
+evidence of prior work. `hasGateStatePriorWork(priorWork)` makes that check
+explicit — a non-null `pr_number`, a `worktree_exists` of `true`, or a
+`resume_point` other than `'implement'` — any one of these means a prior
+run plainly did *something* here, so zero gate-state comments next to any
+of them is contradictory, not confirmatory. `selectGateState` treats that
+combination as `read-failed`, never `absent`. Absence is only accepted as
+genuine when zero blocks/zero `total` is *not* contradicted by that
+independent evidence. A second, narrower check runs first and
+unconditionally, ahead of the prior-work cross-check: zero blocks with a
+nonzero `total` is self-contradictory on its face (the probe reports
+gate-state comments exist but produced none) — the exact shape a truncated
+or corrupted read would take — so it is always `read-failed` regardless of
+prior-work evidence. `total` is computed by the SAME title-gated jq filter
+`blocks` uses (never a bare count of every comment on the issue), so this
+branch is reachable only under a genuinely truncated or corrupted read —
+not, as an earlier build of this jq idiom let happen, on any ordinary issue
+that had simply received one unrelated human or bot comment.
 
 ### The jq-pinned read idiom, not `fetchConsolidationMarkers`'s bare read
 
@@ -682,8 +687,9 @@ or partial response can get silently read as "no marker" with nothing to
 catch the difference. Gate state instead pins the same deterministic
 "last title-gated comment" idiom the claim probe already uses
 (`gh issue view <n> --repo <r> --json comments --jq '{total, blocks}'`,
-computed by `gateStateProbeCommandLine()`): jq, not the agent, computes the
-exact return shape. The agent's only job is relaying that command's stdout
+computed by `gateStateProbeCommandLine()`, where both `total` and `blocks`
+run through the identical `select(.body | startswith("## Gate State"))`
+filter): jq, not the agent, computes the exact return shape. The agent's only job is relaying that command's stdout
 verbatim as `raw` — it never parses or judges it. `parseGateStateProbeRow`
 is what actually decides whether a read succeeded, and it is built so a
 truncated or non-JSON `raw` string can never validate: any shape mismatch —
@@ -771,6 +777,21 @@ documented here as the *intended* staleness bound for a gate-state block's
 `epoch` — `gateStateEpochStale` computes it — but nothing at this tier
 reads or enforces that `stale` flag. It's substrate for a future consumer,
 carried through so one doesn't need a shape change to start acting on it.
+
+### `write_seq`: orders same-run writes; `epoch` can't
+
+`RUN_EPOCH` is assigned once at Select and is therefore identical across
+every boundary a single run posts — it answers "how old is this run's data"
+(what `gateStateEpochStale` needs), not "which of two same-run writes came
+later" (what `diffGateStateIntent`'s `'superseded'` verdict needs). Those are
+different questions with different answers: two boundaries from the same run
+always carry the same `epoch`, so an epoch comparison between them is always
+a tie, never an order. `GATE_STATE_WRITE_SEQ` is a separate module-level
+counter — not a clock, a plain incrementing integer — that `postGateState`
+bumps once per call and embeds on the payload as `write_seq`. Call order is
+write order (a single issue's boundaries always post sequentially within
+that issue's own `await` chain), so `diffGateStateIntent` orders same-run
+writes on `write_seq`, never `epoch`.
 
 ### `seeded_from`: a discriminator with no reader yet
 

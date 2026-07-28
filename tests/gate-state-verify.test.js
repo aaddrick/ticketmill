@@ -18,6 +18,9 @@
 //     a scripted agent has no way to "cheat" the comparison.
 //   - the sweep never makes an agent call at all when nothing has an intent
 //     (every result is no-intent/post-failed).
+//   - 'mismatch' and 'read-failed' each push a VERIFY_SKIPS entry naming the
+//     issue (the batch PR's Verification Gaps section); 'match'/'superseded'
+//     never do.
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
@@ -42,8 +45,8 @@ function makeResult(context, issue, overrides) {
   return Object.assign({ issue: issue, title: 'fixture', gate_state_intent: null, gate_state_post_failed: null }, overrides)
 }
 
-function intentFor(context, issue, run, epoch, boundary) {
-  return context.buildGateStatePayload({ repo: REPO, issue: issue, run: run || 'run-1', batch: TARGET, epoch: (epoch === undefined ? 1000 : epoch), boundary: boundary || 'plan' })
+function intentFor(context, issue, run, epoch, boundary, writeSeq) {
+  return context.buildGateStatePayload({ repo: REPO, issue: issue, run: run || 'run-1', batch: TARGET, epoch: (epoch === undefined ? 1000 : epoch), boundary: boundary || 'plan', write_seq: (writeSeq === undefined ? 1 : writeSeq) })
 }
 
 function bodyFor(context, issue, payload) {
@@ -108,8 +111,8 @@ test('verifyGateState: newest block is a LATER write from the SAME run -- logs s
   const context = harness.boot()
   seed(context)
   const logs = logsOf(context)
-  const intent = intentFor(context, 4, 'run-1', 1000, 'pr-review-i1')
-  const later = intentFor(context, 4, 'run-1', 2000, 'pr-review-i2')
+  const intent = intentFor(context, 4, 'run-1', 1000, 'pr-review-i1', 1)
+  const later = intentFor(context, 4, 'run-1', 1000, 'pr-review-i2', 2)
   harness.installScriptedAgent(context, function () {
     return { rows: [{ issue: 4, raw: jqRaw([block(bodyFor(context, 4, intent)), block(bodyFor(context, 4, later))]), exit_ok: true }] }
   })
@@ -166,6 +169,56 @@ test('verifyGateState: exit_ok:false on the probe row logs read-failed', async f
   await context.verifyGateState(results)
 
   assert.ok(outcomeLine(logs, 7).indexOf('read-failed') !== -1, outcomeLine(logs, 7))
+})
+
+// ---- mismatch/read-failed reach VERIFY_SKIPS -- the batch PR's Verification
+// Gaps section is the human's only window into what this run's gate-state
+// self-validation couldn't confirm ----
+
+test('verifyGateState: a mismatch outcome pushes a VERIFY_SKIPS entry naming the issue', async function () {
+  const context = harness.boot()
+  seed(context)
+  const intent = intentFor(context, 5, 'run-1', 1000)
+  const otherRun = intentFor(context, 5, 'concurrent-run', 2000)
+  harness.installScriptedAgent(context, function () {
+    return { rows: [{ issue: 5, raw: jqRaw([block(bodyFor(context, 5, otherRun))]), exit_ok: true }] }
+  })
+
+  const results = [makeResult(context, 5, { gate_state_intent: intent })]
+  await context.verifyGateState(results)
+
+  const skips = Array.from(harness.readGlobal(context, 'VERIFY_SKIPS'))
+  assert.ok(skips.some(function (s) { return s.indexOf('#5') !== -1 && s.indexOf('mismatch') !== -1 }), 'expected a VERIFY_SKIPS entry for issue #5: ' + JSON.stringify(skips))
+})
+
+test('verifyGateState: a read-failed outcome pushes a VERIFY_SKIPS entry naming the issue', async function () {
+  const context = harness.boot()
+  seed(context)
+  const intent = intentFor(context, 7)
+  harness.installScriptedAgent(context, function () {
+    return { rows: [{ issue: 7, raw: '', exit_ok: false }] }
+  })
+
+  const results = [makeResult(context, 7, { gate_state_intent: intent })]
+  await context.verifyGateState(results)
+
+  const skips = Array.from(harness.readGlobal(context, 'VERIFY_SKIPS'))
+  assert.ok(skips.some(function (s) { return s.indexOf('#7') !== -1 && s.indexOf('read-failed') !== -1 }), 'expected a VERIFY_SKIPS entry for issue #7: ' + JSON.stringify(skips))
+})
+
+test('verifyGateState: match and superseded outcomes never push a VERIFY_SKIPS entry', async function () {
+  const context = harness.boot()
+  seed(context)
+  const matchPayload = intentFor(context, 3)
+  harness.installScriptedAgent(context, function () {
+    return { rows: [{ issue: 3, raw: jqRaw([block(bodyFor(context, 3, matchPayload))]), exit_ok: true }] }
+  })
+
+  const results = [makeResult(context, 3, { gate_state_intent: matchPayload })]
+  await context.verifyGateState(results)
+
+  const skips = Array.from(harness.readGlobal(context, 'VERIFY_SKIPS'))
+  assert.strictEqual(skips.some(function (s) { return s.indexOf('#3') !== -1 }), false, 'a clean match must never surface as a verification gap: ' + JSON.stringify(skips))
 })
 
 test('verifyGateState: truncated/non-JSON jq stdout (agent succeeded, jq output is garbage) logs read-failed, never a fake match/mismatch', async function () {

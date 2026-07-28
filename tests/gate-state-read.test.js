@@ -170,6 +170,26 @@ test('fetchGateStateBlocks: one dead chunk of three leaves the other two chunks\
   assert.strictEqual(rows[11].exit_ok, true, 'issue #11 (surviving chunk 2) must be intact')
 })
 
+test('fetchGateStateBlocks: a live chunk that returns rows for some but not all of its assigned issues never lets the missing issue read as absent', async function () {
+  const context = harness.boot()
+  seed(context)
+  const logs = []
+  context.log = function (msg) { logs.push(String(msg)) }
+  harness.installScriptedAgent(context, function () {
+    // Schema-valid response (GATE_STATE_PROBE_SCHEMA can't enforce one row per
+    // issue) that simply omits issue 2's row -- distinct from a dead chunk,
+    // which this file's other tests already cover via a null/throwing agent.
+    return { self_login: 'bot', rows: [{ issue: 1, raw: jqRow(0, []), exit_ok: true }] }
+  })
+
+  const result = await context.fetchGateStateBlocks([1, 2], {})
+  const rows = harness.normalize(result.rowsByIssue)
+  assert.deepStrictEqual(rows[2], { raw: '', exit_ok: false }, 'issue #2 must be backfilled as an explicit read-failed stub, never silently missing')
+  const line = logs.find(function (l) { return l.indexOf('#2') !== -1 })
+  assert.ok(line, 'expected a log line for issue #2: ' + JSON.stringify(logs))
+  assert.ok(line.indexOf('read-failed') !== -1 && line.indexOf('absent') === -1, 'issue #2 must log read-failed, never absent: ' + line)
+})
+
 test('fetchGateStateBlocks: truncated jq stdout (agent succeeded, jq output is garbage) logs read-failed, never absent', async function () {
   const context = harness.boot()
   seed(context)

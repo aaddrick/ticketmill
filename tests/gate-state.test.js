@@ -181,6 +181,22 @@ test('parseGateStateProbeRow: well-formed stdout parses to ok:true with total/bl
   assert.deepStrictEqual(result, { ok: true, total: 2, blocks: [{ body: 'x', author_login: 'me', author_association: 'OWNER' }] })
 })
 
+// ---- gateStateProbeCommandLine: the pinned jq idiom ----
+
+test('gateStateProbeCommandLine: `total` is counted by the SAME title-gated filter `blocks` uses, never a bare all-comments count', function () {
+  const context = harness.boot()
+  const line = context.gateStateProbeCommandLine()
+  // A bare `.comments|length` would count EVERY comment on the issue, not
+  // just gate-state ones -- making `blocks.length === 0 && total > 0`
+  // reachable on any issue that has received so much as one unrelated human
+  // or bot comment, which selectGateState's self-contradiction check treats
+  // as read-failed, silently swallowing the `absent` state for the common
+  // case (issue #166 PR #177 review).
+  assert.ok(line.indexOf('.comments|length') === -1, 'total must not be a bare unfiltered comment count: ' + line)
+  const titleFilterCount = (line.match(/select\(\.body \| startswith\("## Gate State"\)\)/g) || []).length
+  assert.strictEqual(titleFilterCount, 2, 'the gate-state title filter must back BOTH total and blocks: ' + line)
+})
+
 // ---- selectGateState: four states ----
 
 test('selectGateState: found / absent / malformed / read-failed are all distinguishable', function () {
@@ -415,20 +431,26 @@ test('gateStateEpochStale / selectGateState: stale flips true once age exceeds C
 
 // ---- diffGateStateIntent ----
 
-test('diffGateStateIntent: all three verdicts -- match, superseded, mismatch', function () {
+test('diffGateStateIntent: verdicts are keyed off write_seq (a monotonic per-run write counter), never epoch -- match, superseded, mismatch', function () {
   const context = harness.boot()
-  const intent = { schema: 1, repo: REPO, issue: 1, run: 'run-1', batch: 'dev', epoch: 1000, boundary: 'plan', group_id: null, members: [1], seeded_from: null, gate_budgets: {}, settled: [] }
+  const intent = { schema: 1, repo: REPO, issue: 1, run: 'run-1', batch: 'dev', epoch: 1000, write_seq: 1, boundary: 'plan', group_id: null, members: [1], seeded_from: null, gate_budgets: {}, settled: [] }
 
   const identical = Object.assign({}, intent)
   assert.strictEqual(context.diffGateStateIntent(intent, identical), 'match')
 
-  const laterSameRun = Object.assign({}, intent, { boundary: 'pr-review-i1', epoch: 2000 })
+  const laterSameRun = Object.assign({}, intent, { boundary: 'pr-review-i1', write_seq: 2 })
   assert.strictEqual(context.diffGateStateIntent(intent, laterSameRun), 'superseded')
 
-  const differentRun = Object.assign({}, intent, { run: 'run-2', epoch: 1500 })
+  // Same run, LATER epoch but the SAME write_seq -- epoch alone must never
+  // establish ordering. In production every boundary in a single run shares
+  // one RUN_EPOCH; only write_seq varies write to write.
+  const laterEpochSameSeq = Object.assign({}, intent, { epoch: 5000 })
+  assert.strictEqual(context.diffGateStateIntent(intent, laterEpochSameSeq), 'mismatch')
+
+  const differentRun = Object.assign({}, intent, { run: 'run-2', write_seq: 2 })
   assert.strictEqual(context.diffGateStateIntent(intent, differentRun), 'mismatch')
 
-  const earlierSameRun = Object.assign({}, intent, { epoch: 500 })
+  const earlierSameRun = Object.assign({}, intent, { write_seq: 0 })
   assert.strictEqual(context.diffGateStateIntent(intent, earlierSameRun), 'mismatch')
 
   assert.strictEqual(context.diffGateStateIntent(null, identical), 'mismatch')

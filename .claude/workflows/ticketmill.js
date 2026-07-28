@@ -421,6 +421,20 @@ let LOCKSTEP_INSTALLED_PATHS = []
 // selectGateState treats a null run epoch as unknown age, which reads as
 // stale, never as fresh (see gateStateEpochStale).
 let RUN_EPOCH = null
+// GATE_STATE_WRITE_SEQ (issue #166 PR #177 review): a per-run, module-level
+// monotonic write counter -- NOT a clock and NOT Date.now()/Math.random() (a
+// plain incrementing int is deterministic across a resume/replay the same way
+// every other module-level counter in this file is). RUN_EPOCH is assigned
+// ONCE at Select and is therefore IDENTICAL across every boundary a run
+// posts, so it cannot order two same-run writes against each other --
+// diffGateStateIntent's 'superseded' verdict needs something that varies
+// write to write. postGateState() increments this once per call and embeds
+// it on the payload as `write_seq`; call order is write order, since a given
+// issue's boundaries always post sequentially within that issue's own await
+// chain. Never reset mid-run. diffGateStateIntent still gates supersession on
+// `intent.run === actual.run` first, since two payloads from different runs
+// never share counter provenance.
+let GATE_STATE_WRITE_SEQ = 0
 
 function stageOpts(key) {
   const base = M[key] || { model: 'sonnet' }
@@ -526,8 +540,9 @@ const PREFLIGHT_SCHEMA = {
     // missing any of these four to their fail-open default so selectGateState never
     // sees an undefined key. gate_state_blocks carries raw verbatim comment bodies
     // (most recent last); gate_state_read_ok is whether the probe's gh call exited
-    // 0; gate_state_total_comments is the issue's total comment count (feeds the
-    // falsifiable-absent cross-check); gate_state_trust is set at Select from the
+    // 0; gate_state_total_comments is the issue's gate-state comment count (the
+    // SAME title-gated filter `gate_state_blocks` uses, never every comment on
+    // the issue -- feeds the falsifiable-absent cross-check); gate_state_trust is set at Select from the
     // probe's self_login, never by the agent itself.
     gate_state_blocks: { type: 'array', items: { type: 'string' } },
     gate_state_read_ok: { type: 'boolean' },
@@ -1073,9 +1088,15 @@ const GATE_STATE_VERIFY_SCHEMA = {
 // consumer -- see the section banner above), so every call site passes null.
 // The field's PRESENCE, not its value, is what parseGateStateComment's schema
 // round-trips against -- a future consumer fills it in without a shape change
-// here. Every field defaults defensively (never throws on a sparse `o`) so a
-// caller mid-construction (e.g. a boundary with no group) gets a valid,
-// schema-conformant payload rather than an exception.
+// here. `write_seq` (issue #166 PR #177 review) is the GATE_STATE_WRITE_SEQ
+// counter value at the moment this payload was built -- unlike `epoch`
+// (identical across every boundary in a run), this varies write to write, so
+// diffGateStateIntent can order two same-run writes against each other. null
+// when the caller doesn't supply one (e.g. a hand-built test fixture, never a
+// real postGateState() call, which always passes it). Every field defaults
+// defensively (never throws on a sparse `o`) so a caller mid-construction
+// (e.g. a boundary with no group) gets a valid, schema-conformant payload
+// rather than an exception.
 function buildGateStatePayload(o) {
   o = o || {}
   return {
@@ -1085,6 +1106,7 @@ function buildGateStatePayload(o) {
     run: o.run,
     batch: o.batch,
     epoch: (o.epoch === undefined) ? null : o.epoch,
+    write_seq: (o.write_seq === undefined) ? null : o.write_seq,
     boundary: o.boundary,
     group_id: (o.group_id === undefined) ? null : o.group_id,
     members: Array.isArray(o.members) ? o.members.slice() : [],
@@ -1231,6 +1253,11 @@ function deriveRunEpoch(nowRaw) {
 // predates CLAIM_STALE_SECONDS relative to `runEpochMs`, OR either side is
 // unparseable/absent. An unknown age reads as stale, never as fresh (fail
 // toward re-verifying, not toward trusting silently).
+// KNOWN IMPRECISION (issue #166 PR #177 review): `payload.epoch` is RUN_EPOCH
+// -- the run's Select-time wall-clock anchor -- not the actual moment this
+// particular boundary was written, so a long-running run's later boundaries
+// read slightly younger than they really are. Log-only at this tier (no
+// consumer yet); not worth a second probe-derived wall-clock read to fix.
 function gateStateEpochStale(payload, runEpochMs) {
   const payloadEpoch = (payload && Number.isFinite(payload.epoch)) ? payload.epoch : null
   if (payloadEpoch === null || !Number.isFinite(runEpochMs)) return true
@@ -1281,7 +1308,11 @@ function gateStateEpochStale(payload, runEpochMs) {
 // zero blocks but total>0 is self-contradictory on its face (the probe says
 // comments exist but produced none) -- exactly the truncated/corrupted-read
 // shape this whole design exists to make undetectable-as-absence, so it is
-// always read-failed regardless of `hasPriorWork`.
+// always read-failed regardless of `hasPriorWork`. `total` is computed by
+// gateStateProbeCommandLine's jq using the SAME title-gated filter `blocks`
+// uses (never a bare all-comments count), so this branch is reachable only
+// under a genuinely truncated/corrupted read, not on any ordinary issue
+// carrying an unrelated human or bot comment.
 //
 // hasGateStatePriorWork: shared with fetchGateStateBlocks' diagnostic log
 // (below the split), which needs the same fact to tell the falsifiable-absent
@@ -1341,18 +1372,24 @@ function selectGateState(rows, evidence, priorWork) {
 // re-read). Three verdicts:
 //   - 'match'      -- byte-for-byte the same write (JSON.stringify-equal).
 //   - 'superseded' -- `actual` is a LATER write from the SAME run (same
-//                     `run`, later `epoch`) -- expected and not alarming: a
-//                     later boundary in this same run posted after `intent`
+//                     `run`, later `write_seq`) -- expected and not alarming:
+//                     a later boundary in this same run posted after `intent`
 //                     was captured (e.g. a later pr-review iteration's write
 //                     landing after an earlier iteration's intent snapshot).
+//                     Ordering is on `write_seq`, NOT `epoch` (issue #166 PR
+//                     #177 review) -- RUN_EPOCH is assigned once at Select and
+//                     is identical on every boundary a single run posts, so it
+//                     can never distinguish an earlier write from a later one
+//                     within that run; only the monotonic per-write
+//                     GATE_STATE_WRITE_SEQ counter does.
 //   - 'mismatch'   -- anything else: a different run's write sitting where
 //                     ours should be, an EARLIER write, or same-run content
-//                     that disagrees without a later epoch to explain it --
-//                     real corruption or a lost write.
+//                     that disagrees without a later write_seq to explain it
+//                     -- real corruption or a lost write.
 function diffGateStateIntent(intent, actual) {
   if (!intent || !actual) return 'mismatch'
   if (JSON.stringify(intent) === JSON.stringify(actual)) return 'match'
-  if (intent.run === actual.run && Number.isFinite(intent.epoch) && Number.isFinite(actual.epoch) && actual.epoch > intent.epoch) {
+  if (intent.run === actual.run && Number.isFinite(intent.write_seq) && Number.isFinite(actual.write_seq) && actual.write_seq > intent.write_seq) {
     return 'superseded'
   }
   return 'mismatch'
@@ -1372,7 +1409,17 @@ function chunkGateStateIssues(list) {
   return chunks
 }
 function gateStateProbeCommandLine() {
-  return 'gh issue view <n> --repo ' + REPO + ' --json comments --jq \'{total: (.comments|length), blocks: [.comments[] | select(.body | startswith("' + GATE_STATE_TITLE + '")) | {body, author_login: .author.login, author_association: .authorAssociation}] | .[-3:]}\''
+  // total is computed by the SAME title-gated select(...) filter blocks uses --
+  // NEVER a bare `.comments|length` -- so it counts gate-state comments only,
+  // not every comment on the issue. A bare all-comments count would make
+  // `blocks.length === 0 && total > 0` reachable on any ordinary issue with so
+  // much as one human reply or one of this pipeline's own non-gate-state
+  // comments, which selectGateState's self-contradiction check (:1343 as of
+  // writing) treats as read-failed -- silently swallowing the `absent` state
+  // for every issue that has ever received an unrelated comment (issue #166
+  // PR #177 review).
+  const titleFilter = 'select(.body | startswith("' + GATE_STATE_TITLE + '"))'
+  return 'gh issue view <n> --repo ' + REPO + ' --json comments --jq \'{total: ([.comments[] | ' + titleFilter + '] | length), blocks: [.comments[] | ' + titleFilter + ' | {body, author_login: .author.login, author_association: .authorAssociation}] | .[-3:]}\''
 }
 function deadGateStateChunkRows(chunk) {
   return chunk.map(function (n) { return { issue: n, raw: '', exit_ok: false } })
@@ -4543,7 +4590,11 @@ async function fetchConsolidationMarkers(issueNumbers) {
 // budget-exhausted, or returns a malformed response) marks ONLY its own
 // chunk's issues read-failed via synthesized {raw: '', exit_ok: false} stub
 // rows — surviving chunks still report normally, rather than one dead call
-// taking the whole candidate set down with it.
+// taking the whole candidate set down with it. A LIVE chunk that returns a
+// schema-valid `rows` array simply missing one of its assigned issues (which
+// GATE_STATE_PROBE_SCHEMA cannot forbid) gets the SAME stub backfilled after
+// the chunk loop below, for the same reason: a queried-but-unanswered issue
+// must read as read-failed, never silently as absent.
 //
 // self_login reduction: each chunk independently runs `gh api user --jq
 // .login` (a single-object endpoint, so the file's "never a bare gh api"
@@ -4607,6 +4658,15 @@ async function fetchGateStateBlocks(issueNumbers, priorWorkByIssue) {
     if (!selfLogin && cr.self_login && cr.self_login.trim()) selfLogin = cr.self_login.trim()
     for (const row of (cr.rows || [])) rowsByIssue[row.issue] = normalizeGateStateRow(row)
   }
+  // Backfill any queried issue a LIVE chunk's response simply omitted — GATE_STATE_PROBE_SCHEMA
+  // cannot enforce one row per issue, so a schema-valid response that drops an issue (never
+  // throws, never hits the dead-chunk catch above) would otherwise leave rowsByIssue[n]
+  // undefined. Stubbed the same way a dead chunk's issues are (deadGateStateChunkRows, a few
+  // lines above) so a queried-but-never-answered issue reads as read-failed, never as a false
+  // "absent" (issue #166 PR #177 review).
+  for (const n of list) {
+    if (!Object.prototype.hasOwnProperty.call(rowsByIssue, n)) rowsByIssue[n] = normalizeGateStateRow({ issue: n, raw: '', exit_ok: false })
+  }
 
   // Per-issue diagnostic log, using the SAME pure selectGateState decision a
   // future consumer would reach — this run just prints it rather than acting
@@ -4615,10 +4675,12 @@ async function fetchGateStateBlocks(issueNumbers, priorWorkByIssue) {
   // needs outcomeGradeR/revisitRiskR already awaited) — the `state` value
   // never depends on it (only the auxiliary `stale` flag does), so passing the
   // module-level RUN_EPOCH here (null on a fresh run) is correct, not stale.
+  // Every issue in `list` now has a rowsByIssue entry (real or backfilled
+  // stub), so `row` below is never falsy — no separate {} fallback needed.
   for (const n of list) {
     const row = rowsByIssue[n]
-    const parsed = row ? parseGateStateProbeRow(row.raw) : { ok: false, total: 0, blocks: [] }
-    const rowsArg = row ? Object.assign({ exit_ok: row.exit_ok }, parsed) : {}
+    const parsed = parseGateStateProbeRow(row.raw)
+    const rowsArg = Object.assign({ exit_ok: row.exit_ok }, parsed)
     const pw = pwByIssue[n] || {}
     const sel = selectGateState(rowsArg, { repo: REPO, issue: n, self_login: selfLogin, claim_authors: [], batch: TARGET, run_epoch: RUN_EPOCH }, pw)
     if (sel.state === 'read-failed' && parsed.blocks.length === 0 && parsed.total === 0 && hasGateStatePriorWork(pw)) {
@@ -4914,6 +4976,7 @@ async function postGateState(ctx, boundary) {
     run: RUN_TAG,
     batch: TARGET,
     epoch: RUN_EPOCH,
+    write_seq: ++GATE_STATE_WRITE_SEQ,
     boundary: boundary,
     group_id: ctx.groupId,
     members: memberIssues(ctx),
@@ -4978,9 +5041,15 @@ async function postGateState(ctx, boundary) {
 // exit path, not just a clean finish.
 //
 // Six outcomes, logged one per issue via `log()`. NON-FATAL end to end:
-// this sweep only ever logs -- it never mutates a result's status, never
-// throws past its own call site, and a dead/misbehaving chunk degrades to
-// 'read-failed' for that chunk's issues rather than aborting the sweep.
+// this sweep never mutates a result's status, never throws past its own call
+// site, and a dead/misbehaving chunk degrades to 'read-failed' for that
+// chunk's issues rather than aborting the sweep. 'mismatch' and 'read-failed'
+// additionally push a VERIFY_SKIPS entry (issue #166 PR #177 review) -- every
+// other outcome is either nothing-to-verify or a clean/expected result, but
+// these two mean this run's self-validation either proved nothing
+// ('read-failed') or found evidence of a lost/corrupted write ('mismatch'),
+// which belongs in the batch PR's Verification Gaps section, the human's only
+// window into what this run couldn't verify.
 //   - 'no-intent'   -- this run never recorded a successful gate-state post
 //                      for this issue AND never recorded a failed one either
 //                      (gate_state_intent and gate_state_post_failed both
@@ -5002,15 +5071,18 @@ async function postGateState(ctx, boundary) {
 //                      run sitting where the intent snapshot was taken from
 //                      (e.g. a later pr-review iteration posted after an
 //                      earlier iteration's intent was captured) -- expected,
-//                      not alarming, so a concurrent unclaimed run's later
-//                      post (or this run's own later boundary) is never
-//                      reported as corruption.
+//                      not alarming, so this run's own later boundary is
+//                      never reported as corruption. A DIFFERENT run's write
+//                      (concurrent or otherwise) is never 'superseded' --
+//                      diffGateStateIntent requires `intent.run === actual.run`
+//                      before it even looks at ordering, so that case always
+//                      falls through to 'mismatch' below.
 //   - 'mismatch'    -- anything else diffGateStateIntent returns: a
 //                      different run's write, an earlier write, no
 //                      gate-state block found at all despite a recorded
 //                      successful post, or same-run content that disagrees
-//                      without a later epoch to explain it. Real corruption
-//                      or a lost write.
+//                      without a later write_seq to explain it. Real
+//                      corruption or a lost write.
 async function verifyGateState(results) {
   const list = Array.isArray(results) ? results : []
   const toVerify = list.filter(function (r) { return r && r.gate_state_intent })
@@ -5063,6 +5135,9 @@ async function verifyGateState(results) {
       }
     }
     log('gate-state-verify #' + r.issue + ': ' + outcome)
+    if (outcome === 'mismatch' || outcome === 'read-failed') {
+      VERIFY_SKIPS.push('#' + r.issue + ': gate-state self-validation reported ' + outcome + ' -- this run\'s durable gate-state record for this issue could not be confirmed to have round-tripped through GitHub as intended (non-fatal, no consumer relies on it yet, but resume continuity for a future consumer is unverified)')
+    }
   }
 }
 
