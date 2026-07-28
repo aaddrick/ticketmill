@@ -68,7 +68,7 @@ to ship.
 | `invocation-and-guardrails.md` | Invocation, the sandbox lint, and the engine-owned path guardrail. |
 | `branching-and-merge.md` | The batch-branch model, release stage, and merge auto-resolve. |
 | `metrics.md` | Friction and churn, rework tax, gate yield, and outcome grading. |
-| `gate-hygiene.md` | Typed review findings, engine-assigned ids, the three loop predicates, and gate-outcome tallying (the quality gate's disposition map, its cap, the pooled friction denominator, and its supersession of `metrics.md:13-14` and `:114`). Authored text, added after the split; not tracked in the provenance fixture, the same as the `AGENTS.md`/`CLAUDE.md` row below. |
+| `gate-hygiene.md` | Typed review findings, engine-assigned ids, the three loop predicates, gate-outcome tallying (the quality gate's disposition map, its cap, the pooled friction denominator, and its supersession of `metrics.md:13-14` and `:114`), and the durable per-issue "## Gate State" comment (write boundaries, the four-state read contract, and the trust model). Authored text, added after the split; not tracked in the provenance fixture, the same as the `AGENTS.md`/`CLAUDE.md` row below. |
 | `failure-semantics.md` | How the run fails, halts, and resumes (two segments, emitted out of source order: the short bullet list first, the incident-derived-machinery table second). |
 | `cost-and-tokens.md` | Token tracking, cost estimation, and the token_budget guard. |
 | `scheduling.md` | Claims interop, the consolidation gate, and lane scheduling. |
