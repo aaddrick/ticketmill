@@ -1887,6 +1887,15 @@ const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> l
   'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
   'or recall a SHA from memory.'
 
+// ----- fixes_applied id-prefix ask (issue #162): shared by every fix stage fed
+// through findingsBlock() (quality-fix, test-quality-fix, pr-fix) so a human
+// skimming fixes_applied can map each entry straight back to the id-prefixed
+// finding line it resolved. `example` is a static illustrative id, not a live
+// value — each call site supplies one representative of its own id shape. -----
+function fixesAppliedIdAsk(example) {
+  return 'Prefix each fixes_applied entry with the id of the finding it resolves (e.g. "' + example + '").'
+}
+
 // ----- preflight step 5 (predicted_files lane-scheduling hint) (issue #113) -----
 // A PURE FUNCTION of (ROOT, TARGET), NOT a plain string: it is invoked at the
 // preflight call site (below the TICKETMILL-TEST-HARNESS-SPLIT marker) with the
@@ -3084,8 +3093,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       '',
       'After committing, post an issue comment "## Quality Fix (' + stepLabel + ', iteration ' + iter + ')" with the',
       'commit SHA and the fixes applied in 2-4 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
-      'Prefix each fixes_applied entry with the id of the finding it resolves (e.g. "[quality-task-1-i1-2] tightened',
-      'the null guard").',
+      fixesAppliedIdAsk('[quality-task-1-i1-2] tightened the null guard'),
       COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
@@ -3614,8 +3622,7 @@ async function runTestLoop(ctx, forced) {
       fixContext(ctx, null),
       'After committing, post an issue comment "## Test Quality Fix (iteration ' + iter + ')" with the commit SHA and',
       'what was added/strengthened (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
-      'Prefix each fixes_applied entry with the id of the finding it resolves (e.g. "[test-i1-2] added a missing',
-      'edge-case test").',
+      fixesAppliedIdAsk('[test-i1-2] added a missing edge-case test'),
       COMMIT_SHA_ASK,
       HANDOFF_ASK,
       'Add missing assertions, remove TODOs, add edge-case tests, etc. Commit. Return status, commit, files_changed, fixes_applied, summary.',
@@ -4852,8 +4859,7 @@ async function reviewAndMerge(ctx) {
       fixContext(ctx, null),
       'After pushing, post a PR comment "## PR Review Fix (iteration ' + iter + ')" with the commit SHA and the fixes',
       'applied in 2-4 lines (gh pr comment ' + ctx.pr + ' --repo ' + REPO + ').',
-      'Prefix each fixes_applied entry with the id of the finding it resolves (e.g. "[code-i1-2] tightened the null',
-      'guard").',
+      fixesAppliedIdAsk('[code-i1-2] tightened the null guard'),
       COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
