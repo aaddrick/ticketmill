@@ -318,6 +318,12 @@ const MAX_TOUCH_FILES = 100
 // comment already sets for gating efficiency metrics; not a correctness input,
 // only a display/trust-flag threshold.
 const MAX_RECONCILE_ERROR_FOR_TRUST = 0.05
+// gate-state read (issue #166 task 3): fetchGateStateBlocks issues ONE agent
+// call per chunk of at most this many issues (belt-and-braces — a dead chunk's
+// agent call only takes its own chunk's issues down with it; surviving chunks
+// still report). Not a correctness input: the per-issue jq command inside a
+// chunk is fully independent of every other issue in it.
+const MAX_GATE_STATE_PROBE_CHUNK = 5
 // churn analytics (issue #89): a file appearing in >= this many DISTINCT
 // issues' ctx.changed_files within one run is a cross-issue hotspot (computeChurn) —
 // 2 is the smallest number that actually means "more than one issue collided on
@@ -1336,23 +1342,48 @@ function diffGateStateIntent(intent, actual) {
   return 'mismatch'
 }
 
-// attachGateStateBlocks: per-preflight normalizer mirroring
+// attachGateStateBlocks: per-preflight normalizer AND real-data join, mirroring
 // attachEngineOwnedIntentional's shape (:3023) -- guarantees every preflight
 // carries all four gate-state PREFLIGHT_SCHEMA fields (gate_state_blocks,
 // gate_state_read_ok, gate_state_total_comments, gate_state_trust)
-// UNCONDITIONALLY, defaulted to their fail-open value, so a probe-died
-// fallback preflight entry (the agent never returned these optional fields at
-// all) flows through the Select-time selectGateState() call identically to a
-// fully-populated one -- no downstream reader ever has to defensively check
-// for a missing key. Pure and side-effect-free, like its model: returns a NEW
-// array, never mutates `preflights`.
-function attachGateStateBlocks(preflights) {
+// UNCONDITIONALLY. Pure and side-effect-free: returns a NEW array, never
+// mutates `preflights` or `rowsByIssue`.
+//
+// `rowsByIssue` (optional; keyed by issue NUMBER) carries fetchGateStateBlocks'
+// RAW per-issue probe rows -- {raw, exit_ok} straight off GATE_STATE_PROBE_SCHEMA,
+// UNPARSED -- this function is what runs parseGateStateProbeRow, so a truncated
+// or non-JSON `raw` string handed in here surfaces as gate_state_read_ok:false,
+// never as an empty-but-successful read. `selfLogin` is the reduced
+// self_login string (see fetchGateStateBlocks below the split) stored verbatim
+// as gate_state_trust -- a FUTURE consumer's selectGateState call uses it as
+// evidence.self_login; this function itself never decides trust or state.
+//
+// Every preflight's four fields are ALWAYS computed fresh from `rowsByIssue`/
+// `selfLogin` -- NEVER read back off the preflight object's own pre-existing
+// values, even when `rowsByIssue` has no entry for that issue. This is
+// deliberate: these four fields are read-only FACTS this run's own probe
+// resolved, never something an upstream agent (e.g. the preflight probe,
+// which happens to share PREFLIGHT_SCHEMA) gets to assert on its own — a
+// hallucinated gate_state_blocks arriving on `p` from anywhere else is always
+// clobbered to the real (or fail-open default) value, exactly like
+// attachEngineOwnedIntentional never trusts an agent-supplied regime.
+function attachGateStateBlocks(preflights, rowsByIssue, selfLogin) {
+  const byIssue = rowsByIssue || {}
+  const trust = typeof selfLogin === 'string' ? selfLogin : ''
   return (preflights || []).map(function (p) {
+    const row = Object.prototype.hasOwnProperty.call(byIssue, p.issue) ? byIssue[p.issue] : null
+    if (!row) {
+      return Object.assign({}, p, {
+        gate_state_blocks: [], gate_state_read_ok: false, gate_state_total_comments: 0, gate_state_trust: trust,
+      })
+    }
+    const parsed = parseGateStateProbeRow(row.raw)
+    const readOk = row.exit_ok === true && parsed.ok === true
     return Object.assign({}, p, {
-      gate_state_blocks: Array.isArray(p.gate_state_blocks) ? p.gate_state_blocks : [],
-      gate_state_read_ok: p.gate_state_read_ok === true,
-      gate_state_total_comments: Number.isInteger(p.gate_state_total_comments) ? p.gate_state_total_comments : 0,
-      gate_state_trust: typeof p.gate_state_trust === 'string' ? p.gate_state_trust : '',
+      gate_state_blocks: readOk ? parsed.blocks.map(function (b) { return b.body }) : [],
+      gate_state_read_ok: readOk,
+      gate_state_total_comments: readOk ? parsed.total : 0,
+      gate_state_trust: trust,
     })
   })
 }
@@ -4452,6 +4483,118 @@ async function fetchConsolidationMarkers(issueNumbers) {
     'one exists on an issue, the MOST RECENT). Omit issues with none entirely.',
   ].join('\n'), stageOpts('probe'), CONSOLIDATION_MARKER_PROBE_SCHEMA)
   return (r && r.markers) || []
+}
+
+// fetchGateStateBlocks: READ-ONLY (safe under DRY_RUN) — the whole-set gate-
+// state read, shaped like fetchConsolidationMarkers just above it, but the
+// READ IDIOM is deliberately NOT that one: fetchConsolidationMarkers hands the
+// agent a bare `gh issue view --json comments` and trusts its own judgment to
+// pick the right comment, which lets a truncated response get silently
+// misread as "no marker". Gate state instead pins the claim probe's
+// deterministic idiom (the per-issue `gh issue view ... --jq '{total, blocks}'`
+// a few thousand lines below, in the claims loop) verbatim, one command per
+// issue: jq computes the EXACT return shape, so a short/truncated read is a
+// JSON.parse failure (parseGateStateProbeRow), never a fake "zero blocks".
+// The agent's ONLY job per issue is relaying that command's stdout — it never
+// parses or judges it.
+//
+// Chunked at MAX_GATE_STATE_PROBE_CHUNK issues per agent call — belt-and-
+// braces, not a truncation defense (the jq pin already makes a truncated READ
+// structurally impossible to misread): a chunk whose agent call dies (throws,
+// budget-exhausted, or returns a malformed response) marks ONLY its own
+// chunk's issues read-failed via synthesized {raw: '', exit_ok: false} stub
+// rows — surviving chunks still report normally, rather than one dead call
+// taking the whole candidate set down with it.
+//
+// self_login reduction: each chunk independently runs `gh api user --jq
+// .login` (a single-object endpoint, so the file's "never a bare gh api"
+// pagination rule does not apply) since chunks run in parallel and none of
+// them can see another's result. The FIRST chunk (in `chunks` order) that
+// reports a non-empty login wins — every chunk is hitting the SAME
+// authenticated identity, so this is a redundant-computation reduction, not a
+// disagreement to arbitrate; an empty string means no chunk could resolve it
+// (an installation token, or every chunk died), which isTrustedGateStateAuthor
+// treats as "primary trust unavailable, fall through to claim_authors".
+//
+// `priorWorkByIssue` ({issue: {pr_number, worktree_exists, resume_point}}) is
+// NEVER sent to the agent (it stays a pure verbatim relay) — it feeds ONLY
+// the per-issue log line below, via selectGateState's falsifiable-absent rule,
+// so "zero gate-state comments but a PR is already open" logs as the
+// DISTINCT, greppable suspicious case rather than a bare "absent" that could
+// hide a real read problem.
+//
+// Returns { rowsByIssue, self_login } — rowsByIssue is RAW ({issue: {raw,
+// exit_ok}}), unparsed on purpose: attachGateStateBlocks (above the split) is
+// what runs parseGateStateProbeRow, so this function's own contract stays a
+// thin, mirror-of-fetchConsolidationMarkers relay with no decision logic of
+// its own beyond the per-issue log line (which is diagnostic output, not a
+// decision fed back into the run).
+async function fetchGateStateBlocks(issueNumbers, priorWorkByIssue) {
+  const list = Array.isArray(issueNumbers) ? issueNumbers.slice() : []
+  if (!list.length) return { rowsByIssue: {}, self_login: '' }
+  const pwByIssue = priorWorkByIssue || {}
+  const chunks = []
+  for (let i = 0; i < list.length; i += MAX_GATE_STATE_PROBE_CHUNK) chunks.push(list.slice(i, i + MAX_GATE_STATE_PROBE_CHUNK))
+
+  const chunkResults = await Promise.all(chunks.map(function (chunk, ci) {
+    return agent([
+      'READ-ONLY (safe under any run mode, including a dry run). For EACH issue number listed below, run this EXACT',
+      'command, substituting only <n> for that issue\'s number — do not alter the jq filter in any way:',
+      'gh issue view <n> --repo ' + REPO + ' --json comments --jq \'{total: (.comments|length), blocks: [.comments[] | select(.body | startswith("' + GATE_STATE_TITLE + '")) | {body, author_login: .author.login, author_association: .authorAssociation}] | .[-3:]}\'',
+      'Issues in this call: ' + chunk.join(', '),
+      'Relay each command\'s stdout VERBATIM as `raw` — never parse, reformat, summarize, or judge it. `exit_ok` is',
+      'whether that gh command exited 0 for that issue (false on any non-zero exit, including a repo/issue lookup',
+      'failure).',
+      '',
+      'Also run ONCE for this whole call (not per issue): gh api user --jq .login',
+      'Return self_login = that command\'s trimmed stdout, or "" if the command fails or returns nothing (this',
+      'happens for installation tokens — expected, not an error).',
+      '',
+      'Return rows: [{issue, raw, exit_ok}] — exactly one entry per issue listed above, even one whose gh command',
+      'failed.',
+    ].join('\n'), { label: 'gate-state-probe-c' + ci, phase: 'Select', schema: GATE_STATE_PROBE_SCHEMA, model: M.probe.model, effort: M.probe.effort })
+      .catch(function () { return null })
+      .then(function (r) {
+        if (r && Array.isArray(r.rows)) return { self_login: typeof r.self_login === 'string' ? r.self_login : '', rows: r.rows }
+        // dead chunk — belt-and-braces: mark ONLY this chunk's issues read-failed via
+        // explicit stub rows, never silently drop them (a dropped issue would look
+        // identical to one this function was never asked about at all).
+        return { self_login: '', rows: chunk.map(function (n) { return { issue: n, raw: '', exit_ok: false } }) }
+      })
+  }))
+
+  const rowsByIssue = {}
+  let selfLogin = ''
+  for (const cr of chunkResults) {
+    if (!selfLogin && cr.self_login && cr.self_login.trim()) selfLogin = cr.self_login.trim()
+    for (const row of (cr.rows || [])) rowsByIssue[row.issue] = { raw: typeof row.raw === 'string' ? row.raw : '', exit_ok: row.exit_ok === true }
+  }
+
+  // Per-issue diagnostic log, using the SAME pure selectGateState decision a
+  // future consumer would reach — this run just prints it rather than acting
+  // on it (substrate only, no consumer yet). run_epoch is not yet assigned at
+  // this Select-phase call site (see the RUN_EPOCH assignment below, which
+  // needs outcomeGradeR/revisitRiskR already awaited) — the `state` value
+  // never depends on it (only the auxiliary `stale` flag does), so passing the
+  // module-level RUN_EPOCH here (null on a fresh run) is correct, not stale.
+  for (const n of list) {
+    const row = rowsByIssue[n]
+    const parsed = row ? parseGateStateProbeRow(row.raw) : { ok: false, total: 0, blocks: [] }
+    const rowsArg = row ? Object.assign({ exit_ok: row.exit_ok }, parsed) : {}
+    const pw = pwByIssue[n] || {}
+    const sel = selectGateState(rowsArg, { repo: REPO, issue: n, self_login: selfLogin, claim_authors: [], batch: TARGET, run_epoch: RUN_EPOCH }, pw)
+    const hasPriorWork = !!((pw.pr_number !== null && pw.pr_number !== undefined) || pw.worktree_exists === true || (pw.resume_point != null && pw.resume_point !== 'implement'))
+    if (sel.state === 'read-failed' && parsed.blocks.length === 0 && hasPriorWork) {
+      const why = pw.pr_number != null ? ('PR #' + pw.pr_number + ' open')
+        : pw.worktree_exists ? 'worktree exists'
+        : ('resume_point=' + pw.resume_point)
+      log('gate-state #' + n + ': absent (unexpected: ' + why + ')')
+    } else {
+      log('gate-state #' + n + ': ' + sel.state + (sel.state === 'found' && !sel.trusted ? ' (untrusted author)' : ''))
+    }
+  }
+
+  return { rowsByIssue: rowsByIssue, self_login: selfLogin }
 }
 
 // challengeConsolidationGroup: the capped contrarian loop for ONE proposed group.
@@ -7758,6 +7901,20 @@ let preflights = (await Promise.all(issueList.map(function (it) {
 // deriveUnits()'s OR-fold for how it threads onto a consolidation-group unit.
 preflights = attachEngineOwnedIntentional(preflights, ENGINE_OWNED)
 
+// ---- Select: gate-state read (issue #166 task 3) — READ-ONLY, safe under
+// DRY_RUN (this whole block runs before the DRY_RUN early-return below), and
+// placed right after the regime classifier it sits beside in PREFLIGHT_SCHEMA.
+// priorWork is each preflight's OWN already-resolved pr_number/worktree_exists/
+// resume_point — passing it lets fetchGateStateBlocks' falsifiable-absent log
+// line be evidence-driven rather than model-attested. See fetchGateStateBlocks'
+// module comment (below the split) for the full design; attachGateStateBlocks
+// (above the split) guarantees every preflight — even one a dead chunk never
+// covered — comes out carrying all four gate-state fields, fail-open defaulted.
+const gateStatePriorWork = {}
+for (const p of preflights) gateStatePriorWork[p.issue] = { pr_number: p.pr_number, worktree_exists: p.worktree_exists, resume_point: p.resume_point }
+const gateStateProbe = await fetchGateStateBlocks(preflights.map(function (p) { return p.issue }), gateStatePriorWork)
+preflights = attachGateStateBlocks(preflights, gateStateProbe.rowsByIssue, gateStateProbe.self_login)
+
 for (const p of preflights) log('#' + p.issue + ' preflight: ' + p.resume_point + ' — ' + p.reason)
 
 // ---- Select: engine-owned root-dirty skip — regime (a) of the three-regime
@@ -7774,6 +7931,19 @@ if (engineSkip.flagged.length) log('engine-owned guardrail: root working tree di
 const learnR = await learnPromise
 const outcomeGradeR = await outcomeGradePromise
 const revisitRiskR = await revisitRiskPromise
+// RUN_EPOCH (issue #166 task 3): derived here because both outcomeGradeR.now
+// and revisitRiskR.now are already awaited above, and each already carries a
+// `date -u +%Y-%m-%dT%H:%M:%SZ` wall-clock anchor from the exact same idiom
+// (OUTCOMES_SCHEMA / REVISIT_RISK_SCHEMA's own step 0 — the sandbox has no
+// Date.now()/argless `new Date()`) — no extra agent call needed. Prefer
+// outcomeGradeR's since it fires first in program order; fall back to
+// revisitRiskR's so a dead outcome-grading pass alone doesn't leave the whole
+// run epoch-less. Logged loudly when both are unavailable/unparseable: every
+// gate-state comparison this run then treats age as unknown, which
+// gateStateEpochStale resolves toward stale, never toward silently trusting
+// an old block.
+RUN_EPOCH = deriveRunEpoch((outcomeGradeR && outcomeGradeR.now) || (revisitRiskR && revisitRiskR.now))
+if (RUN_EPOCH === null) log('gate-state: RUN_EPOCH is null — outcome-grading and revisit-risk both failed to supply a wall-clock reading this run; every gate-state block will read as unknown-age/stale')
 addStage('preflight', preflightR1Before) // STAGE_TOKENS.preflight R1 close — see the bracket comment above learnPromise
 if (learnR && learnR.found) {
   LEARN = learnR

@@ -1,11 +1,12 @@
 'use strict'
 
 // Unit tests for the durable per-issue gate-state substrate (issue #166,
-// task 1): the pure build/parse/select/trust/epoch/diff/attach layer above
-// the TICKETMILL-TEST-HARNESS-SPLIT marker. Substrate only -- nothing here
-// exercises a WRITE (postGateState, task 2) or the Select-time wiring
-// (fetchGateStateBlocks / RUN_EPOCH assignment, task 3); this file proves the
-// plumbing those tasks will drive is correct in isolation.
+// task 1): the pure build/parse/select/trust/epoch/diff layer above the
+// TICKETMILL-TEST-HARNESS-SPLIT marker. Substrate only -- nothing here
+// exercises a WRITE (postGateState, task 2). attachGateStateBlocks' real-data
+// join and its interaction with fetchGateStateBlocks (task 3's Select-time
+// wiring) are covered separately in tests/gate-state-read.test.js; only its
+// bare defaulting shape (no join data at all) is proven here.
 //
 // Covers: build/parse round trip (incl. apostrophe/newline-bearing free
 // text), every parseGateStateComment rejection path (malformed JSON,
@@ -434,18 +435,23 @@ test('diffGateStateIntent: all three verdicts -- match, superseded, mismatch', f
   assert.strictEqual(context.diffGateStateIntent(intent, null), 'mismatch')
 })
 
-// ---- attachGateStateBlocks ----
+// ---- attachGateStateBlocks (bare defaulting shape only -- see
+// tests/gate-state-read.test.js for the real rowsByIssue join, the
+// hallucination-clobbering behavior, and fetchGateStateBlocks itself) ----
 
-test('attachGateStateBlocks: writes all four gate-state fields unconditionally, defaulted, without mutating the input', function () {
+test('attachGateStateBlocks: with no join data at all, writes all four gate-state fields unconditionally to their fail-open defaults, without mutating the input', function () {
   const context = harness.boot()
   const preflights = [
     { issue: 1 },
+    // even a preflight that already carries these fields (e.g. a hallucinating
+    // agent) gets them fully overridden -- these four facts are NEVER read back
+    // off the preflight's own pre-existing value, only from real join data.
     { issue: 2, gate_state_blocks: ['x'], gate_state_read_ok: true, gate_state_total_comments: 5, gate_state_trust: 'primary' },
   ]
   const attached = harness.normalize(context.attachGateStateBlocks(preflights))
 
   assert.deepStrictEqual(attached[0], { issue: 1, gate_state_blocks: [], gate_state_read_ok: false, gate_state_total_comments: 0, gate_state_trust: '' })
-  assert.deepStrictEqual(attached[1], { issue: 2, gate_state_blocks: ['x'], gate_state_read_ok: true, gate_state_total_comments: 5, gate_state_trust: 'primary' })
+  assert.deepStrictEqual(attached[1], { issue: 2, gate_state_blocks: [], gate_state_read_ok: false, gate_state_total_comments: 0, gate_state_trust: '' })
   // non-mutating: the original host-realm objects never gained the new keys
   assert.strictEqual(Object.prototype.hasOwnProperty.call(preflights[0], 'gate_state_blocks'), false)
 })
