@@ -2566,12 +2566,15 @@ const FRICTION_TOP_N = 5
 //
 // Each of the seven capped pipeline stages (approach/plan/task-review/quality/
 // test/browser/pr-review) contributes a normalized min(1, iters/cap) ratio —
-// running below a cap is normal, not friction. Six of the seven stages run
-// at most once per issue, so their denominator is that single loop's cap;
-// quality alone can run once per task plus once per PR-fix round, so its
-// denominator is the cap POOLED across those invocations (cap * quality_scopes,
-// via multiScopeField below) rather than one loop's cap against a multi-loop
-// numerator. Caps are read LIVE off module scope inside the function body (MAX_CONTRARIAN_
+// running below a cap is normal, not friction. Four of the seven stages
+// (approach/plan/test/pr-review) run at most once per issue, so their
+// denominator is that single loop's cap; quality is the one whose pooled
+// denominator is implemented here (cap * quality_scopes, via multiScopeField
+// below) rather than one loop's cap against a multi-loop numerator.
+// task-review and browser are multi-scope aggregates too and not yet counted
+// this way (see multiScopeField below).
+//
+// Caps are read LIVE off module scope inside the function body (MAX_CONTRARIAN_
 // ITERATIONS et al — the same idiom aggregateTokens uses reading STAGE_LABELS),
 // never captured once at module load, so a __seed()-overridden cap in tests
 // changes the ratio it computes, not a stale snapshot.
@@ -2614,9 +2617,9 @@ function computeFriction(results) {
   // how many scopes/invocations contributed to that aggregate, so the ratio
   // below pools the cap (cap * scopes) instead of comparing the aggregate to
   // one loop's cap. task_review_attempts and browser_iters are two more
-  // multi-scope aggregates (per-task task review, per-iteration browser
-  // checks) not yet counted this way — this map is the extension point for
-  // adding them once their own scope counters exist.
+  // multi-scope aggregates (per-task task review, per-phase browser checks —
+  // implement and pre-merge) not yet counted this way — this map is the
+  // extension point for adding them once their own scope counters exist.
   const multiScopeField = { quality: 'quality_scopes' }
   const stageKeys = Object.keys(caps)
 
