@@ -220,3 +220,152 @@ test('runTestLoop: an existing issues: ["x"] fixture still runs test-quality-fix
   assert.ok(fixCall, 'test-quality-fix stage must have run for an issues: ["x"] fixture')
   assert.ok(/- \[test-i1-1\] \[unspecified\] x -> /.test(fixCall.prompt), 'fix prompt must render the id-prefixed finding line: ' + fixCall.prompt.slice(0, 2000))
 })
+
+// ---- issue #167: the finding-hypothesis framing, the rebuttal-only exit at
+// the evaluator-fed test-quality-fix stage, and byte-identity proof that the
+// ORACLE-fed test-fix stage (ground truth, not a hypothesis) never reads
+// `rebutted` at all ----
+
+test('runTestLoop: FINDING_HYPOTHESIS_ASK renders in the test-quality-fix prompt when the validator named structured findings', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {}, TEST_CMD: 'npm test' })
+
+  let validateCalls = 0
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':test-run-') !== -1) return { result: 'passed', summary: 'all green', total_tests: 3, passed_tests: 3, failed_tests: 0, failures: [] }
+    if (label.indexOf(':test-validate-') !== -1) {
+      validateCalls++
+      if (validateCalls === 1) return { result: 'changes_requested', comments: 'hollow assertion', issues: ['x'], summary: 'needs work' }
+      return { result: 'approved', comments: '', issues: [], summary: 'covered now' }
+    }
+    if (label.indexOf(':test-quality-fix-') !== -1) return { status: 'success', summary: 'strengthened tests', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 76 })
+  const result = await context.runTestLoop(ctx)
+
+  assert.strictEqual(result.ok, true)
+  const fixCall = scriptedAgent.calls.find(function (c) { return ((c.opts && c.opts.label) || '').indexOf(':test-quality-fix-') !== -1 })
+  assert.ok(fixCall, 'test-quality-fix stage must have run')
+  assert.ok(fixCall.prompt.includes('HYPOTHESIS the reviewer formed'), 'test-quality-fix prompt must render FINDING_HYPOTHESIS_ASK when findings are structured: ' + fixCall.prompt.slice(0, 2000))
+})
+
+test('runTestLoop: FINDING_HYPOTHESIS_ASK does NOT render in the test-quality-fix prompt when `issues` is omitted entirely (prose-fallback path stays byte-identical)', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {}, TEST_CMD: 'npm test' })
+
+  let validateCalls = 0
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':test-run-') !== -1) return { result: 'passed', summary: 'all green', total_tests: 3, passed_tests: 3, failed_tests: 0, failures: [] }
+    if (label.indexOf(':test-validate-') !== -1) {
+      validateCalls++
+      if (validateCalls === 1) return { result: 'changes_requested', comments: 'hollow assertion', summary: 'needs work' }
+      return { result: 'approved', comments: '', issues: [], summary: 'covered now' }
+    }
+    if (label.indexOf(':test-quality-fix-') !== -1) return { status: 'success', summary: 'strengthened tests', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 77 })
+  const result = await context.runTestLoop(ctx)
+
+  assert.strictEqual(result.ok, true)
+  const fixCall = scriptedAgent.calls.find(function (c) { return ((c.opts && c.opts.label) || '').indexOf(':test-quality-fix-') !== -1 })
+  assert.ok(fixCall, 'test-quality-fix stage must have run')
+  assert.ok(!fixCall.prompt.includes('HYPOTHESIS the reviewer formed'), 'test-quality-fix prompt must NOT render FINDING_HYPOTHESIS_ASK on the prose-fallback path: ' + fixCall.prompt.slice(0, 2000))
+})
+
+test('runTestLoop: the test-fix prompt (oracle-fed — a failing test is ground truth, not a hypothesis) does NOT contain FINDING_HYPOTHESIS_ASK and still carries its own anti-rebuttal guard verbatim', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {}, TEST_CMD: 'npm test' })
+
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':test-run-') !== -1) return { result: 'failed', summary: 'failing on purpose', total_tests: 1, passed_tests: 0, failed_tests: 1, failures: [{ test: 'x', message: 'always fails' }] }
+    if (label.indexOf(':test-fix-') !== -1) return { status: 'success', summary: 'attempted a fix', commit: 'deadbeef', files_changed: ['tests/foo.test.js'] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 78 })
+  await context.runTestLoop(ctx)
+
+  const fixCall = scriptedAgent.calls.find(function (c) { return ((c.opts && c.opts.label) || '').indexOf(':test-fix-') !== -1 })
+  assert.ok(fixCall, 'test-fix stage must have run')
+  assert.ok(!fixCall.prompt.includes('HYPOTHESIS the reviewer formed'), 'test-fix prompt must never carry FINDING_HYPOTHESIS_ASK — a failing test is ground truth: ' + fixCall.prompt.slice(0, 2000))
+  assert.ok(fixCall.prompt.includes('Fix the real defect — do NOT delete or weaken assertions just to make the failure disappear.'), 'test-fix prompt must still carry its own anti-rebuttal guard verbatim: ' + fixCall.prompt.slice(0, 2000))
+})
+
+test('runTestLoop: a test-quality-fix that rebuts every finding and applies none exits the loop with ok:true (never ok:false), a contested entry, a decision, a VERIFY_SKIPS line, and the rebuttal counter', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {}, TEST_CMD: 'npm test' })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':test-run-') !== -1) return { result: 'passed', summary: 'all green', total_tests: 3, passed_tests: 3, failed_tests: 0, failures: [] }
+    if (label.indexOf(':test-validate-') !== -1) return { result: 'changes_requested', comments: '', issues: [{ severity: 'minor', summary: 'hollow assertion' }], summary: 'needs work' }
+    if (label.indexOf(':test-quality-fix-') !== -1) {
+      return {
+        status: 'success', summary: 'disagree', commit: null, files_changed: [], fixes_applied: [],
+        rebutted: [{ finding_id: 'test-i1-1', evidence: 'ran it — assertion already covers the edge case' }],
+      }
+    }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 79 })
+  const result = await context.runTestLoop(ctx)
+
+  // Never { ok: false } — a rebuttal-only round here must not be able to
+  // route through the 'test-loop' merge-block stage key. It ends this loop's
+  // OWN iteration cleanly, same as the empty-findings exit above.
+  assert.strictEqual(result.ok, true)
+  assert.strictEqual(result.error, undefined)
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 1)
+  assert.strictEqual(ctx.metrics.test_quality_fix_rounds, 0)
+
+  assert.strictEqual(ctx.contested.length, 1)
+  assert.strictEqual(ctx.contested[0].id, 'test-i1-1')
+  assert.strictEqual(ctx.contested[0].summary, 'hollow assertion')
+  assert.ok(ctx.contested[0].evidence.includes('assertion already covers'))
+
+  assert.ok(ctx.decisions.some(function (d) { return d.entry.includes('Gate: findings contested, none applied') }), 'expected a pushDecision entry for the contested-only round: ' + JSON.stringify(ctx.decisions))
+
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 1)
+  assert.ok(verifySkips[0].includes('#79'), 'expected the line to name this issue: ' + verifySkips[0])
+})
+
+test('runTestLoop: a test-fix response carrying `rebutted` with empty fixes_applied/files_changed drives the loop exactly as today — the field is unread at the ORACLE-fed test-fix stage', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: {}, TEST_CMD: 'npm test' })
+
+  let runCalls = 0
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':test-run-') !== -1) {
+      runCalls++
+      if (runCalls === 1) return { result: 'failed', summary: 'failing', total_tests: 1, passed_tests: 0, failed_tests: 1, failures: [{ test: 'x', message: 'always fails' }] }
+      return { result: 'passed', summary: 'all green', total_tests: 1, passed_tests: 1, failed_tests: 0, failures: [] }
+    }
+    if (label.indexOf(':test-fix-') !== -1) {
+      // `rebutted` present with empty fixes_applied/files_changed — the exact
+      // shape that would be rebuttal-only at an EVALUATOR-fed gate. test-fix
+      // has no such gating: the loop must simply `continue` to the next
+      // test-run, same as any other live, non-error fix response.
+      return { status: 'success', summary: 'attempted a fix', commit: null, files_changed: [], fixes_applied: [], rebutted: [{ finding_id: 'x', evidence: 'y' }] }
+    }
+    if (label.indexOf(':test-validate-') !== -1) return { result: 'approved', comments: '', issues: [], summary: 'looks good' }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 80 })
+  const result = await context.runTestLoop(ctx)
+
+  assert.strictEqual(result.ok, true)
+  assert.strictEqual(ctx.metrics.test_iters, 2)
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 0)
+  assert.ok(!ctx.contested || ctx.contested.length === 0, '`rebutted` on a test-fix response must never populate ctx.contested: ' + JSON.stringify(ctx.contested))
+})

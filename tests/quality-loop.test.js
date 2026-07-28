@@ -533,3 +533,284 @@ test('runQualityLoop: a loop that converges to "approved" pushes no VERIFY_SKIPS
   const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
   assert.strictEqual(verifySkips.length, 0)
 })
+
+// ---- issue #167: the finding-hypothesis framing and the rebuttal-only exit ----
+
+test('runQualityLoop: FINDING_HYPOTHESIS_ASK renders in the quality-fix prompt when the reviewer named structured findings', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  let reviewCalls = 0
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      if (reviewCalls === 1) return { result: 'changes_requested', comments: 'fix this', issues: ['x'], recommended_fix_agent: null, summary: 'needs work' }
+      return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 68 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'approved')
+  const fixCall = scriptedAgent.calls.find(function (c) { return ((c.opts && c.opts.label) || '').indexOf(':quality-fix-') !== -1 })
+  assert.ok(fixCall, 'fix stage must have run')
+  assert.ok(fixCall.prompt.includes('HYPOTHESIS the reviewer formed'), 'quality-fix prompt must render FINDING_HYPOTHESIS_ASK when findings are structured: ' + fixCall.prompt.slice(0, 2000))
+})
+
+test('runQualityLoop: FINDING_HYPOTHESIS_ASK does NOT render in the quality-fix prompt when `issues` is omitted entirely (prose-fallback path stays byte-identical)', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  let reviewCalls = 0
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      if (reviewCalls === 1) return { result: 'changes_requested', comments: 'fix this', recommended_fix_agent: null, summary: 'needs work' }
+      return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: [] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 69 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'approved')
+  const fixCall = scriptedAgent.calls.find(function (c) { return ((c.opts && c.opts.label) || '').indexOf(':quality-fix-') !== -1 })
+  assert.ok(fixCall, 'fix stage must have run')
+  assert.ok(!fixCall.prompt.includes('HYPOTHESIS the reviewer formed'), 'quality-fix prompt must NOT render FINDING_HYPOTHESIS_ASK on the prose-fallback path: ' + fixCall.prompt.slice(0, 2000))
+})
+
+test('runQualityLoop: a fix that rebuts every finding and applies none exits the loop as "degraded" with a "carried-unresolved" disposition, a contested entry, a decision, a VERIFY_SKIPS line, and the rebuttal counter — no cap line', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) return { result: 'changes_requested', comments: '', issues: [{ severity: 'major', summary: 'bug' }], recommended_fix_agent: null, summary: 'needs work' }
+    if (label.indexOf(':quality-fix-') !== -1) {
+      return {
+        status: 'success', summary: 'disagree', commit: null, files_changed: [], fixes_applied: [],
+        rebutted: [{ finding_id: 'quality-task-1-i1-1', evidence: 'ran the reproducer, guard already covers this input' }],
+      }
+    }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 70 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'degraded')
+  // rebutted stays a SEPARATE flag from `degraded`: this is a dispute, not an
+  // agent failure, so the rolling degrade window/quality_degrades must be
+  // untouched.
+  assert.strictEqual(ctx.metrics.quality_degrades, 0)
+  assert.strictEqual(ctx.degrades[ctx.degrades.length - 1], false)
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 1)
+  assert.strictEqual(ctx.metrics.quality_iters, 1)
+
+  // recordGateOutcome booked 're-litigated' (iteration 1 of 5) before the fix
+  // ran; the rebuttal-only exit must retype that same bucket to
+  // 'carried-unresolved', not double-book a fresh entry.
+  harness.assertVmEqual(ctx.gate_findings.quality, {
+    count: 1,
+    severity: { critical: 0, major: 1, minor: 0 },
+    disposition: { 'carried-unresolved': 1 },
+  })
+
+  assert.strictEqual(ctx.contested.length, 1)
+  assert.strictEqual(ctx.contested[0].id, 'quality-task-1-i1-1')
+  assert.strictEqual(ctx.contested[0].summary, 'bug')
+  assert.ok(ctx.contested[0].evidence.includes('ran the reproducer'))
+
+  assert.ok(ctx.decisions.some(function (d) { return d.entry.includes('Gate: findings contested, none applied') }), 'expected a pushDecision entry for the contested-only round: ' + JSON.stringify(ctx.decisions))
+
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 1, 'expected exactly one VERIFY_SKIPS line, no separate cap line: ' + JSON.stringify(verifySkips))
+  assert.ok(verifySkips[0].includes('#70'), 'expected the line to name this issue: ' + verifySkips[0])
+  assert.ok(verifySkips[0].includes('task 1'), 'expected the line to name the scope: ' + verifySkips[0])
+  assert.ok(!verifySkips[0].includes('capped at'), 'a rebuttal-only exit must not read as a cap exhaustion: ' + verifySkips[0])
+})
+
+test('runQualityLoop: a round that rebuts one finding but applies a real fix for another proceeds normally — not treated as rebuttal-only', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  let reviewCalls = 0
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      if (reviewCalls === 1) {
+        return {
+          result: 'changes_requested', comments: '', recommended_fix_agent: null, summary: 'needs work',
+          issues: [{ severity: 'major', summary: 'real bug' }, { severity: 'minor', summary: 'not actually a bug' }],
+        }
+      }
+      return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    if (label.indexOf(':quality-fix-') !== -1) {
+      return {
+        // files_changed stays OUTSIDE simplify_globs (src/**) deliberately —
+        // an in-scope touch would flip runSimplify on for iteration 2 and
+        // this scenario's ':simplify-' branch is scripted to throw, to prove
+        // (per the sibling tests above) that simplify never runs on an
+        // out-of-scope change.
+        status: 'success', summary: 'fixed one, rebutted the other', commit: 'deadbeef',
+        files_changed: ['docs/other.md'], fixes_applied: ['[quality-task-1-i1-1] fixed the real bug'],
+        rebutted: [{ finding_id: 'quality-task-1-i1-2', evidence: 'checked — not a bug' }],
+      }
+    }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 71 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'approved')
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 0)
+  assert.strictEqual(ctx.touch_counts['docs/other.md'], 1)
+  assert.ok(!ctx.contested || ctx.contested.length === 0, 'a partial rebuttal must not be recorded as contested: ' + JSON.stringify(ctx.contested))
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 0)
+})
+
+test('runQualityLoop: a fix response that omits `rebutted` entirely behaves exactly as today (no rebuttal-only exit)', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  let reviewCalls = 0
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      if (reviewCalls === 1) return { result: 'changes_requested', comments: '', issues: [{ severity: 'major', summary: 'bug' }], recommended_fix_agent: null, summary: 'needs work' }
+      return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    // `rebutted` deliberately OMITTED — the pre-#167 shape every fixer used.
+    // files_changed stays outside simplify_globs so iteration 2 does not
+    // flip runSimplify on (see the sibling test above for why that matters).
+    if (label.indexOf(':quality-fix-') !== -1) return { status: 'success', summary: 'fixed', commit: 'deadbeef', files_changed: ['docs/other.md'] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 72 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'approved')
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 0)
+  assert.ok(!ctx.contested || ctx.contested.length === 0)
+})
+
+test('runQualityLoop: a rebutted entry with blank evidence is not a rebuttal — normalizeRebuttals drops it, so the round is NOT treated as rebuttal-only', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  let reviewCalls = 0
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      if (reviewCalls === 1) return { result: 'changes_requested', comments: '', issues: [{ severity: 'major', summary: 'bug' }], recommended_fix_agent: null, summary: 'needs work' }
+      return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    if (label.indexOf(':quality-fix-') !== -1) {
+      return {
+        status: 'success', summary: 'claims disagreement but gives no evidence', commit: null, files_changed: [], fixes_applied: [],
+        rebutted: [{ finding_id: 'quality-task-1-i1-1', evidence: '' }],
+      }
+    }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 73 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'approved')
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 0)
+  assert.ok(!ctx.contested || ctx.contested.length === 0)
+})
+
+test('runQualityLoop: `fixes_applied` omitted but `files_changed` non-empty is not a rebuttal-only round', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  let reviewCalls = 0
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) {
+      reviewCalls++
+      if (reviewCalls === 1) return { result: 'changes_requested', comments: '', issues: [{ severity: 'major', summary: 'bug' }], recommended_fix_agent: null, summary: 'needs work' }
+      return { result: 'approved', comments: '', issues: [], recommended_fix_agent: null, summary: 'looks good' }
+    }
+    // `fixes_applied` OMITTED, but files_changed is non-empty — a fixer that
+    // changed code without listing it in fixes_applied is still not a
+    // rebuttal-only round: the (fix.files_changed||[]).length === 0 arm of
+    // the predicate must fail this round.
+    if (label.indexOf(':quality-fix-') !== -1) {
+      return {
+        // files_changed stays outside simplify_globs so iteration 2 does not
+        // flip runSimplify on (see the sibling tests above).
+        status: 'success', summary: 'fixed it, forgot to list it', commit: 'deadbeef', files_changed: ['docs/other.md'],
+        rebutted: [{ finding_id: 'quality-task-1-i1-1', evidence: 'thought this was unrelated' }],
+      }
+    }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 74 })
+  const result = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+
+  assert.strictEqual(result, 'approved')
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 0)
+  assert.ok(!ctx.contested || ctx.contested.length === 0)
+})
+
+test('runQualityLoop: two rebuttal-only scopes on the same ctx (a task, then a PR-fix round) roll up to exactly one VERIFY_SKIPS entry naming both, and the counter reflects both rounds', async function () {
+  const context = harness.boot()
+  context.__seed({ PROFILE: { simplify_globs: ['src/**'] } })
+
+  harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':simplify-') !== -1) throw new Error('simplify must not run: filesChanged has no in-scope files')
+    if (label.indexOf(':quality-review-') !== -1) return { result: 'changes_requested', comments: '', issues: [{ severity: 'major', summary: 'bug' }], recommended_fix_agent: null, summary: 'needs work' }
+    if (label.indexOf(':quality-fix-task-1-') !== -1) {
+      return {
+        status: 'success', summary: 'disagree', commit: null, files_changed: [], fixes_applied: [],
+        rebutted: [{ finding_id: 'quality-task-1-i1-1', evidence: 'checked, no bug here' }],
+      }
+    }
+    if (label.indexOf(':quality-fix-pr-fix-i1-') !== -1) {
+      return {
+        status: 'success', summary: 'disagree', commit: null, files_changed: [], fixes_applied: [],
+        rebutted: [{ finding_id: 'quality-pr-fix-i1-i1-1', evidence: 'checked, no bug here' }],
+      }
+    }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 75 })
+  const firstResult = await context.runQualityLoop(ctx, 'task-1', 'do the thing', ['docs/readme.md'])
+  const secondResult = await context.runQualityLoop(ctx, 'pr-fix-i1', 'fix pr feedback', ['docs/readme.md'])
+
+  assert.strictEqual(firstResult, 'degraded')
+  assert.strictEqual(secondResult, 'degraded')
+  assert.strictEqual(ctx.metrics.rebuttal_only_rounds, 2)
+
+  const verifySkips = harness.readGlobal(context, 'VERIFY_SKIPS')
+  assert.strictEqual(verifySkips.length, 1, 'a second rebuttal-only scope on the same ctx must rewrite the existing entry in place, not append a second one: ' + JSON.stringify(verifySkips))
+  assert.ok(verifySkips[0].includes('task 1'), 'expected the rolled-up entry to still name the first scope: ' + verifySkips[0])
+  assert.ok(verifySkips[0].includes('PR-fix round 1'), 'expected the rolled-up entry to also name the second scope: ' + verifySkips[0])
+})
