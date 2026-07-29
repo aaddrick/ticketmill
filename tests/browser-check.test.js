@@ -140,6 +140,33 @@ test('runBrowserCheck: fails after MAX_BROWSER_ITERATIONS of persistent failures
   assert.strictEqual(ctx.metrics.browser_iters, maxIters)
 })
 
+// ---- issue #167 scope pin: browser-fix is ORACLE-fed (a failing browser
+// scenario is ground truth), not evaluator-fed like quality-fix/test-quality-
+// fix/pr-fix — FINDING_HYPOTHESIS_ASK must never render here, and the
+// existing anti-rebuttal guard it already carries must stay verbatim. ----
+test('runBrowserCheck: the browser-fix prompt does NOT render FINDING_HYPOTHESIS_ASK and keeps its anti-rebuttal guard verbatim', async function () {
+  const context = harness.boot()
+  harness.readGlobal(context, "BROWSER = { ui_globs: ['src/**'] }")
+
+  const scriptedAgent = harness.installScriptedAgent(context, function (prompt, opts) {
+    const label = (opts && opts.label) || ''
+    if (label.indexOf(':ui-probe-') !== -1) return { ui_files: ['src/App.jsx'] }
+    if (label.indexOf(':browser-cleanup-') !== -1) return { posted: true }
+    if (label.indexOf(':browser-fix-') !== -1) return { status: 'success', summary: 'attempted a fix', commit: 'deadbeef', files_changed: ['src/App.jsx'] }
+    if (label.indexOf(':browser-') !== -1) return { result: 'failed', summary: 'still broken', scenarios: [], failures: ['button does nothing'] }
+    throw new Error('unexpected stage label in this scenario: ' + label)
+  })
+
+  const ctx = harness.makeCtx({ issue: 67 })
+  await context.runBrowserCheck(ctx, 'implement')
+
+  const fixCall = scriptedAgent.calls.find(function (c) { return ((c.opts && c.opts.label) || '').indexOf(':browser-fix-') !== -1 })
+  assert.ok(fixCall, 'browser-fix must have run')
+  const prompt = String(fixCall.prompt)
+  assert.ok(!prompt.includes('HYPOTHESIS the reviewer formed'), 'browser-fix is oracle-fed — it must NOT render FINDING_HYPOTHESIS_ASK: ' + prompt.slice(0, 2000))
+  assert.ok(prompt.includes('Fix the real defect — do NOT hide the symptom (e.g. removing the interaction that fails).'), 'browser-fix must still carry its anti-rebuttal guard verbatim: ' + prompt.slice(0, 2000))
+})
+
 test('runBrowserCheck: cleanup still runs, under the lock, when the browser verifier itself dies', async function () {
   const context = harness.boot()
   harness.readGlobal(context, "BROWSER = { ui_globs: ['src/**'] }")

@@ -466,6 +466,17 @@ const FIX_SCHEMA = {
     status: { enum: ['success', 'error'] }, commit: { type: ['string', 'null'] },
     files_changed: { type: 'array', items: { type: 'string' } },
     fixes_applied: { type: 'array', items: { type: 'string' } }, summary: { type: 'string' }, error: { type: ['string', 'null'] },
+    // rebutted (issue #167): a fixer's disagreement with a finding it judged wrong
+    // instead of fixing — mirrors how REVIEW_SCHEMA.issues stays out of
+    // REVIEW_SCHEMA's own required list (:450), so a fixer that never disagrees
+    // (the entire population before this issue) omits the key and produces a
+    // byte-identical response to today. normalizeRebuttals() below is the sole
+    // consumer; `id` is never part of this schema — finding_id must match an id
+    // the engine already assigned via normalizeFindings() and rendered to this
+    // fixer with a bracketed prefix (see FINDING_HYPOTHESIS_ASK).
+    rebutted: { type: 'array', items: { type: 'object', required: ['finding_id', 'evidence'], properties: {
+      finding_id: { type: 'string' }, evidence: { type: 'string' },
+    } } },
     notes_for_downstream: { type: 'array', items: { type: 'string' } },
   },
 }
@@ -1878,6 +1889,29 @@ function settledBlock(ctx) {
   ].join('\n')
 }
 
+// ----- contested-findings ledger (issue #167) -----
+// Renders a fixer's unadjudicated rebuttal back to the NEXT reviewer, the
+// opposite trust contract from settledBlock; nothing ever removes an entry
+// from ctx.contested once pushed, a known gap, not a design decision.
+// Full rationale: docs/architecture/gate-hygiene.md#contestedblock-versus-settledblock-a-deliberate-contract-inversion
+function contestedBlock(ctx) {
+  const contested = (ctx && ctx.contested) || []
+  if (!contested.length) return ''
+  return [
+    '## Contested findings (rebutted by a fixer, NOT adjudicated — verify, do not assume)',
+    contested.slice(-6).map(function (c) {
+      return '- [' + c.gate + '] [' + c.id + '] ' + String(c.summary || '').slice(0, 400) +
+        '\n  Fixer rebuttal: ' + String(c.evidence || '').slice(0, 300)
+    }).join('\n'),
+    'A contested finding is NOT resolved: verify the rebuttal\'s evidence yourself. If it holds, say so and drop',
+    'the finding. If it does not hold, re-raise it as a finding this iteration — do not let it sit contested',
+    'indefinitely with neither outcome.',
+    'A contested finding is NOT "already addressed" — no code changed for it and no one has ruled on it. Whichever',
+    'instruction this prompt carries elsewhere — not to re-flag issues already addressed or accepted, or to stay consistent with',
+    'your own prior reviews — does NOT apply to anything in this block.',
+  ].join('\n')
+}
+
 // ----- handoff notes (agent -> future-agent context, 3-4 stages downstream) -----
 const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotchas that later agents will need ' +
   '(test/env setup, shifted line numbers after deletes, tooling oddities), also return notes_for_downstream ' +
@@ -1887,6 +1921,23 @@ const HANDOFF_ASK = 'If you discovered environment quirks, workarounds, or gotch
 const COMMIT_SHA_ASK = 'Get the exact commit SHA by running: git -C <worktree> log -1 --format=%H — it prints the ' +
   'full 40-character SHA. Paste that literal command output verbatim in the comment. Never type, shorten, guess, ' +
   'or recall a SHA from memory.'
+
+// ----- finding-hypothesis framing (issue #167) -----
+// Wired into exactly the three EVALUATOR-FED fix stages (quality-fix,
+// test-quality-fix, pr-fix) — never the two ORACLE-fed ones (test-fix,
+// browser-fix), whose findings are ground truth, not a judgment call.
+// Full rationale: docs/architecture/gate-hygiene.md#rebuttal-a-finding-is-a-hypothesis-not-a-command-issue-167
+const FINDING_HYPOTHESIS_ASK = [
+  'Each finding above is a HYPOTHESIS the reviewer formed, not a command — verify it against the actual code before acting on it.',
+  'If a finding is wrong, do NOT change code to satisfy it: record it in `rebutted` with the concrete check you ran ' +
+    'that disproves it (a command, a line reference, a test result — not just disagreement).',
+  'List everything you actually fixed in `fixes_applied`; rebut ONLY the findings you did not fix — never rebut a ' +
+    'finding you also changed code for.',
+  'Only a finding rendered above with a bracketed id (e.g. "[code-i1-2]") can be rebutted — anything you see only ' +
+    'as prose must be fixed or addressed in `summary`, not rebutted.',
+  'A round that rebuts every finding and applies no fix never counts as resolving this gate: it is recorded as an ' +
+    'unresolved verification gap for a human to read, and it can never approve this gate on your say-so.',
+].join('\n')
 
 // ----- fixes_applied id-prefix ask (issue #162): shared by every fix stage fed
 // through findingsBlock() (quality-fix, test-quality-fix, pr-fix) so a human
@@ -2034,6 +2085,25 @@ function recordGateOutcome(ctx, gate, findings, disposition) {
   g.disposition[d] = (g.disposition[d] || 0) + 1
 }
 
+// retypeGateDisposition (issue #167): moves exactly ONE count from disposition
+// bucket `from` to bucket `to` within an already-recorded
+// ctx.gate_findings[gate] entry, without touching that gate's `count`/
+// `severity`. from === to is a supported, count-preserving no-op (reachable
+// on a rebuttal-only fix at a loop's final iteration), not an error case.
+// Full rationale: docs/architecture/gate-hygiene.md#the-three-per-gate-exits-and-why-only-pr-review-can-block-a-merge
+function retypeGateDisposition(ctx, gate, from, to) {
+  if (!ctx || !ctx.gate_findings) return
+  const key = String(gate || '').trim()
+  if (!key || !ctx.gate_findings[key]) return
+  const g = ctx.gate_findings[key]
+  const fromKey = String(from || '').trim()
+  const toKey = String(to || '').trim()
+  if (!fromKey || !toKey || !g.disposition[fromKey]) return
+  g.disposition[fromKey]--
+  if (g.disposition[fromKey] <= 0) delete g.disposition[fromKey]
+  g.disposition[toKey] = (g.disposition[toKey] || 0) + 1
+}
+
 // normalizeFindings (issue #162): turns a REVIEW_SCHEMA `issues` array into the
 // engine's structured finding shape, or signals "the reviewer omitted the key
 // entirely" so callers can fall back to today's prose-only path byte-for-byte.
@@ -2063,6 +2133,33 @@ function normalizeFindings(raw, source) {
     }
     return { id: id, severity: 'unspecified', summary: String(entry) }
   })
+}
+
+// normalizeRebuttals (issue #167): turns FIX_SCHEMA's `rebutted` array into a
+// validated list, mirroring normalizeFindings()'s fail-toward-existing-
+// behavior contract just above it: every drop (non-array raw, blank
+// finding_id/evidence, or a finding_id absent from `findings` — the exact
+// array actually rendered to this fixer) fails toward TODAY's behavior, a
+// silently dropped entry, so a fixer can't fabricate a rebuttal against an
+// id it was never shown. The bar enforced here is non-blankness only, not
+// evidence quality — see gate-hygiene.md for that distinction.
+// Full rationale: docs/architecture/gate-hygiene.md#normalizerebuttals-every-drop-fails-toward-todays-behavior
+function normalizeRebuttals(raw, findings) {
+  if (!Array.isArray(raw)) return []
+  const byId = {}
+  for (const f of (Array.isArray(findings) ? findings : [])) {
+    if (f && f.id) byId[f.id] = f
+  }
+  const out = []
+  for (const entry of raw) {
+    const findingId = String((entry && entry.finding_id) || '').trim()
+    const evidence = String((entry && entry.evidence) || '').trim()
+    if (!findingId || !evidence) continue
+    const match = byId[findingId]
+    if (!match) continue
+    out.push({ finding_id: findingId, evidence: evidence, summary: match.summary || '' })
+  }
+  return out
 }
 
 // findingsBlock (issue #162): the single renderer feeding every fix stage
@@ -2866,7 +2963,14 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
   let runSimplify = !Array.isArray(filesChanged) || filesChanged.length === 0 || filesChanged.some(inScope)
   let approved = false
   let degraded = false
-  for (let iter = 1; !approved && !degraded && iter <= MAX_QUALITY_ITERATIONS; iter++) {
+  // rebutted (issue #167): a third, separate loop-exit flag from `degraded` —
+  // a fix that rebuts every finding and applies none is NOT an agent failure
+  // (degraded stays false, so the rolling degrade window/quality_degrades
+  // below are untouched), but it also cannot approve itself, so the loop must
+  // still stop rather than spend its remaining iterations re-litigating a
+  // dispute only a human/reviewer can adjudicate.
+  let rebutted = false
+  for (let iter = 1; !approved && !degraded && !rebutted && iter <= MAX_QUALITY_ITERATIONS; iter++) {
     if (STOP.tripped) return 'halted'
     ctx.metrics.quality_iters++
     if (iter === 1) ctx.metrics.quality_scopes++
@@ -2906,6 +3010,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       '## Decision chain (context from prior stages)',
       decisionChain(ctx),
       settledBlock(ctx),
+      contestedBlock(ctx),
       '',
       'This is a task-level quality check inside the implementation workflow, NOT a full PR review.',
       'Check: code patterns and standards, consistency with codebase conventions, potential bugs, security concerns.',
@@ -2930,7 +3035,8 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       break
     }
 
-    recordGateOutcome(ctx, 'quality', revFindings || [], iter === MAX_QUALITY_ITERATIONS ? 'carried-unresolved' : 're-litigated')
+    const bookedDisposition = iter === MAX_QUALITY_ITERATIONS ? 'carried-unresolved' : 're-litigated'
+    recordGateOutcome(ctx, 'quality', revFindings || [], bookedDisposition)
     const fixAgent = pickFixAgent(rev.recommended_fix_agent, null)
     const fix = await stage(ctx, 'quality-fix-' + prefix + '-i' + iter, [
       implementerBlock(fixAgent),
@@ -2944,6 +3050,7 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
       'After committing, post an issue comment "## Quality Fix (' + stepLabel + ', iteration ' + iter + ')" with the',
       'commit SHA and the fixes applied in 2-4 lines (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
       fixesAppliedIdAsk('[quality-task-1-i1-2] tightened the null guard'),
+      revFindings !== null ? FINDING_HYPOTHESIS_ASK : '',
       COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
@@ -2952,6 +3059,38 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
     if (!fix || fix.status === 'error') { degraded = true; log('#' + ctx.issue + ' quality ' + prefix + ' i' + iter + ': fix degraded'); break }
     collectNotes(ctx, 'quality-fix', fix)
     collectPostedCommit(ctx, 'quality-fix-' + prefix + '-i' + iter, fix)
+
+    // rebuttal-only exit (issue #167): a fix that rebutted every finding and
+    // applied none is a DISPUTE, not a resolution — stops this loop rather
+    // than spending remaining iterations on it.
+    // Full rationale: docs/architecture/gate-hygiene.md#the-three-per-gate-exits-and-why-only-pr-review-can-block-a-merge
+    const normRebuttals = normalizeRebuttals(fix.rebutted, revFindings || [])
+    const rebuttalOnly = normRebuttals.length > 0 && (fix.fixes_applied || []).length === 0 && (fix.files_changed || []).length === 0
+    if (rebuttalOnly) {
+      rebutted = true
+      retypeGateDisposition(ctx, 'quality', bookedDisposition, 'carried-unresolved')
+      if (!ctx.contested) ctx.contested = []
+      for (const r of normRebuttals) {
+        ctx.contested.push({ gate: 'quality-' + prefix, id: r.finding_id, summary: r.summary, evidence: r.evidence })
+      }
+      pushDecision(ctx, 'Gate: findings contested, none applied', 'Quality fix (' + stepLabel + ', iteration ' + iter + ') rebutted every finding and applied no fix — carried as contested, not resolved.')
+      ctx.metrics.rebuttal_only_rounds++
+      // Rolled up to exactly ONE VERIFY_SKIPS line per issue, mirroring the
+      // quality-cap roll-up just below (runQualityLoop runs once per task plus
+      // once per PR-fix round, so without this a chatty issue would print one
+      // line per rebuttal-only round).
+      if (!ctx.quality_rebuttals) ctx.quality_rebuttals = []
+      ctx.quality_rebuttals.push(stepLabel)
+      const rebutMsg = '#' + ctx.issue + ': quality gate rebuttal-only, no fix applied (' + ctx.quality_rebuttals.join(', ') + ') — findings contested, carried for human review'
+      if (typeof ctx.quality_rebuttal_skip_index === 'number' && ctx.quality_rebuttal_skip_index < VERIFY_SKIPS.length) {
+        VERIFY_SKIPS[ctx.quality_rebuttal_skip_index] = rebutMsg
+      } else {
+        ctx.quality_rebuttal_skip_index = VERIFY_SKIPS.length
+        VERIFY_SKIPS.push(rebutMsg)
+      }
+      break
+    }
+
     tallyTouches(ctx, fix.files_changed)
     if (!runSimplify && (fix.files_changed || []).some(inScope)) runSimplify = true
   }
@@ -2974,7 +3113,12 @@ async function runQualityLoop(ctx, prefix, taskDesc, filesChanged) {
   // exit via the degrade-window halt just below, which both callers
   // (reviewAndMerge, the per-task loop) turn into a hard fail() — so this
   // line must not claim anything merged on a capped-then-halted issue.
-  if (!approved && !degraded) {
+  // Gated to !rebutted too (issue #167): a rebuttal-only exit already pushed
+  // its own rolled-up VERIFY_SKIPS line above and broke the loop before
+  // reaching MAX_QUALITY_ITERATIONS — it must not ALSO be counted as a cap
+  // exhaustion, which would misreport a contested-findings round as the loop
+  // having simply run out of iterations.
+  if (!approved && !degraded && !rebutted) {
     if (!ctx.quality_caps) ctx.quality_caps = []
     ctx.quality_caps.push(stepLabel)
     const capMsg = '#' + ctx.issue + ': quality gate capped at ' + MAX_QUALITY_ITERATIONS + ' iterations without a clean review (' + ctx.quality_caps.join(', ') + ')'
@@ -3443,6 +3587,7 @@ async function runTestLoop(ctx, forced) {
       'After committing, post an issue comment "## Test Quality Fix (iteration ' + iter + ')" with the commit SHA and',
       'what was added/strengthened (gh issue comment ' + ctx.issue + ' --repo ' + REPO + ').',
       fixesAppliedIdAsk('[test-i1-2] added a missing edge-case test'),
+      vFindings !== null ? FINDING_HYPOTHESIS_ASK : '',
       COMMIT_SHA_ASK,
       HANDOFF_ASK,
       'Add missing assertions, remove TODOs, add edge-case tests, etc. Commit. Return status, commit, files_changed, fixes_applied, summary.',
@@ -3450,6 +3595,25 @@ async function runTestLoop(ctx, forced) {
     if (!qfix || qfix.status === 'error') return { ok: false, error: 'test-quality-fix stage failed — halting test loop' }
     collectNotes(ctx, 'test-quality-fix', qfix)
     collectPostedCommit(ctx, 'test-quality-fix-i' + iter, qfix)
+
+    // rebuttal-only exit (issue #167): mirrors runQualityLoop's block above,
+    // minus recordGateOutcome/retypeGateDisposition — this loop books no
+    // 'test-quality' gate_findings entry to retype. Exits { ok: true }, never
+    // { ok: false }: a rebuttal-only round here can never block a merge.
+    // Full rationale: docs/architecture/gate-hygiene.md#the-three-per-gate-exits-and-why-only-pr-review-can-block-a-merge
+    const normRebuttals = normalizeRebuttals(qfix.rebutted, vFindings || [])
+    const rebuttalOnly = normRebuttals.length > 0 && (qfix.fixes_applied || []).length === 0 && (qfix.files_changed || []).length === 0
+    if (rebuttalOnly) {
+      if (!ctx.contested) ctx.contested = []
+      for (const r of normRebuttals) {
+        ctx.contested.push({ gate: 'test-quality', id: r.finding_id, summary: r.summary, evidence: r.evidence })
+      }
+      pushDecision(ctx, 'Gate: findings contested, none applied', 'Test quality fix (iteration ' + iter + ') rebutted every finding and applied no fix — carried as contested, not resolved.')
+      VERIFY_SKIPS.push('#' + ctx.issue + ': test quality fix (iteration ' + iter + ') rebutted every finding and applied no fix — carried as contested, not resolved, for human review')
+      ctx.metrics.rebuttal_only_rounds++
+      return { ok: true }
+    }
+
     tallyTouches(ctx, qfix.files_changed)
     ctx.metrics.test_quality_fix_rounds++
   }
@@ -4715,6 +4879,10 @@ async function implementIssue(ctx) {
 async function reviewAndMerge(ctx) {
   let approved = false
   let haltReason = null
+  // rebuttalRoundsUsed (issue #167): per-reviewAndMerge-call counter permitting
+  // exactly ONE rebuttal-only pr-fix round before this gate stops giving a
+  // disputing fixer another iteration — see the rebuttalOnly block below.
+  let rebuttalRoundsUsed = 0
   for (let iter = 1; iter <= MAX_PR_REVIEW_ITERATIONS && !approved; iter++) {
     if (STOP.tripped) return fail(ctx, 'halted', 'pr-review', 'stopped: ' + STOP.reason)
     ctx.metrics.pr_review_iters = iter
@@ -4727,7 +4895,7 @@ async function reviewAndMerge(ctx) {
           'Verify PR #' + ctx.pr + ' achieves the goals of issue #' + ctx.issue + ' (spec review iteration ' + iter + ').',
           '',
           '## Decision chain', decisionChain(ctx),
-          settledBlock(ctx), '',
+          settledBlock(ctx), contestedBlock(ctx), '',
           learn('workflow'), // issue #88: spec review sees prior-run workflow/scope learnings
           'Check goal achievement, not code quality. Flag scope creep.',
           'IMPORTANT: before flagging any acceptance criterion as missing, check base branch ' + TARGET + ' — if the',
@@ -4748,7 +4916,7 @@ async function reviewAndMerge(ctx) {
           'Review code quality of PR #' + ctx.pr + ' against base ' + TARGET + ' for issue #' + ctx.issue + ' (code review iteration ' + iter + ').',
           '',
           '## Decision chain', decisionChain(ctx),
-          settledBlock(ctx), '',
+          settledBlock(ctx), contestedBlock(ctx), '',
           // issue #88: the merge-gate reviewer sees prior-run error patterns and
           // quality-loop learnings — the bug classes earlier runs caught late.
           learn('error_patterns'),
@@ -4834,6 +5002,7 @@ async function reviewAndMerge(ctx) {
       'After pushing, post a PR comment "## PR Review Fix (iteration ' + iter + ')" with the commit SHA and the fixes',
       'applied in 2-4 lines (gh pr comment ' + ctx.pr + ' --repo ' + REPO + ').',
       fixesAppliedIdAsk('[code-i1-2] tightened the null guard'),
+      (specFindings !== null || codeFindings !== null) ? FINDING_HYPOTHESIS_ASK : '',
       COMMIT_SHA_ASK,
       bwFeedback(ctx),
       HANDOFF_ASK,
@@ -4844,6 +5013,38 @@ async function reviewAndMerge(ctx) {
     pushDecision(ctx, 'PR Review Fix (i' + iter + ')', fix.summary || 'fixes applied')
     collectNotes(ctx, 'pr-fix', fix)
     collectPostedCommit(ctx, 'pr-fix-i' + iter, fix)
+
+    // rebuttal-only exit (issue #167): mirrors runQualityLoop's/runTestLoop's
+    // block, over the UNION of both reviewers' rendered findings. `continue`
+    // MUST precede runQualityLoop below (runSimplify fails open on an empty
+    // filesChanged). rebuttalRoundsUsed permits exactly ONE such round per
+    // reviewAndMerge() call before halting to needs_human.
+    // Full rationale: docs/architecture/gate-hygiene.md#the-three-per-gate-exits-and-why-only-pr-review-can-block-a-merge
+    const prFixFindings = (specFindings || []).concat(codeFindings || [])
+    const normRebuttals = normalizeRebuttals(fix.rebutted, prFixFindings)
+    const rebuttalOnly = normRebuttals.length > 0 && (fix.fixes_applied || []).length === 0 && (fix.files_changed || []).length === 0
+    if (rebuttalOnly) {
+      if (rebuttalRoundsUsed >= 1) {
+        haltReason = 'PR #' + ctx.pr + ' review iteration ' + iter + ': a second rebuttal-only PR fix round rebutted every finding and applied no fix — left open for human review'
+        retypeGateDisposition(ctx, 'pr-review', prReviewDisposition, 'carried-unresolved')
+        break
+      }
+      rebuttalRoundsUsed++
+      retypeGateDisposition(ctx, 'pr-review', prReviewDisposition, 'carried-unresolved')
+      if (!ctx.contested) ctx.contested = []
+      for (const r of normRebuttals) {
+        ctx.contested.push({ gate: 'pr-review', id: r.finding_id, summary: r.summary, evidence: r.evidence })
+      }
+      ctx.metrics.rebuttal_only_rounds++
+      // A single un-rolled line: bounded at two per issue by construction
+      // (capReached breaks above the fix stage, and pr-fix only runs at
+      // iterations 1 and 2 of MAX_PR_REVIEW_ITERATIONS=3), so unlike the
+      // quality loop's rolled-up VERIFY_SKIPS index this never needs
+      // rewriting in place — it is never retracted.
+      VERIFY_SKIPS.push('#' + ctx.issue + ': PR review fix (iteration ' + iter + ') rebutted every finding and applied no fix — carried as contested, not resolved, for human review')
+      continue
+    }
+
     tallyTouches(ctx, fix.files_changed)
 
     const q = await runQualityLoop(ctx, 'pr-fix-i' + iter, 'post-review fixes for PR #' + ctx.pr, fix.files_changed)
@@ -4995,7 +5196,7 @@ async function processIssue(pre) {
     // reasons:[]}) matches computeRevisitRisk's clean no-op shape so a preflight
     // that never carried revisit_risk (e.g. a resume-skip stub) never crashes.
     revisit_risk: (pre.revisit_risk && typeof pre.revisit_risk === 'object') ? pre.revisit_risk : { flagged: false, reasons: [] },
-    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_scopes: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0, findings_empty_exits: 0 },
+    metrics: { approach_iters: 0, plan_iters: 0, tasks_done: 0, tasks_failed: 0, task_review_attempts: 0, quality_iters: 0, quality_scopes: 0, quality_degrades: 0, test_iters: 0, browser_iters: 0, pr_review_iters: 0, merge_auto_resolved: 0, merge_thrash: 0, test_quality_fix_rounds: 0, findings_empty_exits: 0, rebuttal_only_rounds: 0 },
     tokens: { total: 0, byModel: {}, byStage: {}, tracked: false }, // per-stage token deltas from spentTokens(); see stage()
     // Retained-changed-files / friction signals (issue #87). null (not []) means
     // "never captured" — probeChangedFiles() sets these once, unconditionally,

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.2 (2026-07-29)
+
+A finding is a hypothesis at the evaluator-fed fix stages (#167).
+
+The two contrarian revision stages have always told the model to verify a
+challenger's claim before acting on it, and to rebut it with evidence when it
+is wrong. None of the fix stages carried that. They opened with "Address code
+review feedback" and pasted the reviewer's text, so a fixer who believed a
+finding was wrong had two moves: comply, or return an error and fail the issue.
+
+That framing now reaches the three stages whose input is a judge's opinion:
+quality-fix, test-quality-fix, and pr-fix. It deliberately does not reach the
+two whose input is a real failure, test-fix and browser-fix. Both already carry
+an anti-rebuttal guard, and telling a fixer that a failing test is a hypothesis
+inverts a correct instruction. A real failure is a boundary with nothing to
+negotiate.
+
+`FIX_SCHEMA` gains an optional `rebutted` array of `{finding_id, evidence}`, so
+disagreement has somewhere to go that is not an error return. Only findings
+carrying a bracketed id are rebuttable; the framing renders at all only when
+structured findings are present, so the prose-fallback path never sees
+instructions it cannot act on.
+
+The part that makes it a guardrail rather than a suggestion is deterministic. A
+fix round that rebuts findings while changing no files and applying no fixes is
+a rebuttal-only round, evaluated in plain JavaScript at all three gates. The
+quality and test loops exit on one, through a flag kept separate from
+`degraded` so agent death and principled disagreement stay distinguishable. The
+merge gate allows one and halts on a second consecutive round, recording
+`carried-unresolved` and emitting a Verification Gaps line rather than letting
+the PR approve. Prompt text, schema field, and rule ship together and revert as
+a unit.
+
+A prompt rule guarding a prompt rule is the pattern this repository's own code
+review has rejected before. 45 new unit tests cover the primitives.
+
 ## 0.2.1 (2026-07-28)
 
 The engine got too big to run. The Workflow tool refuses any script file of

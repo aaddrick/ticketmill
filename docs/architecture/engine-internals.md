@@ -709,16 +709,48 @@ ctx.unresolved) — or (b) for pr-review (issue #162)
 and quality (issue #163) alike, the reviewer(s)
 requested changes while naming no structured
 findings to fix, so a fix stage would have had
-nothing to act on. For pr-review, (a) and (b) land
-on the same needs_human outcome; only
-ctx.metrics.findings_empty_exits distinguishes
-them. quality has a single reviewer, not a pair,
-so its (b) is one changes_requested verdict with
-issues: [] — that branch sets runQualityLoop's own
-approved = true (see below) even though it still
-tallies carried-unresolved here: "clean" for the
-loop's control flow and "clean" for this gate
-tally answer different questions.
+nothing to act on — or (c), added by issue #167, a
+fix agent shown this gate's findings rebutted every
+one of them (FIX_SCHEMA.rebutted, normalized by
+normalizeRebuttals()) and applied no fix
+(fixes_applied and files_changed both empty):
+retypeGateDisposition() retypes that iteration's
+already-booked disposition to carried-unresolved
+after the fact, at quality and pr-review — the two
+of these gates whose disposition this tally actually
+records. test-quality has the identical
+rebuttal-only exit (same predicate, same
+FIX_SCHEMA.rebutted field) but books no
+gate_findings entry in the first place (it isn't one
+of the four gates this tally covers), so route (c)
+at test-quality is visible only via
+ctx.metrics.rebuttal_only_rounds and the
+contested-findings ledger, never in this tally. For
+pr-review, (a) and (b) land on the same needs_human
+outcome; only ctx.metrics.findings_empty_exits
+distinguishes them from each other. (c) at pr-review
+does NOT land on needs_human the first time it
+fires — a single rebuttal-only pr-fix round
+continues the review loop into another iteration
+instead; only a second rebuttal-only round in the
+same reviewAndMerge() call joins (a) and (b) on
+needs_human. ctx.metrics.rebuttal_only_rounds is
+what distinguishes (c) from (a)/(b): a
+carried-unresolved pr-review tally with
+rebuttal_only_rounds > 0 for that iteration means a
+fixer disputed the findings, not that the cap ran out
+or nothing was named. quality has a single reviewer,
+not a pair, so its (b) is one changes_requested
+verdict with issues: [] — that branch sets
+runQualityLoop's own approved = true (see below) even
+though it still tallies carried-unresolved here:
+"clean" for the loop's control flow and "clean" for
+this gate tally answer different questions. Route (c)
+at quality also sets its own loop-exit flag
+(`rebutted`, kept separate from `degraded`) rather
+than approved = true — a rebuttal-only round is a
+dispute, not a clean review, so it does not get the
+same "clean for control flow" treatment (b) does.
 re-litigated        - neither of the above: the loop revises and
 re-contests, so these findings get judged again
 next iteration (a fix stage for pr-review, a
@@ -777,6 +809,17 @@ findings.length > 0 - render the work list using the existing pr-fix line
 shape (:4259) with the id prefixed, then the prose
 `comments` below under a context-only heading — the
 fix agent's job list is the findings, not the prose.
+(issue #167: a fix agent may rebut, not fix, any
+finding rendered here — record the disagreement in
+FIX_SCHEMA.rebutted with the concrete evidence that
+disproves it, rather than changing code to satisfy a
+finding it judged wrong. Only a finding that reaches
+this branch, carrying the bracketed id this renderer
+prefixes onto each line, can be rebutted; a finding
+that shows up only in the `comments` prose below, or
+only via the findings === null fallback above, has no
+id to rebut against and must be fixed outright or
+addressed in the fixer's own summary instead.)
 findings.length === 0 - a reviewer that validated `issues: []` alongside
 changes_requested (reached only by the pr-review gate
 in task 2, where one reviewer has zero findings and
