@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.3] - 2026-08-02T01-57-45
+
+- aggregateTokens: add point-of-risk comment tying !anyTracked correctness to pre-pool byStage invariant (#120)
+
 ## 0.2.2 (2026-07-29)
 
 A finding is a hypothesis at the evaluator-fed fix stages (#167).
