@@ -2294,6 +2294,12 @@ function aggregateTokens(results, spent, concurrency, byStage, poolSpend) {
   const runTotal = hasSpent ? spent : null
   const trackedAny = anyTracked || anyStage
   const tracked = trackedAny || hasSpent
+  // Every byStage bucket is sampled outside runPool() (the only concurrent
+  // region) via addStage()/STAGE_TOKENS bracketing, so byStage is exact at
+  // any CONCURRENCY — the ONLY reason `!anyTracked` may claim
+  // reconciles:true above concurrency 1 (issue #65, fixed by #119). A
+  // future byStage bucket sampled INSIDE runPool() must revisit this line
+  // or reintroduce #65's false caveat.
   const reconciles = hasSpent && trackedAny && (concurrency === 1 || !anyTracked)
   const remainder = hasSpent ? Math.max(0, spent - sumDeltas) : null
   const hasPoolSpend = isFiniteNumber(poolSpend)
